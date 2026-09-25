@@ -604,10 +604,23 @@ function mimir_coverage_put(
 }
 
 /**
+ * Find fresh coverage that can satisfy a request.
+ * Prefer an exact filter_sig match; if none (and local filtering is safe), fall back
+ * to empty-filter (full-entity) coverage so filtered UI calls hit local filter.
+ *
  * @return array{filter_sig: string, select_sig: string, fetched_at: int, key_id: ?int}|null
  */
-function mimir_coverage_find(PDO $pdo, string $environment, string $company, string $entity, ?string $pushedFilter, string $selectSig, int $maxAge, int $now): ?array
-{
+function mimir_coverage_find(
+    PDO $pdo,
+    string $environment,
+    string $company,
+    string $entity,
+    ?string $pushedFilter,
+    string $selectSig,
+    int $maxAge,
+    int $now,
+    bool $allowEmptyFallback = true
+): ?array {
     $sql = 'SELECT filter_sig, select_sig, fetched_at, key_id FROM cache_coverage
             WHERE environment = :environment AND company = :company AND entity = :entity AND fetched_at >= :min_at';
     $params = [
@@ -617,24 +630,47 @@ function mimir_coverage_find(PDO $pdo, string $environment, string $company, str
         ':min_at' => $now - $maxAge,
     ];
     if ($pushedFilter === null) {
-        $sql .= ' AND filter_sig = \'\'';
+        $sql .= " AND filter_sig = ''";
     } else {
-        $sql .= ' AND (filter_sig = :filter OR filter_sig = \'\')';
+        $sql .= " AND (filter_sig = :filter OR filter_sig = '')";
         $params[':filter'] = $pushedFilter;
     }
     $sql .= ' ORDER BY fetched_at DESC';
     $stmt = $pdo->prepare($sql);
     $stmt->execute($params);
+
+    $exact = null;
+    $empty = null;
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-        if (mimir_select_sig_covers((string) $row['select_sig'], $selectSig)) {
-            $covKey = $row['key_id'] ?? null;
-            return [
-                'filter_sig' => (string) $row['filter_sig'],
-                'select_sig' => (string) $row['select_sig'],
-                'fetched_at' => (int) $row['fetched_at'],
-                'key_id' => $covKey === null || $covKey === '' ? null : (int) $covKey,
-            ];
+        if (!mimir_select_sig_covers((string) $row['select_sig'], $selectSig)) {
+            continue;
         }
+        $covKey = $row['key_id'] ?? null;
+        $candidate = [
+            'filter_sig' => (string) $row['filter_sig'],
+            'select_sig' => (string) $row['select_sig'],
+            'fetched_at' => (int) $row['fetched_at'],
+            'key_id' => $covKey === null || $covKey === '' ? null : (int) $covKey,
+        ];
+        if ($candidate['filter_sig'] === '') {
+            if ($empty === null) {
+                $empty = $candidate;
+            }
+            continue;
+        }
+        if ($pushedFilter !== null && $candidate['filter_sig'] === $pushedFilter && $exact === null) {
+            $exact = $candidate;
+        }
+    }
+
+    if ($pushedFilter === null) {
+        return $empty;
+    }
+    if ($exact !== null) {
+        return $exact;
+    }
+    if ($allowEmptyFallback) {
+        return $empty;
     }
     return null;
 }
@@ -701,6 +737,30 @@ function mimir_select_for_bc_refresh(array $select, array $onFile): array
         return $select;
     }
     return $onFile;
+}
+
+/**
+ * Columns to send as BC $select. Empty list = omit $select (fetch all columns).
+ *
+ * - Full-entity / empty $filter toward BC: always omit — warms maximize sharing;
+ *   API still projects the caller's select.
+ * - Filtered with any on-file columns for company+entity: omit (do not shrink;
+ *   stronger than union age-refresh).
+ * - Filtered cold cache: pass request select.
+ *
+ * @param list<string> $select
+ * @param list<string> $onFile
+ * @return list<string>
+ */
+function mimir_select_for_bc(array $select, array $onFile, bool $emptyFilter): array
+{
+    if ($emptyFilter) {
+        return [];
+    }
+    if ($onFile !== []) {
+        return [];
+    }
+    return $select;
 }
 
 /**
@@ -875,21 +935,34 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $batchCount = $filterBatches === null ? 1 : count($filterBatches);
     $selectSig = mimir_select_sig($select);
     $required = array_values(array_unique(array_merge($select, mimir_filter_fields($filter))));
-    // Age-refresh must not shrink on-file columns: if $select ⊆ cache columns, fetch that union.
-    $fetchSelect = mimir_select_for_bc_refresh(
-        $select,
-        mimir_on_file_columns($pdo, $environment, $company, $entity)
-    );
+    $onFile = mimir_on_file_columns($pdo, $environment, $company, $entity);
+    $emptyFilterFetch = ($pushed === null);
+    // Full-entity warms omit $select toward BC; filtered cold may still pass select.
+    // Age-refresh non-shrink is preserved by omitting (or by mimir_select_for_bc_refresh when used).
+    $fetchSelect = mimir_select_for_bc($select, $onFile, $emptyFilterFetch);
     $fetchSelectSig = mimir_select_sig($fetchSelect);
     $keyId = array_key_exists('key_id', $job) && $job['key_id'] !== null && $job['key_id'] !== ''
         ? (int) $job['key_id']
         : null;
-    $coverage = mimir_coverage_find($pdo, $environment, $company, $entity, $pushed, $selectSig, $maxAge, $now);
+    $allowBroad = mimir_filter_allows_local($filter);
+    $coverage = mimir_coverage_find(
+        $pdo,
+        $environment,
+        $company,
+        $entity,
+        $pushed,
+        $selectSig,
+        $maxAge,
+        $now,
+        $allowBroad
+    );
 
     $fromCache = 0;
     $fromLive = 0;
     $kept = [];
     $usedCoverage = false;
+    $gapFilled = false;
+    $gapSharedKeyId = null;
 
     if ($coverage !== null) {
         $served = mimir_serve_from_coverage(
@@ -916,7 +989,42 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         }
     }
     if (!$usedCoverage) {
-        if ($filterBatches !== null) {
+        $gap = null;
+        if ($filterBatches === null && $allowBroad) {
+            $gap = mimir_try_range_gap_fill(
+                $pdo,
+                $environment,
+                $company,
+                $entity,
+                $prefix,
+                $filter,
+                $types,
+                $keys,
+                $required,
+                $select,
+                $fetchSelect,
+                $fetchSelectSig,
+                $pushed,
+                $mode,
+                $maxAge,
+                $top,
+                $fetch,
+                $now,
+                $keyId
+            );
+        }
+        if ($gap !== null) {
+            $gapFilled = true;
+            $kept = $gap['rows'];
+            $fromCache = $gap['from_cache'];
+            $fromLive = $gap['from_live'];
+            $mode = $gap['mode'];
+            $pushed = $gap['pushed'];
+            $gapSharedKeyId = $gap['shared_key_id'];
+            if ($top > 0 && count($kept) > $top) {
+                $kept = array_slice($kept, 0, $top);
+            }
+        } elseif ($filterBatches !== null) {
             $merged = [];
             $seen = [];
             $anyTruncated = false;
@@ -964,6 +1072,10 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                 }
                 $kept[] = $row;
             }
+            if ($top > 0 && count($kept) > $top) {
+                $kept = array_slice($kept, 0, $top);
+            }
+            $fromLive = count($kept);
         } else {
             $live = mimir_fetch_collection(
                 $pdo,
@@ -990,11 +1102,11 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                 }
                 $kept[] = $row;
             }
+            if ($top > 0 && count($kept) > $top) {
+                $kept = array_slice($kept, 0, $top);
+            }
+            $fromLive = count($kept);
         }
-        if ($top > 0 && count($kept) > $top) {
-            $kept = array_slice($kept, 0, $top);
-        }
-        $fromLive = count($kept);
     }
 
     $value = [];
@@ -1018,6 +1130,13 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
             // null ownership (legacy/UI) or another key populated the coverage
             $shared = 1;
         }
+    } elseif ($gapFilled && $fromLive === 0) {
+        $bcHit = 0;
+        if ($gapSharedKeyId !== null && $keyId !== null && (int) $gapSharedKeyId === $keyId) {
+            $shared = 0;
+        } else {
+            $shared = 1;
+        }
     } else {
         $shared = 0;
         $bcHit = 1;
@@ -1036,6 +1155,9 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         'filter_mode' => $mode,
         'filter_note' => mimir_filter_note($mode),
     ];
+    if ($gapFilled) {
+        $meta['gap_fill'] = 1;
+    }
     if ($batchCount > 1) {
         $meta['filter_batches'] = $batchCount;
     }
@@ -1043,6 +1165,239 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     return [
         'value' => $value,
         'meta' => $meta,
+    ];
+}
+
+
+/**
+ * Fresh coverage rows for an entity (any filter_sig).
+ *
+ * @return list<array{filter_sig: string, select_sig: string, fetched_at: int, key_id: ?int, row_count: int}>
+ */
+function mimir_coverage_list_fresh(
+    PDO $pdo,
+    string $environment,
+    string $company,
+    string $entity,
+    int $maxAge,
+    int $now
+): array {
+    $stmt = $pdo->prepare(
+        'SELECT filter_sig, select_sig, fetched_at, key_id, row_count FROM cache_coverage
+         WHERE environment = :environment AND company = :company AND entity = :entity AND fetched_at >= :min_at
+         ORDER BY fetched_at DESC'
+    );
+    $stmt->execute([
+        ':environment' => $environment,
+        ':company' => $company,
+        ':entity' => $entity,
+        ':min_at' => $now - $maxAge,
+    ]);
+    $out = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $covKey = $row['key_id'] ?? null;
+        $out[] = [
+            'filter_sig' => (string) $row['filter_sig'],
+            'select_sig' => (string) $row['select_sig'],
+            'fetched_at' => (int) $row['fetched_at'],
+            'key_id' => $covKey === null || $covKey === '' ? null : (int) $covKey,
+            'row_count' => (int) ($row['row_count'] ?? 0),
+        ];
+    }
+    return $out;
+}
+
+/**
+ * Row-level gap fill for overlapping contiguous ranges on one comparable field.
+ * Returns null when gap analysis is unsafe — caller falls back to full BC fetch.
+ *
+ * @param list<string> $keys
+ * @param list<string> $required
+ * @param list<string> $select
+ * @param list<string> $fetchSelect
+ * @param array<string, string> $types
+ * @param callable(string): array $fetch
+ * @return array{
+ *   rows: list<array{payload: array<string, mixed>, fetched_at: int}>,
+ *   from_cache: int,
+ *   from_live: int,
+ *   mode: string,
+ *   pushed: ?string,
+ *   shared_key_id: ?int
+ * }|null
+ */
+function mimir_try_range_gap_fill(
+    PDO $pdo,
+    string $environment,
+    string $company,
+    string $entity,
+    string $prefix,
+    mixed $filter,
+    array $types,
+    array $keys,
+    array $required,
+    array $select,
+    array $fetchSelect,
+    string $fetchSelectSig,
+    ?string $pushed,
+    string $mode,
+    int $maxAge,
+    int $top,
+    callable $fetch,
+    int $now,
+    ?int $keyId
+): ?array {
+    $requestRange = mimir_filter_as_range($filter, $types);
+    if ($requestRange === null) {
+        return null;
+    }
+    $field = $requestRange['field'];
+    $type = (string) ($types[$field] ?? 'Edm.String');
+    $selectSig = mimir_select_sig($select);
+
+    $coveredRanges = [];
+    $sharedKeyId = null;
+    $newestAt = null;
+    foreach (mimir_coverage_list_fresh($pdo, $environment, $company, $entity, $maxAge, $now) as $cov) {
+        if (!mimir_select_sig_covers($cov['select_sig'], $selectSig)) {
+            continue;
+        }
+        if ($cov['filter_sig'] === '') {
+            // Full-entity coverage should have been handled by coverage_find; treat as total cover.
+            $coveredRanges = [$requestRange];
+            $sharedKeyId = $cov['key_id'];
+            $newestAt = $cov['fetched_at'];
+            break;
+        }
+        $range = mimir_filter_range_parse_odata($cov['filter_sig']);
+        if ($range === null || $range['field'] !== $field) {
+            continue;
+        }
+        if (mimir_filter_range_intersect($requestRange, $range, $type) === null) {
+            continue;
+        }
+        $coveredRanges[] = $range;
+        if ($newestAt === null || $cov['fetched_at'] > $newestAt) {
+            $newestAt = $cov['fetched_at'];
+            $sharedKeyId = $cov['key_id'];
+        }
+    }
+    if ($coveredRanges === []) {
+        return null;
+    }
+
+    $gaps = mimir_filter_range_gaps($requestRange, $coveredRanges, $type);
+
+    // Collect fresh cached rows that match the request and have required columns.
+    $cached = [];
+    $seen = [];
+    foreach (mimir_cache_all($pdo, $environment, $company, $entity) as $stored) {
+        if (($now - (int) $stored['fetched_at']) > $maxAge) {
+            continue;
+        }
+        $reason = mimir_row_refresh_reason($stored, $required, $maxAge, $now);
+        if ($reason !== 'ok') {
+            continue;
+        }
+        if (!mimir_filter_match($stored['payload'], $filter, $types)) {
+            continue;
+        }
+        $rowKey = $stored['row_key'];
+        $seen[$rowKey] = true;
+        $cached[] = ['payload' => $stored['payload'], 'fetched_at' => $stored['fetched_at']];
+    }
+
+    if ($gaps === []) {
+        // Completeness proof: union of coverages contains the request.
+        $rows = $cached;
+        if ($top > 0 && count($rows) > $top) {
+            $rows = array_slice($rows, 0, $top);
+        }
+        return [
+            'rows' => $rows,
+            'from_cache' => count($rows),
+            'from_live' => 0,
+            'mode' => $mode,
+            'pushed' => $pushed,
+            'shared_key_id' => $sharedKeyId,
+        ];
+    }
+
+    // Partial: fetch only gap sub-ranges from BC, merge with cached overlap.
+    $liveRows = [];
+    $anyTruncated = false;
+    $liveMode = $mode;
+    $lastPushed = $pushed;
+    foreach ($gaps as $gapRange) {
+        try {
+            $gapOdata = mimir_filter_range_to_odata($gapRange, $types);
+        } catch (InvalidArgumentException) {
+            return null;
+        }
+        $live = mimir_fetch_collection(
+            $pdo,
+            $environment,
+            $company,
+            $entity,
+            $prefix,
+            $filter,
+            $types,
+            $keys,
+            $fetchSelect,
+            $gapOdata,
+            'bc',
+            $fetch,
+            $now,
+            true,
+            $keyId
+        );
+        $liveMode = $live['mode'];
+        $lastPushed = $live['pushed'];
+        if (!empty($live['truncated'])) {
+            $anyTruncated = true;
+        }
+        foreach ($live['rows'] as $row) {
+            $rowKey = mimir_row_key($row['payload'], $keys);
+            if (isset($seen[$rowKey])) {
+                continue;
+            }
+            $seen[$rowKey] = true;
+            $liveRows[] = $row;
+        }
+    }
+
+    $merged = [];
+    foreach ($cached as $row) {
+        $merged[] = $row;
+    }
+    foreach ($liveRows as $row) {
+        if (!mimir_filter_match($row['payload'], $filter, $types)) {
+            continue;
+        }
+        $merged[] = $row;
+    }
+
+    if (!$anyTruncated && $pushed !== null && $pushed !== '') {
+        mimir_coverage_put(
+            $pdo,
+            $environment,
+            $company,
+            $entity,
+            $pushed,
+            $fetchSelectSig,
+            $now,
+            count($merged),
+            $keyId
+        );
+    }
+
+    return [
+        'rows' => $merged,
+        'from_cache' => count($cached),
+        'from_live' => count($liveRows),
+        'mode' => $liveMode,
+        'pushed' => $lastPushed,
+        'shared_key_id' => $sharedKeyId,
     ];
 }
 

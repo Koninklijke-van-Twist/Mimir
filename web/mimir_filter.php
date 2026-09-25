@@ -529,3 +529,589 @@ function mimir_filter_note(string $mode): ?string
         default => null,
     };
 }
+
+/**
+ * Opaque OData $filter strings cannot be applied locally.
+ */
+function mimir_filter_allows_local(mixed $filter): bool
+{
+    return !is_string($filter);
+}
+
+/**
+ * Contiguous range on one field: eq / ge / gt / le / lt, or AND of those on the same field.
+ *
+ * @param array<string, string> $types
+ * @return array{
+ *   field: string,
+ *   lower: mixed,
+ *   lower_inclusive: bool,
+ *   upper: mixed,
+ *   upper_inclusive: bool
+ * }|null
+ */
+function mimir_filter_as_range(mixed $filter, array $types = []): ?array
+{
+    if ($filter === null || is_string($filter) || !is_array($filter)) {
+        return null;
+    }
+    $leaves = [];
+    if (isset($filter['and']) && is_array($filter['and']) && array_is_list($filter['and'])) {
+        foreach ($filter['and'] as $child) {
+            if (!is_array($child) || isset($child['and']) || isset($child['or']) || isset($child['xor'])) {
+                return null;
+            }
+            $leaves[] = $child;
+        }
+    } elseif (isset($filter['field'], $filter['op']) && array_key_exists('value', $filter)) {
+        $leaves[] = $filter;
+    } else {
+        return null;
+    }
+    if ($leaves === []) {
+        return null;
+    }
+
+    $field = null;
+    $lower = null;
+    $lowerInc = true;
+    $upper = null;
+    $upperInc = true;
+    $hasLower = false;
+    $hasUpper = false;
+
+    foreach ($leaves as $leaf) {
+        if (!isset($leaf['field'], $leaf['op']) || !array_key_exists('value', $leaf)) {
+            return null;
+        }
+        $name = (string) $leaf['field'];
+        if ($field === null) {
+            $field = $name;
+        } elseif ($field !== $name) {
+            return null;
+        }
+        $op = strtolower((string) $leaf['op']);
+        $value = $leaf['value'];
+        if (!in_array($op, ['eq', 'ge', 'gt', 'le', 'lt'], true)) {
+            return null;
+        }
+        if ($op === 'eq') {
+            if ($hasLower || $hasUpper) {
+                return null;
+            }
+            $lower = $value;
+            $upper = $value;
+            $lowerInc = true;
+            $upperInc = true;
+            $hasLower = true;
+            $hasUpper = true;
+            continue;
+        }
+        if ($op === 'ge' || $op === 'gt') {
+            if ($hasLower) {
+                return null;
+            }
+            $lower = $value;
+            $lowerInc = ($op === 'ge');
+            $hasLower = true;
+            continue;
+        }
+        if ($hasUpper) {
+            return null;
+        }
+        $upper = $value;
+        $upperInc = ($op === 'le');
+        $hasUpper = true;
+    }
+
+    if ($field === null || (!$hasLower && !$hasUpper)) {
+        return null;
+    }
+    if ($hasLower && $hasUpper) {
+        $type = (string) ($types[$field] ?? 'Edm.String');
+        $cmp = mimir_filter_range_cmp($lower, $upper, $type);
+        if ($cmp > 0) {
+            return null;
+        }
+        if ($cmp === 0 && (!$lowerInc || !$upperInc)) {
+            return null;
+        }
+    }
+
+    return [
+        'field' => $field,
+        'lower' => $hasLower ? $lower : null,
+        'lower_inclusive' => $hasLower ? $lowerInc : true,
+        'upper' => $hasUpper ? $upper : null,
+        'upper_inclusive' => $hasUpper ? $upperInc : true,
+    ];
+}
+
+/**
+ * Parse a simple OData range filter_sig (eq / ge / gt / le / lt, optional AND).
+ *
+ * @return array{
+ *   field: string,
+ *   lower: mixed,
+ *   lower_inclusive: bool,
+ *   upper: mixed,
+ *   upper_inclusive: bool
+ * }|null
+ */
+function mimir_filter_range_parse_odata(string $sig): ?array
+{
+    $sig = trim($sig);
+    if ($sig === '') {
+        return null;
+    }
+    $parts = preg_split('/\s+and\s+/i', $sig);
+    if ($parts === false || $parts === []) {
+        return null;
+    }
+    $leaves = [];
+    foreach ($parts as $part) {
+        $part = trim($part);
+        $part = preg_replace('/^\(|\)$/', '', $part) ?? $part;
+        $part = trim($part);
+        if (
+            preg_match(
+                "/^([A-Za-z_][A-Za-z0-9_]*)\s+(eq|ne|gt|ge|lt|le)\s+(.+)$/i",
+                $part,
+                $match
+            ) !== 1
+        ) {
+            return null;
+        }
+        $literal = trim($match[3]);
+        try {
+            $value = mimir_filter_parse_odata_literal($literal);
+        } catch (InvalidArgumentException) {
+            return null;
+        }
+        $leaves[] = [
+            'field' => $match[1],
+            'op' => strtolower($match[2]),
+            'value' => $value,
+        ];
+    }
+    if (count($leaves) === 1) {
+        return mimir_filter_as_range($leaves[0]);
+    }
+    return mimir_filter_as_range(['and' => $leaves]);
+}
+
+/**
+ * @throws InvalidArgumentException
+ */
+function mimir_filter_parse_odata_literal(string $literal): mixed
+{
+    $literal = trim($literal);
+    if (strcasecmp($literal, 'null') === 0) {
+        return null;
+    }
+    if (strcasecmp($literal, 'true') === 0) {
+        return true;
+    }
+    if (strcasecmp($literal, 'false') === 0) {
+        return false;
+    }
+    if (preg_match("/^'(.*)'$/s", $literal, $match) === 1) {
+        return str_replace("''", "'", $match[1]);
+    }
+    if (preg_match("/^guid'([^']+)'$/i", $literal, $match) === 1) {
+        return $match[1];
+    }
+    if (is_numeric($literal)) {
+        return str_contains($literal, '.') ? (float) $literal : (int) $literal;
+    }
+    if (preg_match('/^\d{4}-\d{2}-\d{2}/', $literal) === 1) {
+        return $literal;
+    }
+    throw new InvalidArgumentException('Unsupported OData literal.');
+}
+
+/**
+ * @param array{
+ *   field: string,
+ *   lower: mixed,
+ *   lower_inclusive: bool,
+ *   upper: mixed,
+ *   upper_inclusive: bool
+ * } $range
+ * @param array<string, string> $types
+ */
+function mimir_filter_range_to_odata(array $range, array $types = []): string
+{
+    $field = $range['field'];
+    $type = (string) ($types[$field] ?? 'Edm.String');
+    $parts = [];
+    if ($range['lower'] !== null) {
+        $op = !empty($range['lower_inclusive']) ? 'ge' : 'gt';
+        $parts[] = $field . ' ' . $op . ' ' . mimir_odata_literal($range['lower'], $type);
+    }
+    if ($range['upper'] !== null) {
+        $op = !empty($range['upper_inclusive']) ? 'le' : 'lt';
+        $parts[] = $field . ' ' . $op . ' ' . mimir_odata_literal($range['upper'], $type);
+    }
+    if ($parts === []) {
+        throw new InvalidArgumentException('Range has no bounds.');
+    }
+    if (count($parts) === 1) {
+        return $parts[0];
+    }
+    return '(' . implode(') and (', $parts) . ')';
+}
+
+/**
+ * @param array{
+ *   field: string,
+ *   lower: mixed,
+ *   lower_inclusive: bool,
+ *   upper: mixed,
+ *   upper_inclusive: bool
+ * } $range
+ * @return array<string, mixed>
+ */
+function mimir_filter_range_to_json(array $range): array
+{
+    $leaves = [];
+    if ($range['lower'] !== null) {
+        $leaves[] = [
+            'field' => $range['field'],
+            'op' => !empty($range['lower_inclusive']) ? 'ge' : 'gt',
+            'value' => $range['lower'],
+        ];
+    }
+    if ($range['upper'] !== null) {
+        $leaves[] = [
+            'field' => $range['field'],
+            'op' => !empty($range['upper_inclusive']) ? 'le' : 'lt',
+            'value' => $range['upper'],
+        ];
+    }
+    if ($leaves === []) {
+        throw new InvalidArgumentException('Range has no bounds.');
+    }
+    if (
+        count($leaves) === 2
+        && $range['lower'] !== null
+        && $range['upper'] !== null
+        && $range['lower'] === $range['upper']
+        && !empty($range['lower_inclusive'])
+        && !empty($range['upper_inclusive'])
+    ) {
+        return ['field' => $range['field'], 'op' => 'eq', 'value' => $range['lower']];
+    }
+    if (count($leaves) === 1) {
+        return $leaves[0];
+    }
+    return ['and' => $leaves];
+}
+
+/**
+ * @return int negative if $a < $b, 0 if equal, positive if $a > $b
+ */
+function mimir_filter_range_cmp(mixed $a, mixed $b, string $type): int
+{
+    $edm = strtolower($type);
+    $numeric = preg_match('/int|decimal|double|single|float|byte/', $edm) === 1;
+    if ($numeric && is_numeric($a) && is_numeric($b)) {
+        return ((float) $a) <=> ((float) $b);
+    }
+    return ((string) $a) <=> ((string) $b);
+}
+
+/**
+ * True when $outer fully contains $inner (same field).
+ *
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $outer
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $inner
+ */
+function mimir_filter_range_contains(array $outer, array $inner, string $type): bool
+{
+    if ($outer['field'] !== $inner['field']) {
+        return false;
+    }
+    if ($inner['lower'] !== null) {
+        if ($outer['lower'] !== null) {
+            $cmp = mimir_filter_range_cmp($outer['lower'], $inner['lower'], $type);
+            if ($cmp > 0) {
+                return false;
+            }
+            if ($cmp === 0 && !$outer['lower_inclusive'] && $inner['lower_inclusive']) {
+                return false;
+            }
+        }
+    } elseif ($outer['lower'] !== null) {
+        return false;
+    }
+    if ($inner['upper'] !== null) {
+        if ($outer['upper'] !== null) {
+            $cmp = mimir_filter_range_cmp($outer['upper'], $inner['upper'], $type);
+            if ($cmp < 0) {
+                return false;
+            }
+            if ($cmp === 0 && !$outer['upper_inclusive'] && $inner['upper_inclusive']) {
+                return false;
+            }
+        }
+    } elseif ($outer['upper'] !== null) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Subtract covered ranges from request; return contiguous gaps (same field).
+ *
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $request
+ * @param list<array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool}> $covered
+ * @return list<array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool}>
+ */
+function mimir_filter_range_gaps(array $request, array $covered, string $type): array
+{
+    $field = $request['field'];
+    $relevant = [];
+    foreach ($covered as $range) {
+        if (($range['field'] ?? '') !== $field) {
+            continue;
+        }
+        $clipped = mimir_filter_range_intersect($request, $range, $type);
+        if ($clipped !== null) {
+            $relevant[] = $clipped;
+        }
+    }
+    if ($relevant === []) {
+        return [$request];
+    }
+    usort($relevant, static function (array $a, array $b) use ($type): int {
+        if ($a['lower'] === null) {
+            return $b['lower'] === null ? 0 : -1;
+        }
+        if ($b['lower'] === null) {
+            return 1;
+        }
+        $cmp = mimir_filter_range_cmp($a['lower'], $b['lower'], $type);
+        if ($cmp !== 0) {
+            return $cmp;
+        }
+        return ($b['lower_inclusive'] <=> $a['lower_inclusive']);
+    });
+
+    $merged = [];
+    foreach ($relevant as $range) {
+        if ($merged === []) {
+            $merged[] = $range;
+            continue;
+        }
+        $lastIdx = count($merged) - 1;
+        if (mimir_filter_range_can_merge($merged[$lastIdx], $range, $type)) {
+            $merged[$lastIdx] = mimir_filter_range_union_pair($merged[$lastIdx], $range, $type);
+        } else {
+            $merged[] = $range;
+        }
+    }
+
+    $gaps = [];
+    $cursorLower = $request['lower'];
+    $cursorLowerInc = $request['lower_inclusive'];
+    foreach ($merged as $piece) {
+        $gap = mimir_filter_range_before($cursorLower, $cursorLowerInc, $piece, $field, $type);
+        if ($gap !== null) {
+            $gaps[] = $gap;
+        }
+        if ($piece['upper'] === null) {
+            return $gaps;
+        }
+        $cursorLower = $piece['upper'];
+        $cursorLowerInc = !$piece['upper_inclusive'];
+    }
+    $tail = [
+        'field' => $field,
+        'lower' => $cursorLower,
+        'lower_inclusive' => $cursorLowerInc,
+        'upper' => $request['upper'],
+        'upper_inclusive' => $request['upper_inclusive'],
+    ];
+    if (mimir_filter_range_nonempty($tail, $type)) {
+        $gaps[] = $tail;
+    }
+    return $gaps;
+}
+
+/**
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $a
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $b
+ * @return array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool}|null
+ */
+function mimir_filter_range_intersect(array $a, array $b, string $type): ?array
+{
+    if ($a['field'] !== $b['field']) {
+        return null;
+    }
+    $lower = null;
+    $lowerInc = true;
+    if ($a['lower'] === null && $b['lower'] === null) {
+        $lower = null;
+        $lowerInc = true;
+    } elseif ($a['lower'] === null) {
+        $lower = $b['lower'];
+        $lowerInc = $b['lower_inclusive'];
+    } elseif ($b['lower'] === null) {
+        $lower = $a['lower'];
+        $lowerInc = $a['lower_inclusive'];
+    } else {
+        $cmp = mimir_filter_range_cmp($a['lower'], $b['lower'], $type);
+        if ($cmp > 0) {
+            $lower = $a['lower'];
+            $lowerInc = $a['lower_inclusive'];
+        } elseif ($cmp < 0) {
+            $lower = $b['lower'];
+            $lowerInc = $b['lower_inclusive'];
+        } else {
+            $lower = $a['lower'];
+            $lowerInc = $a['lower_inclusive'] && $b['lower_inclusive'];
+        }
+    }
+    $upper = null;
+    $upperInc = true;
+    if ($a['upper'] === null && $b['upper'] === null) {
+        $upper = null;
+        $upperInc = true;
+    } elseif ($a['upper'] === null) {
+        $upper = $b['upper'];
+        $upperInc = $b['upper_inclusive'];
+    } elseif ($b['upper'] === null) {
+        $upper = $a['upper'];
+        $upperInc = $a['upper_inclusive'];
+    } else {
+        $cmp = mimir_filter_range_cmp($a['upper'], $b['upper'], $type);
+        if ($cmp < 0) {
+            $upper = $a['upper'];
+            $upperInc = $a['upper_inclusive'];
+        } elseif ($cmp > 0) {
+            $upper = $b['upper'];
+            $upperInc = $b['upper_inclusive'];
+        } else {
+            $upper = $a['upper'];
+            $upperInc = $a['upper_inclusive'] && $b['upper_inclusive'];
+        }
+    }
+    $out = [
+        'field' => $a['field'],
+        'lower' => $lower,
+        'lower_inclusive' => $lowerInc,
+        'upper' => $upper,
+        'upper_inclusive' => $upperInc,
+    ];
+    return mimir_filter_range_nonempty($out, $type) ? $out : null;
+}
+
+/**
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $range
+ */
+function mimir_filter_range_nonempty(array $range, string $type): bool
+{
+    if ($range['lower'] === null || $range['upper'] === null) {
+        return true;
+    }
+    $cmp = mimir_filter_range_cmp($range['lower'], $range['upper'], $type);
+    if ($cmp < 0) {
+        return true;
+    }
+    if ($cmp > 0) {
+        return false;
+    }
+    return $range['lower_inclusive'] && $range['upper_inclusive'];
+}
+
+/**
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $a
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $b
+ */
+function mimir_filter_range_can_merge(array $a, array $b, string $type): bool
+{
+    if ($a['field'] !== $b['field']) {
+        return false;
+    }
+    if ($a['upper'] === null || $b['lower'] === null) {
+        return true;
+    }
+    $cmp = mimir_filter_range_cmp($a['upper'], $b['lower'], $type);
+    if ($cmp > 0) {
+        return true;
+    }
+    if ($cmp < 0) {
+        return false;
+    }
+    // Same boundary: gap only when both exclude the point (lt X and gt X).
+    return $a['upper_inclusive'] || $b['lower_inclusive'];
+}
+
+/**
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $a
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $b
+ * @return array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool}
+ */
+function mimir_filter_range_union_pair(array $a, array $b, string $type): array
+{
+    $lower = $a['lower'];
+    $lowerInc = $a['lower_inclusive'];
+    if ($a['lower'] === null || $b['lower'] === null) {
+        $lower = null;
+        $lowerInc = true;
+    } else {
+        $cmp = mimir_filter_range_cmp($a['lower'], $b['lower'], $type);
+        if ($cmp > 0) {
+            $lower = $b['lower'];
+            $lowerInc = $b['lower_inclusive'];
+        } elseif ($cmp === 0) {
+            $lowerInc = $a['lower_inclusive'] || $b['lower_inclusive'];
+        }
+    }
+    $upper = $a['upper'];
+    $upperInc = $a['upper_inclusive'];
+    if ($a['upper'] === null || $b['upper'] === null) {
+        $upper = null;
+        $upperInc = true;
+    } else {
+        $cmp = mimir_filter_range_cmp($a['upper'], $b['upper'], $type);
+        if ($cmp < 0) {
+            $upper = $b['upper'];
+            $upperInc = $b['upper_inclusive'];
+        } elseif ($cmp === 0) {
+            $upperInc = $a['upper_inclusive'] || $b['upper_inclusive'];
+        }
+    }
+    return [
+        'field' => $a['field'],
+        'lower' => $lower,
+        'lower_inclusive' => $lowerInc,
+        'upper' => $upper,
+        'upper_inclusive' => $upperInc,
+    ];
+}
+
+/**
+ * @param array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool} $piece
+ * @return array{field: string, lower: mixed, lower_inclusive: bool, upper: mixed, upper_inclusive: bool}|null
+ */
+function mimir_filter_range_before(
+    mixed $cursorLower,
+    bool $cursorLowerInc,
+    array $piece,
+    string $field,
+    string $type
+): ?array {
+    if ($piece['lower'] === null) {
+        return null;
+    }
+    $gap = [
+        'field' => $field,
+        'lower' => $cursorLower,
+        'lower_inclusive' => $cursorLowerInc,
+        'upper' => $piece['lower'],
+        'upper_inclusive' => !$piece['lower_inclusive'],
+    ];
+    return mimir_filter_range_nonempty($gap, $type) ? $gap : null;
+}

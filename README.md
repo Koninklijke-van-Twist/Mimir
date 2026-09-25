@@ -9,6 +9,7 @@ De pagina staat in `web/` en gaat via FTP naar `/var/www/html/mimir/`.
 - `web/index.php` — verkenner (SSO). Tabel kiezen, filters, kolommen, resultaat, API-sleutels.
 - `web/ui_api.php` — JSON voor die pagina. Zelfde login als de pagina. `max_age` staat hier vast op **600 seconden**.
 - `web/api/` — API met sleutel (`tables.php`, `schema.php`, `query.php`, `companies.php`, of `index.php` met `PATH_INFO` / `?route=`).
+- `web/openapi.yaml` / `web/openapi.json` — OpenAPI 3-specificatie (publiek, geen sleutel).
 - `web/odata.php` — BC-client (basic of NTLM, paginering via `@odata.nextLink`, `$metadata`).
 - `web/mimir_store.php` — SQLite: rijcache, dekking van een fetch, API-sleutels, usage.
 - `web/mimir_filter.php` — filterboom `and` / `or` / `xor`.
@@ -72,9 +73,24 @@ Een bestaande cache zonder `environment`-kolom wordt bij de eerste start omgezet
 
 Een rij is vers als `now - fetched_at <= max_age`. Daarnaast onthoudt Mímir of een fetch van die tabel (plus het `$filter` dat naar BC ging, of de hele tabel) binnen `max_age` compleet binnen was. Alleen dan komt het antwoord uit de cache.
 
-Vraagt `select` een kolom die op een verder verse rij ontbreekt, dan haalt Mímir **de hele rij** opnieuw op (geen `$select` op die ene rij) en vervangt de cache. Een losse kolom bijplakken doen we niet.
+### Brede dekking (minder BC-calls)
 
-Is de cache verouderd (`max_age`) en is de gevraagde `select` een echte deelverzameling van de kolommen die al op die entity staan, dan haalt Mímir bij BC opnieuw **alle kolommen die al op file stonden** op (zodat de cache niet smaller wordt) en projecteert het API-antwoord alsnog op alleen de gevraagde `select`. Zonder `select`, of als `select` gelijk is aan / breder is dan wat op file staat, blijft het huidige gedrag.
+- Een **gefilterde** JSON-query mag uit een verse **lege-filter** (hele-tabel) dekking komen als de `select` past: Mímir filtert dan lokaal. Opaque OData-`$filter`-strings doen dat niet (die zijn niet lokaal toepasbaar).
+- Exacte `filter_sig`-dekking wint van lege-filterdekking als beide vers genoeg zijn.
+- **Warms / nightlies / batch-jobs** die veel UI-filters moeten voeden: haal **zonder filter** op (of met een zeer breed filter). Er is in Mímir zelf geen aparte entity-warm-endpoint; `nightly.php` doet alleen bedrijven + `$metadata`. Apps die warms doen moeten dus zelf `filter` weglaten.
+
+### `$select` naar BC
+
+- **Lege-filter / full-entity** fetch naar BC: **geen `$select`** — alle kolommen binnen, dekking `select_sig=*`. Het API-antwoord projecteert nog steeds op de gevraagde `select`.
+- **Gefilterde** fetch met al kolommen op file voor dat company+entity: eveneens **geen `$select`** naar BC (niet krimpen; delen maximaliseren).
+- **Gefilterde** cold cache: request-`select` mag nog naar BC.
+- Ontbreekt een gevraagde kolom op een verder verse rij, dan haalt Mímir **de hele rij** opnieuw op (geen `$select` op die ene rij).
+
+### Overlappende ranges (gap fill)
+
+Voor aaneengesloten ranges op **één** vergelijkbaar veld (`eq` / `ge` / `gt` / `le` / `lt` en AND daarvan): als er verse overlappinge rangedekking is, haalt Mímir alleen de **ontbrekende subranges** uit BC, merge’t met gecachte rijen, en zet `meta.gap_fill=1`. Zonder veiligheidsbewijs (geen passende dekking, of onveilig filter zoals `contains` / cross-field OR) blijft het volledige BC-fetch voor dat filter.
+
+`meta.shared` / `meta.bc_hit` / `from_cache` / `from_live` blijven de meetlat: shared = volledig uit andermans/legacy cache zonder BC; bc_hit zodra BC werd gebeld (ook bij partial gap fill).
 
 De UI gebruikt altijd `max_age` 600. De API laat de aanroeper dat bepalen (default 3600, maximum 365 dagen).
 
@@ -109,7 +125,9 @@ Elke API-call schrijft `key_id`, endpoint en timestamp.
 
 ## API
 
-Authenticatie: `Authorization: Bearer <sleutel>` of `X-API-Key: <sleutel>`.
+Machine-readable specificatie: [OpenAPI 3 YAML](https://sleutels.kvt.nl/mimir/openapi.yaml) en [JSON](https://sleutels.kvt.nl/mimir/openapi.json) (ook gelinkt vanuit de UI-footer). Geen authenticatie voor die bestanden.
+
+Authenticatie voor de data-API: `Authorization: Bearer <sleutel>` of `X-API-Key: <sleutel>`.
 
 | Methode | Pad | Doel |
 | --- | --- | --- |
@@ -197,6 +215,7 @@ Zonder Business Central:
 ```sh
 php tests/mimir_filter_test.php
 php tests/mimir_cache_test.php
+php tests/mimir_bc_reduce_test.php
 php tests/mimir_keys_test.php
 php tests/mimir_heatmap_test.php
 php tests/mimir_auth_env_test.php
