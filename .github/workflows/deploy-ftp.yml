@@ -30,18 +30,20 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
 
-      # Mirror web/ with --no-perms (Argus-pattern). Local git modes (755) must
-      # not overwrite the server. Exclude writable runtime dirs data and cache
-      # (the directory node and its contents) plus sqlite/json/lock globs, and
-      # exclude auth.php and .htaccess. Do not exclude analytics/** so
-      # analytics.php deploys again; only analytics/*.sqlite and
-      # analytics/*.sqlite-* stay on the server. No put into data/.
-      # Host/FTP may reset directory modes during mirror; the next step heals
-      # the writable dirs with chmod 777 on the directories only.
-      # NL: Argus-patroon — alleen directory-chmod. data en cache (map én
-      # inhoud) blijven buiten de mirror; analytics.php gaat wel mee. Geen put
-      # naar data/. Host/FTP kan modi tijdens de mirror resetten; de volgende
-      # stap herstelt de schrijfbare mappen elke deploy.
+      # PHP and other code landed as mode 600 because mirror used --no-perms
+      # and the FTP server applied its umask; Apache needs >=644 to read them.
+      # On the runner, set 755 on directories and 644 on files, then mirror
+      # without --no-perms so lftp uploads those modes (Asclepius-style).
+      # Exclude writable runtime dirs data and cache (the directory node and
+      # its contents) plus sqlite/json/lock globs, and exclude auth.php and
+      # .htaccess. Do not exclude analytics/** so analytics.php deploys; only
+      # analytics/*.sqlite and analytics/*.sqlite-* stay on the server.
+      # No put into data/. The next step's chmod 777 heals writable runtime
+      # dirs (Argus) after the mirror.
+      # NL: 600 kwam van --no-perms plus de server-umask. Lokale 644/755 en
+      # mirror zonder --no-perms maakt PHP leesbaar voor Apache. chmod 777
+      # op de mappen herstelt de schrijfbare runtime-dirs. data en cache
+      # (map én inhoud) blijven buiten de mirror; analytics.php gaat wel mee.
       - name: Deploy web/ to FTP (with delete & excludes)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
@@ -49,6 +51,9 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
+          find ./web -type d -exec chmod 755 {} +
+          find ./web -type f -exec chmod 644 {} +
+
           lftp -u "$FTP_USERNAME","$FTP_PASSWORD" "$FTP_HOST" << EOF
           set cmd:fail-exit true
           set net:max-retries 1
@@ -58,7 +63,7 @@ jobs:
 
           cd "$FTP_REMOTE_DIR"
 
-          mirror -R --delete --no-perms \
+          mirror -R --delete \
             --exclude-glob .htaccess \
             --exclude-glob auth.php \
             --exclude-glob data \
@@ -81,17 +86,19 @@ jobs:
           EOF
 
       # Argus-pattern: directory chmod only, and only after mirror/bye succeeded.
-      # chmod 777 on data, cache, and analytics — never on sqlite/wal/shm files.
-      # Host/FTP may reset modes during mirror; this heals writable dirs every
-      # deploy. `set cmd:fail-exit false` in the same lftp session as the mirror
-      # is not enough: lftp still exits 1 and the Actions job (bash -e) goes red
-      # after a successful upload. This separate session uses fail-exit false so
-      # one 550 does not skip the other chmods, and `|| true` so any chmod
-      # failure cannot fail the job.
+      # chmod 777 on data, cache, and analytics heals writable runtime dirs —
+      # never chmod individual sqlite/wal/shm files. Deployed code is already
+      # 644/755 from the runner chmod plus mirror without --no-perms; that is
+      # what stops new PHP from landing as 600 (the old --no-perms + server
+      # umask path). Host/FTP may still reset directory modes during mirror.
+      # `set cmd:fail-exit false` in the same lftp session as the mirror is not
+      # enough: lftp still exits 1 and the Actions job (bash -e) goes red after
+      # a successful upload. This separate session uses fail-exit false so one
+      # 550 does not skip the other chmods, and `|| true` so any chmod failure
+      # cannot fail the job.
       # NL: Argus-patroon — alleen chmod 777 op de mappen data, cache en
-      # analytics, niet op sqlite-bestanden. Host/FTP kan modi tijdens de
-      # mirror resetten; dit herstelt de schrijfbare mappen elke deploy.
-      # Best-effort: een 550 mag de job niet rood maken.
+      # analytics, niet op sqlite-bestanden. Dat herstelt de schrijfbare
+      # runtime-dirs. Best-effort: een 550 mag de job niet rood maken.
       - name: chmod data, cache, analytics (best-effort)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
