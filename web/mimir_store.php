@@ -667,8 +667,9 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         throw new MimirUserException('max_age moet tussen 0 en 365 dagen liggen.');
     }
     $top = (int) ($job['top'] ?? MIMIR_DEFAULT_TOP);
-    if ($top < 1 || $top > MIMIR_MAX_TOP) {
-        throw new MimirUserException('top moet tussen 1 en ' . MIMIR_MAX_TOP . ' liggen.');
+    // 0 = unlimited (geen array_slice). Positief blijft begrensd op MIMIR_MAX_TOP.
+    if ($top < 0 || $top > MIMIR_MAX_TOP) {
+        throw new MimirUserException('top moet 0 (ongelimiteerd) of tussen 1 en ' . MIMIR_MAX_TOP . ' liggen.');
     }
 
     $plan = mimir_filter_plan($filter, $types);
@@ -677,6 +678,8 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     if ($mode === 'none') {
         $pushed = null;
     }
+    $filterBatches = mimir_filter_odata_batches($filter, $types);
+    $batchCount = $filterBatches === null ? 1 : count($filterBatches);
     $selectSig = mimir_select_sig($select);
     $required = array_values(array_unique(array_merge($select, mimir_filter_fields($filter))));
     $coverage = mimir_coverage_find($pdo, $environment, $company, $entity, $pushed, $selectSig, $maxAge, $now);
@@ -711,30 +714,79 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         }
     }
     if (!$usedCoverage) {
-        $live = mimir_fetch_collection(
-            $pdo,
-            $environment,
-            $company,
-            $entity,
-            $prefix,
-            $filter,
-            $types,
-            $keys,
-            $select,
-            $pushed,
-            $mode,
-            $fetch,
-            $now
-        );
-        $mode = $live['mode'];
-        $pushed = $live['pushed'];
-        foreach ($live['rows'] as $row) {
-            if (!mimir_filter_match($row['payload'], $filter, $types)) {
-                continue;
+        if ($filterBatches !== null) {
+            $merged = [];
+            $seen = [];
+            $anyTruncated = false;
+            $mode = 'bc';
+            foreach ($filterBatches as $batchFilter) {
+                $live = mimir_fetch_collection(
+                    $pdo,
+                    $environment,
+                    $company,
+                    $entity,
+                    $prefix,
+                    $filter,
+                    $types,
+                    $keys,
+                    $select,
+                    $batchFilter,
+                    'bc',
+                    $fetch,
+                    $now,
+                    false
+                );
+                if ($live['mode'] === 'local') {
+                    $mode = 'local';
+                }
+                if (!empty($live['truncated'])) {
+                    $anyTruncated = true;
+                }
+                foreach ($live['rows'] as $row) {
+                    $rowKey = mimir_row_key($row['payload'], $keys);
+                    if (isset($seen[$rowKey])) {
+                        continue;
+                    }
+                    $seen[$rowKey] = true;
+                    $merged[] = $row;
+                }
             }
-            $kept[] = $row;
+            if (!$anyTruncated) {
+                $filterSig = $pushed ?? '';
+                mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($merged));
+            }
+            foreach ($merged as $row) {
+                if (!mimir_filter_match($row['payload'], $filter, $types)) {
+                    continue;
+                }
+                $kept[] = $row;
+            }
+        } else {
+            $live = mimir_fetch_collection(
+                $pdo,
+                $environment,
+                $company,
+                $entity,
+                $prefix,
+                $filter,
+                $types,
+                $keys,
+                $select,
+                $pushed,
+                $mode,
+                $fetch,
+                $now
+            );
+            $mode = $live['mode'];
+            $pushed = $live['pushed'];
+            foreach ($live['rows'] as $row) {
+                if (!mimir_filter_match($row['payload'], $filter, $types)) {
+                    continue;
+                }
+                $kept[] = $row;
+            }
         }
-        if (count($kept) > $top) {
+        if ($top > 0 && count($kept) > $top) {
             $kept = array_slice($kept, 0, $top);
         }
         $fromLive = count($kept);
@@ -750,19 +802,24 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         $max = $max === null ? $at : max($max, $at);
     }
 
+    $meta = [
+        'environment' => $environment,
+        'from_cache' => $fromCache,
+        'from_live' => $fromLive,
+        'max_age' => $maxAge,
+        'fetched_at_min' => $min,
+        'fetched_at_max' => $max,
+        'bc_filter' => $pushed,
+        'filter_mode' => $mode,
+        'filter_note' => mimir_filter_note($mode),
+    ];
+    if ($batchCount > 1) {
+        $meta['filter_batches'] = $batchCount;
+    }
+
     return [
         'value' => $value,
-        'meta' => [
-            'environment' => $environment,
-            'from_cache' => $fromCache,
-            'from_live' => $fromLive,
-            'max_age' => $maxAge,
-            'fetched_at_min' => $min,
-            'fetched_at_max' => $max,
-            'bc_filter' => $pushed,
-            'filter_mode' => $mode,
-            'filter_note' => mimir_filter_note($mode),
-        ],
+        'meta' => $meta,
     ];
 }
 
@@ -824,7 +881,7 @@ function mimir_serve_from_coverage(
         }
         $rows[] = $current;
     }
-    if (count($rows) > $top) {
+    if ($top > 0 && count($rows) > $top) {
         $rows = array_slice($rows, 0, $top);
     }
     $out = [];
@@ -904,7 +961,7 @@ function mimir_refresh_whole_row(
  * @param list<string> $select
  * @param array<string, string> $types
  * @param callable(string): array $fetch
- * @return array{rows: list<array{payload: array<string, mixed>, fetched_at: int}>, mode: string, pushed: ?string}
+ * @return array{rows: list<array{payload: array<string, mixed>, fetched_at: int}>, mode: string, pushed: ?string, truncated: bool}
  */
 function mimir_fetch_collection(
     PDO $pdo,
@@ -919,7 +976,8 @@ function mimir_fetch_collection(
     ?string $pushed,
     string $mode,
     callable $fetch,
-    int $now
+    int $now,
+    bool $writeCoverage = true
 ): array {
     $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch): array {
         $query = ['$top' => MIMIR_ODATA_PAGE_SIZE];
@@ -967,13 +1025,13 @@ function mimir_fetch_collection(
         $stored[] = ['payload' => $clean, 'fetched_at' => $now];
     }
 
-    if (!$pages['truncated']) {
+    if ($writeCoverage && !$pages['truncated']) {
         $filterSig = $pushed ?? '';
         $selectSig = mimir_select_sig($select);
         mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($stored));
     }
 
-    return ['rows' => $stored, 'mode' => $mode, 'pushed' => $pushed];
+    return ['rows' => $stored, 'mode' => $mode, 'pushed' => $pushed, 'truncated' => $pages['truncated']];
 }
 
 /**

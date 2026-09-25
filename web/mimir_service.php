@@ -67,6 +67,9 @@ function mimir_parse_route(string $route): array
     if ($route === 'query') {
         return ['action' => 'query'];
     }
+    if ($route === 'companies') {
+        return ['action' => 'companies'];
+    }
     return ['action' => 'unknown'];
 }
 
@@ -483,7 +486,7 @@ function mimir_api_main(?string $forcedRoute = null): void
     $parsed = mimir_parse_route($route);
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     if ($parsed['action'] === 'unknown') {
-        mimir_json(['error' => 'Onbekend endpoint. Gebruik tables, tables/{naam}/schema of query.'], 404);
+        mimir_json(['error' => 'Onbekend endpoint. Gebruik tables, tables/{naam}/schema, query of companies.'], 404);
     }
 
     mimir_usage_log($pdo, $record['id'], $parsed['action'], time());
@@ -497,6 +500,18 @@ function mimir_api_main(?string $forcedRoute = null): void
             }
             $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
             mimir_json(['value' => $listed['tables'], 'environment' => $listed['environment']]);
+        }
+        if ($parsed['action'] === 'companies') {
+            if ($method !== 'GET') {
+                mimir_json(['error' => 'GET verwacht.'], 405);
+            }
+            // Cache only — zelfde pad als de UI zonder ?live=1.
+            $catalog = mimir_company_catalog($pdo, $now, false);
+            mimir_json([
+                'value' => $catalog['companies'],
+                'fetched_at' => $catalog['fetched_at'],
+                'source' => $catalog['source'],
+            ]);
         }
         if ($parsed['action'] === 'schema') {
             if ($method !== 'GET') {

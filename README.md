@@ -8,7 +8,7 @@ De pagina staat in `web/` en gaat via FTP naar `/var/www/html/mimir/`.
 
 - `web/index.php` — verkenner (SSO). Tabel kiezen, filters, kolommen, resultaat, API-sleutels.
 - `web/ui_api.php` — JSON voor die pagina. Zelfde login als de pagina. `max_age` staat hier vast op **600 seconden**.
-- `web/api/` — API met sleutel (`tables.php`, `schema.php`, `query.php`, of `index.php` met `PATH_INFO` / `?route=`).
+- `web/api/` — API met sleutel (`tables.php`, `schema.php`, `query.php`, `companies.php`, of `index.php` met `PATH_INFO` / `?route=`).
 - `web/odata.php` — BC-client (basic of NTLM, paginering via `@odata.nextLink`, `$metadata`).
 - `web/mimir_store.php` — SQLite: rijcache, dekking van een fetch, API-sleutels, usage.
 - `web/mimir_filter.php` — filterboom `and` / `or` / `xor`.
@@ -93,6 +93,8 @@ BC antwoordt vaak met **HTTP 501** op een OR over verschillende velden. XOR best
 
 Komt er toch een 501 terug, dan haalt Mímir dezelfde set opnieuw op zonder `$filter` en past de boom alsnog lokaal toe.
 
+Grote same-field OR-lijsten (JSON of eenvoudige `$filter`-string) batcht Mímir automatisch (40 per keer, korter bij te lange URL), zodat clients één query kunnen sturen.
+
 Paginering volgt `@odata.nextLink` tot de set klaar is (plafond 100 pagina's van 2000). Alleen een afgeronde set wordt als dekking bewaard.
 
 ## API-sleutels
@@ -111,11 +113,13 @@ Authenticatie: `Authorization: Bearer <sleutel>` of `X-API-Key: <sleutel>`.
 | --- | --- | --- |
 | GET | `/mimir/api/tables.php?company=…` | entity sets van het environment van dat bedrijf. `q` filtert op naam |
 | GET | `/mimir/api/schema.php?table=ItemList&company=…` | velden, types, sleutels van dat environment |
+| GET | `/mimir/api/companies.php` | bedrijven uit de nightly-cache (`name` + `environment`). Geen live discovery per call |
 | POST | `/mimir/api/query.php` | één tabel, of meerdere via `queries` |
 
 Zonder `PATH_INFO` werken ook:
 
 - `GET /mimir/api/index.php?route=tables`
+- `GET /mimir/api/index.php?route=companies`
 - `GET /mimir/api/index.php/tables/ItemList/schema`
 - `POST /mimir/api/index.php/query`
 
@@ -137,7 +141,19 @@ curl -sS \
   "https://sleutels.kvt.nl/mimir/api/query.php"
 ```
 
-Antwoord: `{ "value": [ … ], "meta": { "environment", "from_cache", "from_live", "max_age", "fetched_at_min", "fetched_at_max", "bc_filter", "filter_mode", "filter_note" } }`. `environment` is de BC-database die bij het bedrijf hoort.
+Antwoord: `{ "value": [ … ], "meta": { "environment", "from_cache", "from_live", "max_age", "fetched_at_min", "fetched_at_max", "bc_filter", "filter_mode", "filter_note", "filter_batches?" } }`. `environment` is de BC-database die bij het bedrijf hoort.
+
+### Query-opties
+
+- **`filter`**: JSON-boom (`and` / `or` / `xor` + bladeren) zoals voorheen, **of** een niet-lege OData `$filter`-string. Een string gaat ongewijzigd naar BC (`filter_mode=bc`); lokaal matchen wordt overgeslagen. Maximale lengte 32 768 tekens.
+- **`top`**: default **100**. Positief tot **10 000**. **`0` = ongelimiteerd** (geen `array_slice`; wel bestaande `@odata.nextLink`-paginering van 2000).
+- **Automatische OR-batching**: een grote same-field `or` van `eq`-bladeren (JSON-boom of eenvoudige string `(Field eq 'a') or (Field eq 'b') or …`) wordt intern in chunks van **40** (of kleiner bij lange URL) naar BC gestuurd. Resultaten worden op rijsleutel samengevoegd. Clients hoeven zelf niet meer te chunken. Bij meer dan één batch staat `meta.filter_batches` op het aantal. Complexe strings die niet veilig te splitsen zijn, gaan als één `$filter` (nextLink blijft gelden).
+
+```sh
+curl -sS -H "Authorization: Bearer mimir_…"   "https://sleutels.kvt.nl/mimir/api/companies.php"
+
+curl -sS   -H "Authorization: Bearer mimir_…"   -H "Content-Type: application/json"   -d '{"company":"Koninklijke van Twist","table":"ItemList","top":0,"filter":"(No eq 'A') or (No eq 'B')"}'   "https://sleutels.kvt.nl/mimir/api/query.php"
+```
 
 Meerdere tabellen in één verzoek, met een optionele equijoin (v1, één sleutel, na het ophalen — geen join in BC):
 

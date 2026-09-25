@@ -173,4 +173,50 @@ mimir_cache_same(count($calls), 2, '501 retries without $filter');
 mimir_cache_same($retry['meta']['filter_mode'], 'local', 'retry is local');
 mimir_cache_same(count($retry['value']), 1, 'local eq still applied after 501');
 
+
+$pdo = mimir_db(':memory:');
+$calls = [];
+$orLeaves = [];
+for ($i = 0; $i < 45; $i++) {
+    $orLeaves[] = ['field' => 'No', 'op' => 'eq', 'value' => 'N' . $i];
+}
+$batched = mimir_query_entity($pdo, mimir_job([
+    'filter' => ['or' => $orLeaves],
+    'top' => 0,
+]), function (string $url) use (&$calls): array {
+    $calls[] = $url;
+    $decoded = rawurldecode($url);
+    $rows = [];
+    if (preg_match_all("/No eq '([^']*)'/", $decoded, $matches) > 0) {
+        foreach ($matches[1] as $no) {
+            $rows[] = ['No' => $no, 'Description' => 'd-' . $no];
+        }
+    }
+    return ['value' => $rows];
+}, $now);
+mimir_cache_same(count($calls), 2, '45 OR eqs => two BC batches');
+mimir_cache_same($batched['meta']['filter_batches'] ?? null, 2, 'meta filter_batches');
+mimir_cache_same(count($batched['value']), 45, 'top zero unlimited');
+
+$pdo = mimir_db(':memory:');
+$calls = [];
+$stringFilter = implode(' or ', array_map(static fn ($i) => "(No eq 'S{$i}')", range(0, 41)));
+$strBatched = mimir_query_entity($pdo, mimir_job([
+    'filter' => $stringFilter,
+    'top' => 0,
+]), function (string $url) use (&$calls): array {
+    $calls[] = $url;
+    $decoded = rawurldecode($url);
+    $rows = [];
+    if (preg_match_all("/No eq '([^']*)'/", $decoded, $matches) > 0) {
+        foreach ($matches[1] as $no) {
+            $rows[] = ['No' => $no, 'Description' => $no];
+        }
+    }
+    return ['value' => $rows];
+}, $now);
+mimir_cache_same(count($calls), 2, 'string OR batched');
+mimir_cache_same($strBatched['meta']['filter_mode'], 'bc', 'string filter mode bc');
+mimir_cache_same(count($strBatched['value']), 42, 'string filter returned all');
+
 fwrite(STDOUT, "ok\n");

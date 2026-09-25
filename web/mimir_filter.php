@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 const MIMIR_FILTER_OPS = ['eq', 'ne', 'gt', 'ge', 'lt', 'le', 'contains', 'startswith', 'endswith'];
 const MIMIR_FILTER_MAX_DEPTH = 8;
+const MIMIR_FILTER_MAX_STRING = 32768;
+const MIMIR_FILTER_OR_BATCH = 40;
+/** Max length of one batched $filter string (URL safety). */
+const MIMIR_FILTER_BATCH_MAX_CHARS = 1500;
 
 function mimir_filter_field_ok(string $field): bool
 {
@@ -18,8 +22,17 @@ function mimir_filter_validate(mixed $filter, int $depth = 0): ?string
     if ($filter === null) {
         return null;
     }
+    if (is_string($filter)) {
+        if (trim($filter) === '') {
+            return 'Filter-string mag niet leeg zijn.';
+        }
+        if (strlen($filter) > MIMIR_FILTER_MAX_STRING) {
+            return 'Filter-string is te lang (max ' . MIMIR_FILTER_MAX_STRING . ' tekens).';
+        }
+        return null;
+    }
     if (!is_array($filter)) {
-        return 'Filter moet een object zijn.';
+        return 'Filter moet een object of OData $filter-string zijn.';
     }
     if ($depth > MIMIR_FILTER_MAX_DEPTH) {
         return 'Filter is te diep genest.';
@@ -76,6 +89,12 @@ function mimir_filter_plan(mixed $filter, array $types = []): array
 {
     if ($filter === null) {
         return ['mode' => 'none', 'odata' => null];
+    }
+    if (is_string($filter)) {
+        return ['mode' => 'bc', 'odata' => $filter];
+    }
+    if (!is_array($filter)) {
+        return ['mode' => 'local', 'odata' => null];
     }
     if (isset($filter['and']) && $filter['and'] === []) {
         return ['mode' => 'none', 'odata' => null];
@@ -177,7 +196,7 @@ function mimir_filter_odata_tree(mixed $filter, array $types): ?string
  */
 function mimir_filter_fields(mixed $filter): array
 {
-    if (!is_array($filter)) {
+    if (is_string($filter) || !is_array($filter)) {
         return [];
     }
     foreach (['and', 'or', 'xor'] as $name) {
@@ -269,6 +288,10 @@ function mimir_bool_value(mixed $value): ?bool
 function mimir_filter_match(array $row, mixed $filter, array $types = []): bool
 {
     if ($filter === null) {
+        return true;
+    }
+    // Opaque OData $filter-string: BC heeft al gefilterd.
+    if (is_string($filter)) {
         return true;
     }
     if (!is_array($filter)) {
@@ -375,6 +398,126 @@ function mimir_filter_compare(mixed $actual, string $op, mixed $expected, string
         'le' => $left <= $right,
         default => false,
     };
+}
+
+/**
+ * Splits a list of OData leaf clauses into OR-batches (count and URL length).
+ *
+ * @param list<string> $parts
+ * @return list<string>
+ */
+function mimir_filter_chunk_or_parts(array $parts): array
+{
+    if ($parts === []) {
+        return [];
+    }
+    $batches = [];
+    $current = [];
+    foreach ($parts as $part) {
+        $part = (string) $part;
+        $candidate = array_merge($current, [$part]);
+        $wrapped = '(' . implode(') or (', $candidate) . ')';
+        if (
+            $current !== []
+            && (
+                count($current) >= MIMIR_FILTER_OR_BATCH
+                || strlen($wrapped) > MIMIR_FILTER_BATCH_MAX_CHARS
+            )
+        ) {
+            $batches[] = '(' . implode(') or (', $current) . ')';
+            $current = [$part];
+            continue;
+        }
+        $current = $candidate;
+    }
+    if ($current !== []) {
+        $batches[] = '(' . implode(') or (', $current) . ')';
+    }
+    return $batches;
+}
+
+/**
+ * Detect a simple same-field eq OR string: (Field eq 'a') or (Field eq 'b') …
+ *
+ * @return list<string>|null leaf clauses (Field eq '…'), or null if too complex
+ */
+function mimir_filter_parse_simple_eq_or_string(string $filter): ?array
+{
+    $rest = trim($filter);
+    if ($rest === '') {
+        return null;
+    }
+    $field = null;
+    $parts = [];
+    while ($rest !== '') {
+        if (
+            preg_match(
+                "/^\(?\s*([A-Za-z_][A-Za-z0-9_]*)\s+eq\s+'((?:[^']|'')*)'\s*\)?\s*(?:or\b|$)/i",
+                $rest,
+                $match
+            ) !== 1
+        ) {
+            return null;
+        }
+        $name = $match[1];
+        if ($field === null) {
+            $field = $name;
+        } elseif (strcasecmp($field, $name) !== 0) {
+            return null;
+        }
+        $parts[] = $name . " eq '" . $match[2] . "'";
+        $rest = ltrim(substr($rest, strlen($match[0])));
+    }
+    return $parts === [] ? null : $parts;
+}
+
+/**
+ * Same-field OR of pushable leaves from a JSON tree (top-level `or` only).
+ *
+ * @param array<string, string> $types
+ * @return list<string>|null
+ */
+function mimir_filter_same_field_or_parts(mixed $filter, array $types): ?array
+{
+    if (!is_array($filter) || !isset($filter['or']) || !is_array($filter['or']) || !array_is_list($filter['or'])) {
+        return null;
+    }
+    if (count(mimir_filter_fields($filter)) !== 1) {
+        return null;
+    }
+    $parts = [];
+    foreach ($filter['or'] as $child) {
+        $part = mimir_filter_odata_tree($child, $types);
+        if ($part === null) {
+            return null;
+        }
+        $parts[] = $part;
+    }
+    return $parts === [] ? null : $parts;
+}
+
+/**
+ * OData $filter strings for BC batches. Null = no batching (use the normal single plan).
+ *
+ * @param array<string, string> $types
+ * @return list<string>|null
+ */
+function mimir_filter_odata_batches(mixed $filter, array $types = []): ?array
+{
+    $parts = null;
+    if (is_string($filter)) {
+        $parts = mimir_filter_parse_simple_eq_or_string($filter);
+    } elseif (is_array($filter)) {
+        $parts = mimir_filter_same_field_or_parts($filter, $types);
+    }
+    if ($parts === null) {
+        return null;
+    }
+    $batches = mimir_filter_chunk_or_parts($parts);
+    if (count($batches) <= 1) {
+        return null;
+    }
+    return $batches;
 }
 
 function mimir_filter_note(string $mode): ?string

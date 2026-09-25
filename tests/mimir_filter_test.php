@@ -122,4 +122,31 @@ $schema = mimir_schema_for_set($parsed, 'ItemList');
 mimir_test_same($schema['keys'], ['No'], 'metadata key');
 mimir_test_same($schema['properties']['Inventory'], 'Edm.Decimal', 'metadata property');
 
+
+$stringPlan = mimir_filter_plan("No eq 'A'", $types);
+mimir_test_same($stringPlan['mode'], 'bc', 'string filter plan');
+mimir_test_same($stringPlan['odata'], "No eq 'A'", 'string filter odata passthrough');
+mimir_test_same(mimir_filter_validate(''), 'Filter-string mag niet leeg zijn.', 'empty string rejected');
+mimir_test_same(mimir_filter_validate(str_repeat('x', MIMIR_FILTER_MAX_STRING + 1)) !== null, true, 'long string rejected');
+mimir_test_same(mimir_filter_validate("No eq 'A'"), null, 'string filter ok');
+mimir_test_same(mimir_filter_match(['No' => 'Z'], "No eq 'A'", $types), true, 'string filter match always true');
+
+$many = [];
+for ($i = 0; $i < 85; $i++) {
+    $many[] = ['field' => 'No', 'op' => 'eq', 'value' => 'N' . $i];
+}
+$batches = mimir_filter_odata_batches(['or' => $many], $types);
+mimir_test_same(is_array($batches), true, 'tree OR batches');
+mimir_test_same(count($batches), 3, '85 eqs => 3 batches of 40');
+mimir_test_same(substr_count($batches[0], ' or '), 39, 'first batch has 40 clauses');
+
+$stringOr = [];
+for ($i = 0; $i < 41; $i++) {
+    $stringOr[] = "(No eq 'N" . $i . "')";
+}
+$stringBatches = mimir_filter_odata_batches(implode(' or ', $stringOr), $types);
+mimir_test_same(is_array($stringBatches), true, 'string OR batches');
+mimir_test_same(count($stringBatches), 2, '41 string eqs => 2 batches');
+mimir_test_same(mimir_filter_odata_batches("(No eq 'A') and (Blocked eq true)", $types), null, 'complex string not batched');
+
 fwrite(STDOUT, "ok\n");
