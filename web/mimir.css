@@ -52,7 +52,8 @@ button:disabled { opacity: .5; cursor: default; }
     border: 1px solid var(--kvt-line);
     border-radius: 16px;
     margin-bottom: 16px;
-    overflow: hidden;
+    /* visible: anders knipt overflow de absolute combo-list af */
+    overflow: visible;
 }
 
 .panel-head { padding: 16px 16px 0; }
@@ -79,10 +80,11 @@ input, select {
     background: #fff;
 }
 
+.toolbar, .combo-field, .combo { overflow: visible; }
 .combo { position: relative; }
 .combo-list {
     position: absolute;
-    z-index: 20;
+    z-index: 40;
     left: 0;
     right: 0;
     top: calc(100% + 4px);
