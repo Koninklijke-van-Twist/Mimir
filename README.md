@@ -97,6 +97,8 @@ Voor aaneengesloten ranges op **één** vergelijkbaar veld (`eq` / `ge` / `gt` /
 
 Business Central laat ongeveer vijf gelijktijdige requests per environment toe. Mímir beperkt live BC-fetches tot **3** tegelijk per environment (`kvtmdlive_aad` en `kvtgermanylive_aad` hebben aparte tellers), met een FIFO-wachtlijst in SQLite (`web/data/bc_limit.sqlite`). Antwoorden die volledig uit de cache komen nemen geen slot. Wie moest wachten krijgt `meta.queue_wait_ms` (en optioneel `bc_slots_used` / `bc_slots_max`). Na **120** seconden wachten volgt HTTP **503** in plaats van oneindig hangen. Constanten: `MIMIR_BC_MAX_CONCURRENT`, `MIMIR_BC_QUEUE_WAIT_SECONDS` in `web/mimir_bc_limit.php`.
 
+Een worker die midden in een request sterft (PHP-timeout, OOM, deploy) laat anders een slot of een wacht-rij achter. Houders ouder dan **360** seconden (`MIMIR_BC_SLOT_STALE_SECONDS`, net boven `CURLOPT_TIMEOUT` 300 in `odata.php`) worden vrijgegeven. Wacht-rijen ouder dan max(wachtbudget, 30) + 30 seconden (`mimir_bc_limit_waiter_stale_seconds()`, standaard `MIMIR_BC_WAITER_STALE_SECONDS` = 150) gaan op elke poll weg, zodat een dode FIFO-kop de limiet niet blijvend blokkeert. Daarnaast geeft een shutdown-handler slots van dit proces vrij als `finally` niet liep. Staat de wachtrij al vast vóór deze versie live is, dan eenmalig in `web/data/bc_limit.sqlite`: `DELETE FROM bc_holders; DELETE FROM bc_waiters;`.
+
 
 De UI gebruikt altijd `max_age` 600. De API laat de aanroeper dat bepalen (default 3600, maximum 365 dagen).
 
@@ -222,6 +224,7 @@ Zonder Business Central:
 php tests/mimir_filter_test.php
 php tests/mimir_cache_test.php
 php tests/mimir_bc_reduce_test.php
+php tests/mimir_bc_limit_test.php
 php tests/mimir_keys_test.php
 php tests/mimir_heatmap_test.php
 php tests/mimir_auth_env_test.php

@@ -7,12 +7,32 @@ declare(strict_types=1);
  * Per environment (bijv. kvtmdlive_aad) apart, FIFO-wachtlijst via SQLite.
  *
  * In-memory counters werken niet onder Apache mod_php (meerdere workers).
+ * Sterft een worker midden in een request (PHP-timeout, OOM, deploy), dan
+ * loopt `finally` soms niet. Ghost holders en vooral een dode FIFO-kop in
+ * bc_waiters worden daarom op elke poll opgeruimd; een shutdown-handler
+ * geeft slots van dit proces alsnog vrij.
  */
 
 const MIMIR_BC_MAX_CONCURRENT = 3;
 const MIMIR_BC_QUEUE_WAIT_SECONDS = 120;
-/** Houders ouder dan dit (seconden) gelden als vastgelopen worker en worden vrijgegeven. */
-const MIMIR_BC_SLOT_STALE_SECONDS = 600;
+/**
+ * Ghost holders (gedode worker, rij blijft in bc_holders) vervallen na dit
+ * aantal seconden. 360 ligt net boven CURLOPT_TIMEOUT 300 in odata.php:
+ * één lopende BC-call wordt niet halverwege afgepakt, en een dode houder
+ * houdt de capaciteit niet tien minuten (de oude 600s) bezet.
+ */
+const MIMIR_BC_SLOT_STALE_SECONDS = 360;
+/**
+ * Standaardleeftijd (seconden) waarna een bc_waiters-rij als dood geldt:
+ * max(MIMIR_BC_QUEUE_WAIT_SECONDS, 30) + 30 = 150.
+ * Een levende waiter stopt zelf bij het wachtbudget en wist zijn rij. Deze
+ * grens is dat budget plus een kleine grace, zodat een worker die in de
+ * wachtrij sterft niet voor altijd FIFO-kop blijft — anders ziet iedereen
+ * "BC-concurrency limiet" terwijl er niets meer naar BC gaat.
+ * Bij een afwijkend wachtbudget geldt dezelfde formule via
+ * mimir_bc_limit_waiter_stale_seconds().
+ */
+const MIMIR_BC_WAITER_STALE_SECONDS = 150;
 const MIMIR_BC_LIMIT_POLL_US = 50000;
 
 /**
@@ -57,6 +77,17 @@ function mimir_bc_limit_queue_wait_seconds(): int
     }
 
     return MIMIR_BC_QUEUE_WAIT_SECONDS;
+}
+
+/**
+ * Leeftijd in seconden waarna een waiter-rij op de poll-pad wordt verwijderd.
+ * max(queue-wait, 30) + 30. De vloer van 30s voorkomt dat een heel kort
+ * wachtbudget een waiter die nog aan het pollen is meteen wist.
+ * Standaard (wachtbudget 120) is dit MIMIR_BC_WAITER_STALE_SECONDS (150).
+ */
+function mimir_bc_limit_waiter_stale_seconds(): int
+{
+    return max(mimir_bc_limit_queue_wait_seconds(), 30) + 30;
 }
 
 function mimir_bc_limit_now(): float
@@ -152,9 +183,15 @@ function mimir_bc_limit_migrate(PDO $pdo): void
 
 function mimir_bc_limit_cleanup_stale(PDO $pdo, string $environment): void
 {
-    $cutoff = time() - MIMIR_BC_SLOT_STALE_SECONDS;
-    $stmt = $pdo->prepare('DELETE FROM bc_holders WHERE environment = :e AND acquired_at < :c');
-    $stmt->execute([':e' => $environment, ':c' => $cutoff]);
+    $holderCutoff = time() - MIMIR_BC_SLOT_STALE_SECONDS;
+    $pdo->prepare('DELETE FROM bc_holders WHERE environment = :e AND acquired_at < :c')
+        ->execute([':e' => $environment, ':c' => $holderCutoff]);
+
+    // Zelfde klok als enqueued_at (mimir_bc_limit_now). Een dode kop anders
+    // blokkeert elke latere acquire, ook als er geen holders meer zijn.
+    $waiterCutoff = sprintf('%.6F', mimir_bc_limit_now() - mimir_bc_limit_waiter_stale_seconds());
+    $pdo->prepare('DELETE FROM bc_waiters WHERE environment = :e AND enqueued_at < :c')
+        ->execute([':e' => $environment, ':c' => $waiterCutoff]);
 }
 
 function mimir_bc_limit_throw_timeout(string $environment, int $waitSeconds, int $max): never
@@ -239,6 +276,7 @@ function mimir_bc_slot_acquire(string $environment): int
                         'holder_id' => $holderId,
                         'wait_ms' => $waitMs,
                     ];
+                    mimir_bc_limit_register_shutdown_release();
 
                     return $waitMs;
                 }
@@ -332,10 +370,53 @@ function mimir_bc_with_slot(string $environment, callable $fn): mixed
 }
 
 /**
+ * Eenmalig per proces: als finally niet liep (timeout/OOM/deploy), geef
+ * wat dit proces nog vasthoudt alsnog vrij. Normale release blijft primair.
+ * Idempotent en slikt fouten — een response mag hier niet op stuklopen.
+ */
+function mimir_bc_limit_register_shutdown_release(): void
+{
+    static $registered = false;
+    if ($registered) {
+        return;
+    }
+    $registered = true;
+    $GLOBALS['mimir_bc_shutdown_registered'] = true;
+    register_shutdown_function('mimir_bc_limit_shutdown_release');
+}
+
+function mimir_bc_limit_shutdown_release(): void
+{
+    try {
+        if (!isset($GLOBALS['mimir_bc_held']) || !is_array($GLOBALS['mimir_bc_held'])) {
+            return;
+        }
+        foreach (array_keys($GLOBALS['mimir_bc_held']) as $environment) {
+            if (!is_string($environment)) {
+                unset($GLOBALS['mimir_bc_held'][$environment]);
+                continue;
+            }
+            $refs = (int) ($GLOBALS['mimir_bc_held'][$environment]['refs'] ?? 1);
+            if ($refs < 1) {
+                $refs = 1;
+            }
+            for ($i = 0; $i < $refs; $i++) {
+                if (!isset($GLOBALS['mimir_bc_held'][$environment])) {
+                    break;
+                }
+                mimir_bc_slot_release($environment);
+            }
+            unset($GLOBALS['mimir_bc_held'][$environment]);
+        }
+    } catch (Throwable) {
+    }
+}
+
+/**
  * Test/sim: zet een "vreemde" houder zonder process-lokale refcount
  * (alsof een andere Apache-worker het slot heeft).
  */
-function mimir_bc_slot_force_hold(string $environment, string $holderId): void
+function mimir_bc_slot_force_hold(string $environment, string $holderId, ?int $acquiredAt = null): void
 {
     $pdo = mimir_bc_limit_db();
     $pdo->prepare(
@@ -344,7 +425,22 @@ function mimir_bc_slot_force_hold(string $environment, string $holderId): void
     )->execute([
         ':e' => trim($environment),
         ':h' => $holderId,
-        ':t' => time(),
+        ':t' => $acquiredAt ?? time(),
+    ]);
+}
+
+/**
+ * Test/sim: zet een vreemde waiter (alsof een andere worker in de wachtrij staat).
+ */
+function mimir_bc_slot_force_wait(string $environment, string $waiterId, ?float $enqueuedAt = null): void
+{
+    $pdo = mimir_bc_limit_db();
+    $pdo->prepare(
+        'INSERT INTO bc_waiters (environment, waiter_id, enqueued_at) VALUES (:e, :w, :t)'
+    )->execute([
+        ':e' => trim($environment),
+        ':w' => $waiterId,
+        ':t' => $enqueuedAt ?? mimir_bc_limit_now(),
     ]);
 }
 

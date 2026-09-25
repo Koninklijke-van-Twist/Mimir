@@ -26,6 +26,10 @@ $GLOBALS['mimir_bc_queue_wait_seconds'] = 120;
 unset($GLOBALS['mimir_bc_limit_sleep'], $GLOBALS['mimir_bc_limit_now']);
 mimir_bc_limit_test_reset();
 
+mimir_bcl_same(MIMIR_BC_SLOT_STALE_SECONDS, 360, 'holder stale cutoff is 360s');
+mimir_bcl_same(MIMIR_BC_WAITER_STALE_SECONDS, max(MIMIR_BC_QUEUE_WAIT_SECONDS, 30) + 30, 'waiter stale constant matches default formula');
+mimir_bcl_same(mimir_bc_limit_waiter_stale_seconds(), MIMIR_BC_WAITER_STALE_SECONDS, 'default waiter stale age');
+
 // --- (1) Direct acquire / release ---
 $wait = mimir_bc_slot_acquire('kvtmdlive_aad');
 mimir_bcl_same($wait >= 0, true, 'acquire returns non-negative wait_ms');
@@ -171,6 +175,84 @@ mimir_bcl_same($live['meta']['queue_wait_ms'] >= 0, true, 'live queue_wait_ms pr
 mimir_bcl_same($live['meta']['bc_slots_max'], 3, 'bc_slots_max in meta');
 mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 0, 'slot released after query');
 mimir_bcl_same(count($live['value']), 2, 'both pages in result');
+
+// --- (8) Stale holder past cutoff is removed and does not block ---
+mimir_bc_limit_test_reset();
+$GLOBALS['mimir_bc_max_concurrent'] = 1;
+$GLOBALS['mimir_bc_queue_wait_seconds'] = 0;
+unset($GLOBALS['mimir_bc_limit_sleep'], $GLOBALS['mimir_bc_limit_now']);
+mimir_bc_slot_force_hold('kvtmdlive_aad', 'ghost-holder', time() - MIMIR_BC_SLOT_STALE_SECONDS - 5);
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 0, 'stale holder cleaned on count');
+$pdoLimit = mimir_bc_limit_db();
+$ghostLeft = (int) $pdoLimit->query("SELECT COUNT(*) FROM bc_holders WHERE holder_id = 'ghost-holder'")->fetchColumn();
+mimir_bcl_same($ghostLeft, 0, 'stale holder row deleted');
+$afterGhost = mimir_bc_slot_acquire('kvtmdlive_aad');
+mimir_bcl_same($afterGhost >= 0, true, 'acquire proceeds after stale holder cleanup');
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 1, 'only the new holder remains');
+mimir_bc_slot_release('kvtmdlive_aad');
+
+mimir_bc_slot_force_hold('kvtmdlive_aad', 'fresh-holder', time() - 30);
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 1, 'holder younger than cutoff stays');
+$freshBlocked = false;
+try {
+    mimir_bc_slot_acquire('kvtmdlive_aad');
+} catch (MimirUserException $error) {
+    $freshBlocked = true;
+    mimir_bcl_same($error->status, 503, 'fresh holder still yields 503');
+}
+mimir_bcl_same($freshBlocked, true, 'non-stale holder still blocks');
+mimir_bc_slot_force_release('kvtmdlive_aad', 'fresh-holder');
+
+// --- (9) Dead waiter at head does not block a new acquire ---
+mimir_bc_limit_test_reset();
+$GLOBALS['mimir_bc_max_concurrent'] = 1;
+$GLOBALS['mimir_bc_queue_wait_seconds'] = 0;
+unset($GLOBALS['mimir_bc_limit_sleep'], $GLOBALS['mimir_bc_limit_now']);
+mimir_bcl_same(mimir_bc_limit_waiter_stale_seconds(), 60, 'short queue budget still waits 60s before reaping waiters');
+$staleWaiterAt = microtime(true) - (mimir_bc_limit_waiter_stale_seconds() + 5);
+mimir_bc_slot_force_wait('kvtmdlive_aad', 'dead-head', $staleWaiterAt);
+$afterDeadWaiter = mimir_bc_slot_acquire('kvtmdlive_aad');
+mimir_bcl_same($afterDeadWaiter >= 0, true, 'stale head waiter does not block acquire');
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 1, 'slot taken despite dead waiter');
+$pdoLimit = mimir_bc_limit_db();
+$deadLeft = (int) $pdoLimit->query("SELECT COUNT(*) FROM bc_waiters WHERE waiter_id = 'dead-head'")->fetchColumn();
+mimir_bcl_same($deadLeft, 0, 'dead head waiter row removed');
+mimir_bc_slot_release('kvtmdlive_aad');
+
+mimir_bc_slot_force_wait('kvtmdlive_aad', 'live-head', microtime(true));
+$liveBlocked = false;
+try {
+    mimir_bc_slot_acquire('kvtmdlive_aad');
+} catch (MimirUserException) {
+    $liveBlocked = true;
+}
+mimir_bcl_same($liveBlocked, true, 'fresh head waiter still blocks');
+$liveLeft = (int) $pdoLimit->query("SELECT COUNT(*) FROM bc_waiters WHERE waiter_id = 'live-head'")->fetchColumn();
+mimir_bcl_same($liveLeft, 1, 'fresh waiter kept');
+$selfLeft = (int) $pdoLimit->query("SELECT COUNT(*) FROM bc_waiters WHERE waiter_id != 'live-head'")->fetchColumn();
+mimir_bcl_same($selfLeft, 0, 'timed-out acquire removed its own waiter');
+
+// --- (10) Shutdown release drops remaining holds (including nested refs) ---
+mimir_bc_limit_test_reset();
+$GLOBALS['mimir_bc_max_concurrent'] = 3;
+$GLOBALS['mimir_bc_queue_wait_seconds'] = 5;
+unset($GLOBALS['mimir_bc_limit_sleep'], $GLOBALS['mimir_bc_limit_now']);
+mimir_bc_slot_acquire('kvtmdlive_aad');
+mimir_bc_slot_acquire('kvtmdlive_aad');
+mimir_bc_slot_acquire('kvtgermanylive_aad');
+mimir_bcl_same(!empty($GLOBALS['mimir_bc_shutdown_registered']), true, 'shutdown release registered on acquire');
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 1, 'nl held before shutdown');
+mimir_bcl_same(mimir_bc_slots_used('kvtgermanylive_aad'), 1, 'de held before shutdown');
+mimir_bc_limit_shutdown_release();
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 0, 'shutdown released nl including nested refs');
+mimir_bcl_same(mimir_bc_slots_used('kvtgermanylive_aad'), 0, 'shutdown released de');
+mimir_bcl_same($GLOBALS['mimir_bc_held'], [], 'process hold map cleared');
+mimir_bc_limit_shutdown_release();
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 0, 'second shutdown is a no-op');
+$afterShutdown = mimir_bc_slot_acquire('kvtmdlive_aad');
+mimir_bcl_same($afterShutdown >= 0, true, 'acquire works after shutdown release');
+mimir_bc_slot_release('kvtmdlive_aad');
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 0, 'normal release still works after shutdown');
 
 // cleanup
 mimir_bc_limit_test_reset();
