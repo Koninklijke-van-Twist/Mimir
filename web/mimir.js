@@ -363,16 +363,124 @@
         return new Intl.DateTimeFormat('nl-NL', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(unix * 1000));
     }
 
+    const heatmapDefaults = {
+        rows: 4,
+        cols: 7,
+        cell_px: 14,
+        gap_px: 2,
+        intensity_max: 20,
+        over_limit_multiplier: 5,
+    };
+
+    function formatDutchDate(dateText) {
+        const parts = String(dateText || '').split('-');
+        if (parts.length !== 3) return dateText;
+        const date = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+        return date.toLocaleDateString('nl-NL', { day: 'numeric', month: 'long', year: 'numeric' });
+    }
+
+    function todayDateKey() {
+        const now = new Date();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const day = String(now.getDate()).padStart(2, '0');
+        return now.getFullYear() + '-' + month + '-' + day;
+    }
+
+    function mimirHeatLevel(count, max) {
+        if (count <= 0) return '';
+        if (count > max) return 'level-over';
+        if (count >= max) return 'level-max';
+        if (count >= Math.ceil(max * 0.75)) return 'level-4';
+        if (count >= Math.ceil(max * 0.5)) return 'level-3';
+        if (count >= Math.ceil(max * 0.25)) return 'level-2';
+        return 'level-1';
+    }
+
+    function mimirHeatLimitRgb(count, max, multiplier) {
+        const value = Number(count || 0);
+        const limit = Number(max || 0);
+        if (value < limit || limit <= 0) return null;
+        const from = [255, 255, 0];
+        const to = [255, 136, 0];
+        const cap = limit * multiplier;
+        if (value >= cap) return to;
+        const range = cap - limit;
+        const ratio = range > 0 ? ((value - limit) / range) : 1;
+        return [
+            Math.round(from[0] + ((to[0] - from[0]) * ratio)),
+            Math.round(from[1] + ((to[1] - from[1]) * ratio)),
+            Math.round(from[2] + ((to[2] - from[2]) * ratio)),
+        ];
+    }
+
+    function mimirHeatFill(count, future, max, multiplier) {
+        if (future) return 'rgb(246, 247, 249)';
+        const highlight = mimirHeatLimitRgb(count, max, multiplier);
+        if (highlight) return 'rgb(' + highlight.join(',') + ')';
+        switch (mimirHeatLevel(count, max)) {
+            case 'level-1': return 'rgba(0, 153, 204, 0.22)';
+            case 'level-2': return 'rgba(0, 153, 204, 0.42)';
+            case 'level-3': return 'rgba(0, 153, 204, 0.62)';
+            case 'level-4': return 'rgba(0, 153, 204, 0.82)';
+            case 'level-max': return 'rgb(0, 153, 204)';
+            default: return 'rgb(235, 237, 240)';
+        }
+    }
+
+    function mimirHeatTitle(day) {
+        if (day.future) return formatDutchDate(day.date) + ' — nog niet bereikt';
+        const count = Number(day.count || 0);
+        const label = count === 1 ? '1 aanroep' : (count + ' aanroepen');
+        return formatDutchDate(day.date) + ' — ' + label;
+    }
+
+    function renderHeatmapSvg(days, options) {
+        const settings = Object.assign({}, heatmapDefaults, options || {});
+        const list = Array.isArray(days) ? days : [];
+        const cols = Number(settings.cols) || heatmapDefaults.cols;
+        const cellPx = Number(settings.cell_px) || heatmapDefaults.cell_px;
+        const gapPx = Number(settings.gap_px);
+        const max = Number(settings.intensity_max) || heatmapDefaults.intensity_max;
+        const multiplier = Number(settings.over_limit_multiplier) || heatmapDefaults.over_limit_multiplier;
+        const width = (cols * cellPx) + (Math.max(0, cols - 1) * gapPx);
+        const height = (Math.ceil(list.length / cols) * cellPx) + (Math.max(0, Math.ceil(list.length / cols) - 1) * gapPx);
+        const todayKey = todayDateKey();
+        const pad = 1;
+        let shapes = '';
+        for (let index = 0; index < list.length; index++) {
+            const day = list[index] || {};
+            const col = index % cols;
+            const row = Math.floor(index / cols);
+            const x = col * (cellPx + gapPx);
+            const y = row * (cellPx + gapPx);
+            const future = !!day.future;
+            const count = Number(day.count || 0);
+            const isToday = String(day.date || '') === todayKey;
+            const stroke = isToday ? 'rgb(230, 152, 152)' : (future ? 'rgba(0, 0, 0, 0.03)' : 'rgba(0, 0, 0, 0.04)');
+            shapes += '<rect x="' + x + '" y="' + y + '" width="' + cellPx + '" height="' + cellPx + '" rx="2"'
+                + ' fill="' + mimirHeatFill(count, future, max, multiplier) + '" stroke="' + stroke + '">'
+                + '<title>' + esc(mimirHeatTitle(day)) + '</title></rect>';
+            if (!future && count > max) {
+                const centerX = x + (cellPx / 2);
+                const centerY = y + (cellPx / 2) + 1;
+                shapes += '<text x="' + centerX + '" y="' + centerY + '" text-anchor="middle" dominant-baseline="middle" font-size="10" pointer-events="none" aria-hidden="true">⭐</text>';
+            }
+        }
+        return '<svg class="heatmap-svg" width="' + width + '" height="' + height + '" viewBox="' + (-pad) + ' ' + (-pad) + ' ' + (width + (pad * 2)) + ' ' + (height + (pad * 2)) + '" role="img" aria-label="Aanroepen per dag, maandag tot zondag">' + shapes + '</svg>';
+    }
+
     async function loadKeys() {
         try {
             const data = await api('ui_api.php?action=keys');
             const rows = data.value || [];
+            const heatmap = data.heatmap || heatmapDefaults;
             keysBody.innerHTML = rows.length ? rows.map(function (row) {
                 const avg = new Intl.NumberFormat('nl-NL', { maximumFractionDigits: 2 }).format(row.avg_per_day || 0);
                 const revoked = row.revoked_at ? ' class="revoked"' : '';
                 const button = row.revoked_at ? 'Ingetrokken' : '<button type="button" data-revoke="' + row.id + '">Intrekken</button>';
-                return '<tr' + revoked + '><td>' + esc(row.label) + '</td><td><code class="key">' + esc(row.key) + '</code></td><td>' + avg + '</td><td>' + esc(formatWhen(row.created_at)) + '</td><td>' + button + '</td></tr>';
-            }).join('') : '<tr><td class="empty" colspan="5">Nog geen sleutels.</td></tr>';
+                const grid = renderHeatmapSvg(row.days || [], heatmap);
+                return '<tr' + revoked + '><td>' + esc(row.label) + '</td><td><code class="key">' + esc(row.key) + '</code></td><td>' + avg + '</td><td>' + grid + '<p class="heatmap-caption">ma–zo</p></td><td>' + esc(formatWhen(row.created_at)) + '</td><td>' + button + '</td></tr>';
+            }).join('') : '<tr><td class="empty" colspan="6">Nog geen sleutels.</td></tr>';
         } catch (error) {
             keyStatus.textContent = error.message;
             keyStatus.classList.add('error');

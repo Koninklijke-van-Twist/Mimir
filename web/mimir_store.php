@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/mimir_filter.php';
 require_once __DIR__ . '/odata.php';
+require_once __DIR__ . '/mimir_heatmap.php';
 
 const MIMIR_UI_MAX_AGE = 600;
 const MIMIR_ODATA_PAGE_SIZE = 2000;
@@ -183,7 +184,7 @@ function mimir_key_revoke(PDO $pdo, int $id, string $ownerEmail, int $now): bool
 }
 
 /**
- * @return list<array{id: int, label: string, key: string, created_at: int, revoked_at: ?int, avg_per_day: float}>
+ * @return list<array{id: int, label: string, key: string, created_at: int, revoked_at: ?int, avg_per_day: float, days: list<array{date: string, count: int, future: bool}>}>
  */
 function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
 {
@@ -201,9 +202,50 @@ function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
             'created_at' => (int) $row['created_at'],
             'revoked_at' => $row['revoked_at'] === null ? null : (int) $row['revoked_at'],
             'avg_per_day' => mimir_key_avg_per_day($pdo, $id, $now),
+            'days' => mimir_key_usage_days($pdo, $id, $now),
         ];
     }
     return $rows;
+}
+
+/**
+ * Dagtotalen voor het Mithra-weekraster (maandag als eerste kolom, vier weken).
+ *
+ * @return list<array{date: string, count: int, future: bool}>
+ */
+function mimir_key_usage_days(PDO $pdo, int $keyId, int $now): array
+{
+    $today = mimir_heatmap_today($now);
+    $dates = mimir_heatmap_grid_dates($today);
+    if ($dates === []) {
+        return [];
+    }
+    $zone = mimir_heatmap_timezone();
+    $from = (new DateTimeImmutable($dates[0] . ' 00:00:00', $zone))->getTimestamp();
+    $to = (new DateTimeImmutable($today . ' 23:59:59', $zone))->getTimestamp();
+    return mimir_heatmap_build_grid_days(mimir_usage_counts_by_date($pdo, $keyId, $from, $to), $today);
+}
+
+/**
+ * @return array<string, int>
+ */
+function mimir_usage_counts_by_date(PDO $pdo, int $keyId, int $fromUnix, int $toUnix): array
+{
+    $stmt = $pdo->prepare(
+        'SELECT called_at FROM api_usage WHERE key_id = :id AND called_at >= :from_at AND called_at <= :to_at'
+    );
+    $stmt->execute([
+        ':id' => $keyId,
+        ':from_at' => $fromUnix,
+        ':to_at' => $toUnix,
+    ]);
+    $zone = mimir_heatmap_timezone();
+    $counts = [];
+    while ($calledAt = $stmt->fetchColumn()) {
+        $date = (new DateTimeImmutable('@' . (int) $calledAt))->setTimezone($zone)->format('Y-m-d');
+        $counts[$date] = (int) ($counts[$date] ?? 0) + 1;
+    }
+    return $counts;
 }
 
 function mimir_key_avg_per_day(PDO $pdo, int $keyId, int $now): float

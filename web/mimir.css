@@ -132,6 +132,8 @@ th, td { border-bottom: 1px solid var(--kvt-line); padding: 8px; text-align: lef
 th { color: #00529b; font-size: .75rem; }
 code.key { font-size: .78rem; word-break: break-all; }
 tr.revoked { color: var(--kvt-muted); }
+.heatmap-svg { display: block; }
+.heatmap-caption { margin: 4px 0 0; color: var(--kvt-muted); font-size: .68rem; font-weight: 500; }
 .empty { color: var(--kvt-muted); padding: 8px 0; }
 
 @media (max-width: 800px) {

@@ -72,7 +72,7 @@ Paginering volgt `@odata.nextLink` tot de set klaar is (plafond 100 pagina's van
 
 Aanmaken kan in de pagina, met een label. De volledige sleutel blijft daarna zichtbaar voor de eigenaar: hij staat leesbaar in `web/data/mimir.sqlite` (achter SSO, niet in git, niet via het web — `web/data/.htaccess` weigert alles). Opzoeken van een binnenkomende sleutel gaat via SHA-256 (`key_hash`), niet via een scan op de plaintext.
 
-Per sleutel toont de pagina het gemiddelde aantal calls per dag over de laatste 30×24 uur: `aantal calls / 30`. Intrekken zet `revoked_at`; de sleutel werkt dan niet meer.
+Per sleutel toont de pagina het gemiddelde aantal calls per dag over de laatste 30×24 uur: `aantal calls / 30`. Daarnaast een SVG-weekraster (maandag t/m zondag, vier weken, tijdzone Europe/Amsterdam) met het aantal aanroepen per dag. Hover toont datum en aantal. De intensiteit loopt tot 20 calls op een dag; daarboven wordt het vakje geel tot oranje. Intrekken zet `revoked_at`; de sleutel werkt dan niet meer.
 
 Elke API-call schrijft `key_id`, endpoint en timestamp.
 

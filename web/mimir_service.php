@@ -428,7 +428,10 @@ function mimir_ui_main(): void
     try {
         $email = mimir_session_email();
         if ($action === 'keys' && $method === 'GET') {
-            mimir_json(['value' => mimir_key_list($pdo, $email, $now)]);
+            mimir_json([
+                'value' => mimir_key_list($pdo, $email, $now),
+                'heatmap' => mimir_heatmap_options(),
+            ]);
         }
         if ($action === 'keys_create' && $method === 'POST') {
             $body = mimir_read_json_body();
