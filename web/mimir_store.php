@@ -125,6 +125,7 @@ function mimir_migrate(PDO $pdo): void
             select_sig TEXT NOT NULL,
             fetched_at INTEGER NOT NULL,
             row_count INTEGER NOT NULL,
+            key_id INTEGER,
             PRIMARY KEY (environment, company, entity, filter_sig, select_sig)
         )'
     );
@@ -134,6 +135,10 @@ function mimir_migrate(PDO $pdo): void
              SELECT '', company, entity, filter_sig, select_sig, fetched_at, row_count FROM cache_coverage_legacy"
         );
         $pdo->exec('DROP TABLE cache_coverage_legacy');
+    }
+    $coverageColumns = mimir_sqlite_columns($pdo, 'cache_coverage');
+    if ($coverageColumns !== [] && !in_array('key_id', $coverageColumns, true)) {
+        $pdo->exec('ALTER TABLE cache_coverage ADD COLUMN key_id INTEGER');
     }
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS meta_cache (
@@ -158,10 +163,29 @@ function mimir_migrate(PDO $pdo): void
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             key_id INTEGER NOT NULL,
             endpoint TEXT NOT NULL,
-            called_at INTEGER NOT NULL
+            called_at INTEGER NOT NULL,
+            shared INTEGER NOT NULL DEFAULT 0,
+            bc_hit INTEGER NOT NULL DEFAULT 0,
+            from_cache INTEGER NOT NULL DEFAULT 0,
+            from_live INTEGER NOT NULL DEFAULT 0
         )'
     );
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_api_usage_key_time ON api_usage(key_id, called_at)');
+    $usageColumns = mimir_sqlite_columns($pdo, 'api_usage');
+    if ($usageColumns !== []) {
+        if (!in_array('shared', $usageColumns, true)) {
+            $pdo->exec('ALTER TABLE api_usage ADD COLUMN shared INTEGER NOT NULL DEFAULT 0');
+        }
+        if (!in_array('bc_hit', $usageColumns, true)) {
+            $pdo->exec('ALTER TABLE api_usage ADD COLUMN bc_hit INTEGER NOT NULL DEFAULT 0');
+        }
+        if (!in_array('from_cache', $usageColumns, true)) {
+            $pdo->exec('ALTER TABLE api_usage ADD COLUMN from_cache INTEGER NOT NULL DEFAULT 0');
+        }
+        if (!in_array('from_live', $usageColumns, true)) {
+            $pdo->exec('ALTER TABLE api_usage ADD COLUMN from_live INTEGER NOT NULL DEFAULT 0');
+        }
+    }
 }
 
 function mimir_key_hash(string $key): string
@@ -248,7 +272,7 @@ function mimir_key_revoke(PDO $pdo, int $id, string $ownerEmail, int $now): bool
 }
 
 /**
- * @return list<array{id: int, label: string, key: string, created_at: int, revoked_at: ?int, avg_per_day: float, days: list<array{date: string, count: int, future: bool}>}>
+ * @return list<array{id: int, label: string, key: string, created_at: int, revoked_at: ?int, avg_per_day: float, shared_pct: ?int, days: list<array{date: string, count: int, future: bool}>}>
  */
 function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
 {
@@ -266,6 +290,7 @@ function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
             'created_at' => (int) $row['created_at'],
             'revoked_at' => $row['revoked_at'] === null ? null : (int) $row['revoked_at'],
             'avg_per_day' => mimir_key_avg_per_day($pdo, $id, $now),
+            'shared_pct' => mimir_key_shared_pct($pdo, $id, $now),
             'days' => mimir_key_usage_days($pdo, $id, $now),
         ];
     }
@@ -321,14 +346,128 @@ function mimir_key_avg_per_day(PDO $pdo, int $keyId, int $now): float
     return $count / 30;
 }
 
-function mimir_usage_log(PDO $pdo, int $keyId, string $endpoint, int $now): void
+function mimir_key_shared_pct(PDO $pdo, int $keyId, int $now): ?int
 {
-    $stmt = $pdo->prepare('INSERT INTO api_usage (key_id, endpoint, called_at) VALUES (:id, :endpoint, :at)');
+    return mimir_usage_shared_pct($pdo, $now, $keyId);
+}
+
+/**
+ * Global shared % across all API keys (same 7-day query window). Null when no query calls.
+ */
+function mimir_usage_shared_pct_global(PDO $pdo, int $now): ?int
+{
+    return mimir_usage_shared_pct($pdo, $now, null);
+}
+
+/**
+ * Percentage of query calls in the past 7 days counted as shared cache hits.
+ * Null when there were no query calls in the window (UI shows —).
+ */
+function mimir_usage_shared_pct(PDO $pdo, int $now, ?int $keyId): ?int
+{
+    $since = $now - (7 * 86400);
+    if ($keyId === null) {
+        $stmt = $pdo->prepare(
+            "SELECT COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN shared = 1 THEN 1 ELSE 0 END), 0) AS shared_count
+             FROM api_usage
+             WHERE endpoint = 'query' AND called_at >= :since"
+        );
+        $stmt->execute([':since' => $since]);
+    } else {
+        $stmt = $pdo->prepare(
+            "SELECT COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN shared = 1 THEN 1 ELSE 0 END), 0) AS shared_count
+             FROM api_usage
+             WHERE key_id = :id AND endpoint = 'query' AND called_at >= :since"
+        );
+        $stmt->execute([':id' => $keyId, ':since' => $since]);
+    }
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!is_array($row)) {
+        return null;
+    }
+    $total = (int) ($row['total'] ?? 0);
+    if ($total === 0) {
+        return null;
+    }
+    return (int) round(100 * ((int) ($row['shared_count'] ?? 0)) / $total);
+}
+
+function mimir_usage_log(
+    PDO $pdo,
+    int $keyId,
+    string $endpoint,
+    int $now,
+    int $shared = 0,
+    int $bcHit = 0,
+    int $fromCache = 0,
+    int $fromLive = 0
+): void {
+    $stmt = $pdo->prepare(
+        'INSERT INTO api_usage (key_id, endpoint, called_at, shared, bc_hit, from_cache, from_live)
+         VALUES (:id, :endpoint, :at, :shared, :bc_hit, :from_cache, :from_live)'
+    );
     $stmt->execute([
         ':id' => $keyId,
         ':endpoint' => $endpoint,
         ':at' => $now,
+        ':shared' => $shared ? 1 : 0,
+        ':bc_hit' => $bcHit ? 1 : 0,
+        ':from_cache' => max(0, $fromCache),
+        ':from_live' => max(0, $fromLive),
     ]);
+}
+
+/**
+ * Derive usage flags from a query response (single table or multi-query results).
+ *
+ * @param array<string, mixed> $response
+ * @return array{shared: int, bc_hit: int, from_cache: int, from_live: int}
+ */
+function mimir_usage_flags_from_response(array $response): array
+{
+    if (isset($response['results']) && is_array($response['results'])) {
+        $anyShared = false;
+        $anyBc = false;
+        $sumCache = 0;
+        $sumLive = 0;
+        $childCount = 0;
+        foreach ($response['results'] as $child) {
+            if (!is_array($child)) {
+                continue;
+            }
+            $childCount++;
+            $meta = is_array($child['meta'] ?? null) ? $child['meta'] : [];
+            $fromCache = (int) ($meta['from_cache'] ?? 0);
+            $fromLive = (int) ($meta['from_live'] ?? 0);
+            $sumCache += $fromCache;
+            $sumLive += $fromLive;
+            if ($fromLive > 0 || (int) ($meta['bc_hit'] ?? 0) === 1) {
+                $anyBc = true;
+            }
+            if ((int) ($meta['shared'] ?? 0) === 1) {
+                $anyShared = true;
+            }
+        }
+        if ($childCount === 0) {
+            return ['shared' => 0, 'bc_hit' => 0, 'from_cache' => 0, 'from_live' => 0];
+        }
+        return [
+            'shared' => (!$anyBc && $anyShared) ? 1 : 0,
+            'bc_hit' => $anyBc ? 1 : 0,
+            'from_cache' => $sumCache,
+            'from_live' => $sumLive,
+        ];
+    }
+
+    $meta = is_array($response['meta'] ?? null) ? $response['meta'] : [];
+    return [
+        'shared' => (int) ($meta['shared'] ?? 0) ? 1 : 0,
+        'bc_hit' => (int) ($meta['bc_hit'] ?? 0) ? 1 : 0,
+        'from_cache' => (int) ($meta['from_cache'] ?? 0),
+        'from_live' => (int) ($meta['from_live'] ?? 0),
+    ];
 }
 
 function mimir_meta_get(PDO $pdo, string $key, int $ttl, int $now): ?array
@@ -433,12 +572,24 @@ function mimir_cache_all(PDO $pdo, string $environment, string $company, string 
     return $rows;
 }
 
-function mimir_coverage_put(PDO $pdo, string $environment, string $company, string $entity, string $filterSig, string $selectSig, int $fetchedAt, int $rowCount): void
-{
+function mimir_coverage_put(
+    PDO $pdo,
+    string $environment,
+    string $company,
+    string $entity,
+    string $filterSig,
+    string $selectSig,
+    int $fetchedAt,
+    int $rowCount,
+    ?int $keyId = null
+): void {
     $stmt = $pdo->prepare(
-        'INSERT INTO cache_coverage (environment, company, entity, filter_sig, select_sig, fetched_at, row_count)
-         VALUES (:environment, :company, :entity, :filter_sig, :select_sig, :at, :count)
-         ON CONFLICT(environment, company, entity, filter_sig, select_sig) DO UPDATE SET fetched_at = excluded.fetched_at, row_count = excluded.row_count'
+        'INSERT INTO cache_coverage (environment, company, entity, filter_sig, select_sig, fetched_at, row_count, key_id)
+         VALUES (:environment, :company, :entity, :filter_sig, :select_sig, :at, :count, :key_id)
+         ON CONFLICT(environment, company, entity, filter_sig, select_sig) DO UPDATE SET
+            fetched_at = excluded.fetched_at,
+            row_count = excluded.row_count,
+            key_id = COALESCE(excluded.key_id, cache_coverage.key_id)'
     );
     $stmt->execute([
         ':environment' => $environment,
@@ -448,15 +599,16 @@ function mimir_coverage_put(PDO $pdo, string $environment, string $company, stri
         ':select_sig' => $selectSig,
         ':at' => $fetchedAt,
         ':count' => $rowCount,
+        ':key_id' => $keyId,
     ]);
 }
 
 /**
- * @return array{filter_sig: string, select_sig: string, fetched_at: int}|null
+ * @return array{filter_sig: string, select_sig: string, fetched_at: int, key_id: ?int}|null
  */
 function mimir_coverage_find(PDO $pdo, string $environment, string $company, string $entity, ?string $pushedFilter, string $selectSig, int $maxAge, int $now): ?array
 {
-    $sql = 'SELECT filter_sig, select_sig, fetched_at FROM cache_coverage
+    $sql = 'SELECT filter_sig, select_sig, fetched_at, key_id FROM cache_coverage
             WHERE environment = :environment AND company = :company AND entity = :entity AND fetched_at >= :min_at';
     $params = [
         ':environment' => $environment,
@@ -475,19 +627,18 @@ function mimir_coverage_find(PDO $pdo, string $environment, string $company, str
     $stmt->execute($params);
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         if (mimir_select_sig_covers((string) $row['select_sig'], $selectSig)) {
+            $covKey = $row['key_id'] ?? null;
             return [
                 'filter_sig' => (string) $row['filter_sig'],
                 'select_sig' => (string) $row['select_sig'],
                 'fetched_at' => (int) $row['fetched_at'],
+                'key_id' => $covKey === null || $covKey === '' ? null : (int) $covKey,
             ];
         }
     }
     return null;
 }
 
-/**
- * @param list<string> $select
- */
 function mimir_select_sig(array $select): string
 {
     if ($select === []) {
@@ -609,6 +760,7 @@ function mimir_project_row(array $row, array $select): array
  *   filter?: mixed,
  *   max_age?: int,
  *   top?: int,
+ *   key_id?: ?int,
  *   schema: array{keys?: list<string>, properties?: array<string, string>}
  * } $job
  * @param callable(string): array $fetch
@@ -682,6 +834,9 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $batchCount = $filterBatches === null ? 1 : count($filterBatches);
     $selectSig = mimir_select_sig($select);
     $required = array_values(array_unique(array_merge($select, mimir_filter_fields($filter))));
+    $keyId = array_key_exists('key_id', $job) && $job['key_id'] !== null && $job['key_id'] !== ''
+        ? (int) $job['key_id']
+        : null;
     $coverage = mimir_coverage_find($pdo, $environment, $company, $entity, $pushed, $selectSig, $maxAge, $now);
 
     $fromCache = 0;
@@ -734,7 +889,8 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                     'bc',
                     $fetch,
                     $now,
-                    false
+                    false,
+                    $keyId
                 );
                 if ($live['mode'] === 'local') {
                     $mode = 'local';
@@ -753,7 +909,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
             }
             if (!$anyTruncated) {
                 $filterSig = $pushed ?? '';
-                mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($merged));
+                mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($merged), $keyId);
             }
             foreach ($merged as $row) {
                 if (!mimir_filter_match($row['payload'], $filter, $types)) {
@@ -775,7 +931,9 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                 $pushed,
                 $mode,
                 $fetch,
-                $now
+                $now,
+                true,
+                $keyId
             );
             $mode = $live['mode'];
             $pushed = $live['pushed'];
@@ -802,10 +960,28 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         $max = $max === null ? $at : max($max, $at);
     }
 
+    $bcHit = 0;
+    $shared = 0;
+    if ($usedCoverage && $fromLive === 0) {
+        $coverageKeyId = $coverage['key_id'] ?? null;
+        $bcHit = 0;
+        if ($coverageKeyId !== null && $keyId !== null && (int) $coverageKeyId === $keyId) {
+            $shared = 0;
+        } else {
+            // null ownership (legacy/UI) or another key populated the coverage
+            $shared = 1;
+        }
+    } else {
+        $shared = 0;
+        $bcHit = 1;
+    }
+
     $meta = [
         'environment' => $environment,
         'from_cache' => $fromCache,
         'from_live' => $fromLive,
+        'shared' => $shared,
+        'bc_hit' => $bcHit,
         'max_age' => $maxAge,
         'fetched_at_min' => $min,
         'fetched_at_max' => $max,
@@ -977,7 +1153,8 @@ function mimir_fetch_collection(
     string $mode,
     callable $fetch,
     int $now,
-    bool $writeCoverage = true
+    bool $writeCoverage = true,
+    ?int $keyId = null
 ): array {
     $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch): array {
         $query = ['$top' => MIMIR_ODATA_PAGE_SIZE];
@@ -1028,7 +1205,7 @@ function mimir_fetch_collection(
     if ($writeCoverage && !$pages['truncated']) {
         $filterSig = $pushed ?? '';
         $selectSig = mimir_select_sig($select);
-        mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($stored));
+        mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($stored), $keyId);
     }
 
     return ['rows' => $stored, 'mode' => $mode, 'pushed' => $pushed, 'truncated' => $pages['truncated']];

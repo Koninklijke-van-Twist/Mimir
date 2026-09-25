@@ -50,6 +50,25 @@ mimir_key_same(mimir_key_avg_per_day($pdo, $created['id'], $now), 1.0, 'calls ol
 $list = mimir_key_list($pdo, 'tim@kvt.nl', $now);
 mimir_key_same($list[0]['key'], $created['key'], 'owner list shows the full key');
 mimir_key_same($list[0]['avg_per_day'], 1.0, 'list includes the average');
+mimir_key_same($list[0]['shared_pct'], 0, 'existing query without shared flag is 0%');
+
+$empty = mimir_key_create($pdo, 'tim@kvt.nl', 'Nog leeg', $now);
+$list = mimir_key_list($pdo, 'tim@kvt.nl', $now);
+$byId = [];
+foreach ($list as $row) {
+    $byId[$row['id']] = $row;
+}
+mimir_key_same($byId[$empty['id']]['shared_pct'], null, 'key without query calls shows null shared_pct');
+
+$shareKey = mimir_key_create($pdo, 'tim@kvt.nl', 'Share demo', $now);
+mimir_usage_log($pdo, $shareKey['id'], 'query', $now - 100, 1, 0, 1, 0);
+mimir_usage_log($pdo, $shareKey['id'], 'query', $now - 90, 0, 1, 0, 1);
+$list = mimir_key_list($pdo, 'tim@kvt.nl', $now);
+$byId = [];
+foreach ($list as $row) {
+    $byId[$row['id']] = $row;
+}
+mimir_key_same($byId[$shareKey['id']]['shared_pct'], 50, 'list includes shared_pct for past week queries');
 
 mimir_key_same(mimir_key_revoke($pdo, $created['id'], 'other@kvt.nl', $now), false, 'someone else cannot revoke');
 mimir_key_same(mimir_key_revoke($pdo, $created['id'], 'tim@kvt.nl', $now), true, 'owner can revoke');

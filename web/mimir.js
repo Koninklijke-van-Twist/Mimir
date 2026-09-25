@@ -13,6 +13,7 @@
     const keyLabel = document.getElementById('key-label');
     const keyStatus = document.getElementById('key-status');
     const keysBody = document.querySelector('#keys tbody');
+    const sharedGlobalEl = document.getElementById('shared-global');
 
     const state = {
         tables: [],
@@ -479,18 +480,29 @@
         return '<svg class="heatmap-svg" width="' + width + '" height="' + height + '" viewBox="' + (-pad) + ' ' + (-pad) + ' ' + (width + (pad * 2)) + ' ' + (height + (pad * 2)) + '" role="img" aria-label="Aanroepen per dag, maandag tot zondag">' + shapes + '</svg>';
     }
 
+    function formatSharedPct(value) {
+        if (value === null || value === undefined || value === '') {
+            return '—';
+        }
+        return new Intl.NumberFormat('nl-NL', { maximumFractionDigits: 0 }).format(Number(value)) + '%';
+    }
+
     async function loadKeys() {
         try {
             const data = await api('ui_api.php?action=keys');
             const rows = data.value || [];
             const heatmap = data.heatmap || heatmapDefaults;
+            if (sharedGlobalEl) {
+                sharedGlobalEl.innerHTML = 'Gedeeld <strong>' + esc(formatSharedPct(data.shared_pct_global)) + '</strong>';
+            }
             keysBody.innerHTML = rows.length ? rows.map(function (row) {
                 const avg = new Intl.NumberFormat('nl-NL', { maximumFractionDigits: 2 }).format(row.avg_per_day || 0);
+                const shared = formatSharedPct(row.shared_pct);
                 const revoked = row.revoked_at ? ' class="revoked"' : '';
                 const button = row.revoked_at ? 'Ingetrokken' : '<button type="button" data-revoke="' + row.id + '">Intrekken</button>';
                 const grid = renderHeatmapSvg(row.days || [], heatmap);
-                return '<tr' + revoked + '><td>' + esc(row.label) + '</td><td><code class="key">' + esc(row.key) + '</code></td><td>' + avg + '</td><td>' + grid + '<p class="heatmap-caption">ma–zo</p></td><td>' + esc(formatWhen(row.created_at)) + '</td><td>' + button + '</td></tr>';
-            }).join('') : '<tr><td class="empty" colspan="6">Nog geen sleutels.</td></tr>';
+                return '<tr' + revoked + '><td>' + esc(row.label) + '</td><td><code class="key">' + esc(row.key) + '</code></td><td>' + avg + '</td><td>' + esc(shared) + '</td><td>' + grid + '<p class="heatmap-caption">ma–zo</p></td><td>' + esc(formatWhen(row.created_at)) + '</td><td>' + button + '</td></tr>';
+            }).join('') : '<tr><td class="empty" colspan="7">Nog geen sleutels.</td></tr>';
         } catch (error) {
             keyStatus.textContent = error.message;
             keyStatus.classList.add('error');

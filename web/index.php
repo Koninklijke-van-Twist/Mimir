@@ -39,7 +39,10 @@ function mimir_h(string $value): string
                     <p>OData-verkenner en cache voor Business Central. Andere sleutels-apps halen hun gegevens hier op, in plaats van zelf BC te bellen.</p>
                 </div>
             </div>
-            <p class="who"><?= mimir_h($email) ?></p>
+            <div class="hero-aside">
+                <p class="who"><?= mimir_h($email) ?></p>
+                <p class="shared-global" id="shared-global" title="Percentage van alle query-API-aanroepen (alle sleutels) in de afgelopen 7 dagen dat volledig uit cache kwam die door een andere sleutel is gevuld — zonder Business Central te bellen.">Gedeeld <strong>—</strong></p>
+            </div>
         </header>
 
         <section class="panel">
@@ -100,7 +103,7 @@ function mimir_h(string $value): string
         <section class="panel">
             <div class="panel-head">
                 <h2>API-sleutels</h2>
-                <p>De volledige sleutel blijft zichtbaar voor jou. Hij staat in leesbare vorm in de SQLite-database achter deze login, en de lookup gebruikt SHA-256. Per sleutel zie je het daggemiddelde van de laatste maand en een weekraster van de aanroepen (maandag tot zondag).</p>
+                <p>De volledige sleutel blijft zichtbaar voor jou. Hij staat in leesbare vorm in de SQLite-database achter deze login, en de lookup gebruikt SHA-256. Per sleutel zie je het daggemiddelde van de laatste maand, welk aandeel van de query-aanroepen afgelopen week geen Business Central nodig had dankzij cache van een andere sleutel/app («Waarvan gedeeld»), en een weekraster van de aanroepen (maandag tot zondag).</p>
             </div>
             <form id="key-form" class="key-form">
                 <label class="field grow">
@@ -117,6 +120,7 @@ function mimir_h(string $value): string
                             <th>Label</th>
                             <th>Sleutel</th>
                             <th>Gem. calls / dag</th>
+                            <th>Waarvan gedeeld</th>
                             <th>Laatste weken</th>
                             <th>Aangemaakt</th>
                             <th></th>

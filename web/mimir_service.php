@@ -260,7 +260,7 @@ function mimir_metadata_for_environment(PDO $pdo, string $environment, int $now)
  * @param array<string, mixed> $spec
  * @return array{value: list<array<string, mixed>>, meta: array<string, mixed>}
  */
-function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAge = null): array
+function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAge = null, ?int $keyId = null): array
 {
     $company = trim((string) ($spec['company'] ?? ''));
     $table = trim((string) ($spec['table'] ?? $spec['entity'] ?? ''));
@@ -290,6 +290,7 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
         'filter' => $spec['filter'] ?? null,
         'max_age' => $maxAge,
         'top' => $spec['top'] ?? MIMIR_DEFAULT_TOP,
+        'key_id' => $keyId,
         'schema' => [
             'keys' => $schema['keys'],
             'properties' => $schema['properties'],
@@ -301,7 +302,7 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
  * @param array<string, mixed> $body
  * @return array<string, mixed>
  */
-function mimir_run_request_body(PDO $pdo, array $body, int $now, ?int $forceMaxAge = null): array
+function mimir_run_request_body(PDO $pdo, array $body, int $now, ?int $forceMaxAge = null, ?int $keyId = null): array
 {
     if (array_key_exists('queries', $body)) {
         $queries = $body['queries'];
@@ -332,7 +333,7 @@ function mimir_run_request_body(PDO $pdo, array $body, int $now, ?int $forceMaxA
             if (!array_key_exists('max_age', $query) && array_key_exists('max_age', $body)) {
                 $query['max_age'] = $body['max_age'];
             }
-            $results[$name] = mimir_run_table_query($pdo, $query, $now, $forceMaxAge);
+            $results[$name] = mimir_run_table_query($pdo, $query, $now, $forceMaxAge, $keyId);
         }
         if (isset($body['combine'])) {
             $results = mimir_apply_combine($results, $body['combine']);
@@ -340,7 +341,7 @@ function mimir_run_request_body(PDO $pdo, array $body, int $now, ?int $forceMaxA
         return ['results' => $results];
     }
 
-    return mimir_run_table_query($pdo, $body, $now, $forceMaxAge);
+    return mimir_run_table_query($pdo, $body, $now, $forceMaxAge, $keyId);
 }
 
 /**
@@ -489,7 +490,6 @@ function mimir_api_main(?string $forcedRoute = null): void
         mimir_json(['error' => 'Onbekend endpoint. Gebruik tables, tables/{naam}/schema, query of companies.'], 404);
     }
 
-    mimir_usage_log($pdo, $record['id'], $parsed['action'], time());
     mimir_load_auth(true);
 
     try {
@@ -498,6 +498,7 @@ function mimir_api_main(?string $forcedRoute = null): void
             if ($method !== 'GET') {
                 mimir_json(['error' => 'GET verwacht.'], 405);
             }
+            mimir_usage_log($pdo, $record['id'], $parsed['action'], $now);
             $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
             mimir_json(['value' => $listed['tables'], 'environment' => $listed['environment']]);
         }
@@ -505,6 +506,7 @@ function mimir_api_main(?string $forcedRoute = null): void
             if ($method !== 'GET') {
                 mimir_json(['error' => 'GET verwacht.'], 405);
             }
+            mimir_usage_log($pdo, $record['id'], $parsed['action'], $now);
             // Cache only — zelfde pad als de UI zonder ?live=1.
             $catalog = mimir_company_catalog($pdo, $now, false);
             mimir_json([
@@ -517,6 +519,7 @@ function mimir_api_main(?string $forcedRoute = null): void
             if ($method !== 'GET') {
                 mimir_json(['error' => 'GET verwacht.'], 405);
             }
+            mimir_usage_log($pdo, $record['id'], $parsed['action'], $now);
             $schema = mimir_table_schema($pdo, trim((string) ($_GET['company'] ?? '')), (string) ($parsed['table'] ?? ''), $now);
             mimir_json($schema);
         }
@@ -524,7 +527,19 @@ function mimir_api_main(?string $forcedRoute = null): void
             mimir_json(['error' => 'POST verwacht.'], 405);
         }
         $body = mimir_read_json_body();
-        mimir_json(mimir_run_request_body($pdo, $body, $now, null));
+        $result = mimir_run_request_body($pdo, $body, $now, null, $record['id']);
+        $flags = mimir_usage_flags_from_response($result);
+        mimir_usage_log(
+            $pdo,
+            $record['id'],
+            'query',
+            $now,
+            $flags['shared'],
+            $flags['bc_hit'],
+            $flags['from_cache'],
+            $flags['from_live']
+        );
+        mimir_json($result);
     } catch (MimirUserException $error) {
         mimir_json(['error' => $error->getMessage()], $error->status);
     } catch (Throwable $error) {
@@ -563,6 +578,7 @@ function mimir_ui_main(): void
             mimir_json([
                 'value' => mimir_key_list($pdo, $email, $now),
                 'heatmap' => mimir_heatmap_options(),
+                'shared_pct_global' => mimir_usage_shared_pct_global($pdo, $now),
             ]);
         }
         if ($action === 'keys_create' && $method === 'POST') {
