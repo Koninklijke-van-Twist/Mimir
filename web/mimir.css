@@ -62,7 +62,7 @@ button:disabled { opacity: .5; cursor: default; }
 
 .toolbar, .key-form {
     display: grid;
-    grid-template-columns: minmax(180px, 240px) minmax(240px, 1fr) auto;
+    grid-template-columns: minmax(180px, 240px) minmax(240px, 1fr);
     gap: 12px;
     align-items: end;
     padding: 16px;
@@ -78,6 +78,16 @@ input, select {
     border-radius: 10px;
     padding: 8px 10px;
     background: #fff;
+}
+input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    flex-shrink: 0;
+    align-self: start;
+    margin-top: 2px;
 }
 
 .toolbar, .combo-field, .combo { overflow: visible; }
@@ -125,8 +135,37 @@ input, select {
 .condition select, .condition input { flex: 1; }
 .op-toggle { min-width: 64px; font-weight: 700; color: #00529b; }
 
-.columns { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; max-height: 280px; overflow: auto; margin-top: 8px; }
-.columns label { display: flex; gap: 6px; align-items: center; font-size: .84rem; font-weight: 500; }
+.columns {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 14px;
+    max-height: 320px;
+    overflow: auto;
+    margin-top: 8px;
+    align-content: start;
+}
+.columns label {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+    align-items: start;
+    margin: 0;
+    font-size: .84rem;
+    font-weight: 500;
+    line-height: 1.35;
+    color: var(--kvt-text);
+    min-width: 0;
+}
+.columns label span {
+    overflow-wrap: anywhere;
+}
+
+.run-bar {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--kvt-line);
+}
+.run-bar .primary { min-width: 140px; }
 
 .table-wrap { overflow: auto; padding: 0 16px 16px; }
 table { width: 100%; border-collapse: collapse; font-size: .86rem; }
@@ -139,7 +178,8 @@ tr.revoked { color: var(--kvt-muted); }
 .empty { color: var(--kvt-muted); padding: 8px 0; }
 
 @media (max-width: 800px) {
-    .hero, .toolbar, .key-form, .split, .columns { display: block; }
+    .hero, .toolbar, .key-form, .split { display: block; }
+    .columns { grid-template-columns: 1fr; }
     .hero-logo { margin-bottom: 12px; }
     .field, .key-form button, .toolbar button { margin-top: 8px; }
 }

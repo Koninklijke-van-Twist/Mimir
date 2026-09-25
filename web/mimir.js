@@ -146,7 +146,7 @@
 
     function renderColumns() {
         columnsEl.innerHTML = state.properties.map(function (prop) {
-            return '<label><input type="checkbox" value="' + esc(prop.name) + '"> ' + esc(prop.name) + '</label>';
+            return '<label><input type="checkbox" value="' + esc(prop.name) + '"><span>' + esc(prop.name) + '</span></label>';
         }).join('');
     }
 

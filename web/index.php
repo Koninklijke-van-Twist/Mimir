@@ -59,10 +59,6 @@ function mimir_h(string $value): string
                         <ul id="table-list" class="combo-list" hidden></ul>
                     </div>
                 </div>
-                <div class="field actions">
-                    <span>Query</span>
-                    <button type="button" id="run" class="primary" disabled>Ophalen</button>
-                </div>
             </div>
             <p id="status" class="status" role="status"></p>
         </section>
@@ -73,14 +69,17 @@ function mimir_h(string $value): string
                 <p>OR over verschillende velden en XOR gaan niet naar Business Central (dat geeft daar vaak HTTP 501). Die blijven in Mímir. Een verse rij die een gevraagde kolom mist, wordt in zijn geheel ververst.</p>
             </div>
             <div class="split">
-                <div>
+                <div class="filters-pane">
                     <div id="filters"></div>
                     <div class="row-actions">
                         <button type="button" id="add-condition">Voorwaarde</button>
                         <button type="button" id="add-group">Groep</button>
                     </div>
+                    <div class="run-bar">
+                        <button type="button" id="run" class="primary" disabled>Ophalen</button>
+                    </div>
                 </div>
-                <div>
+                <div class="columns-pane">
                     <p class="hint">Geen aangevinkte kolom betekent: alle kolommen.</p>
                     <div id="columns" class="columns"></div>
                 </div>
