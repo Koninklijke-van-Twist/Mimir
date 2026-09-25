@@ -125,7 +125,54 @@ function mimir_companies_from_map(array $map): array
  *
  * @return array{companies: list<array{name: string, environment: string}>, errors: list<string>}
  */
-function mimir_company_catalog(PDO $pdo, int $now): array
+function mimir_company_cache_key(): string
+{
+    return 'company-map:' . auth_get_environment_key_fragment();
+}
+
+/**
+ * Haalt bedrijven op uit BC en schrijft de nightly-cache.
+ * Geroepen vanuit nightly.php (niet vanuit de UI).
+ *
+ * @return array{companies: list<array{name: string, environment: string}>, map: array<string, string>, errors: list<string>, fetched_at: int}
+ */
+function mimir_refresh_companies(PDO $pdo, int $now): array
+{
+    $discovered = auth_discover_companies_across_active_environments();
+    $map = is_array($discovered['map'] ?? null) ? $discovered['map'] : [];
+    $errors = is_array($discovered['errors'] ?? null) ? array_values($discovered['errors']) : [];
+    $byEnvironment = is_array($discovered['by_environment'] ?? null) ? $discovered['by_environment'] : [];
+    $GLOBALS['demeter_company_environment_map'] = $map;
+    $GLOBALS['demeter_company_environment_errors'] = $errors;
+    $GLOBALS['demeter_companies_by_environment'] = $byEnvironment;
+
+    $payload = [
+        'map' => $map,
+        'errors' => $errors,
+        'by_environment' => $byEnvironment,
+        'active_environments' => auth_get_active_environments(),
+        'source' => 'nightly',
+    ];
+    // Ook partial resultaat bewaren: UI moet een dropdown houden.
+    if ($map !== []) {
+        mimir_meta_put($pdo, mimir_company_cache_key(), $payload, $now);
+    }
+
+    return [
+        'companies' => mimir_companies_from_map($map),
+        'map' => $map,
+        'errors' => $errors,
+        'fetched_at' => $now,
+    ];
+}
+
+/**
+ * Leest de company-dropdown uit de nightly-cache.
+ * Live BC alleen als $allowLive true is (nightly / expliciete refresh).
+ *
+ * @return array{companies: list<array{name: string, environment: string}>, errors: list<string>, fetched_at: int|null, source: string}
+ */
+function mimir_company_catalog(PDO $pdo, int $now, bool $allowLive = false): array
 {
     $current = $GLOBALS['demeter_company_environment_map'] ?? null;
     if (is_array($current) && $current !== []) {
@@ -133,32 +180,47 @@ function mimir_company_catalog(PDO $pdo, int $now): array
         return [
             'companies' => mimir_companies_from_map($current),
             'errors' => is_array($errors) ? array_values($errors) : [],
+            'fetched_at' => isset($GLOBALS['demeter_company_fetched_at']) ? (int) $GLOBALS['demeter_company_fetched_at'] : null,
+            'source' => 'memory',
         ];
     }
 
-    $fragment = auth_get_environment_key_fragment();
-    $cacheKey = 'company-map:' . $fragment;
-    $cached = mimir_meta_get($pdo, $cacheKey, MIMIR_COMPANY_TTL, $now);
+    $cacheKey = mimir_company_cache_key();
+    // Stale nightly-lijst blijft bruikbaar tot de volgende nightly.
+    $cached = mimir_meta_get_raw($pdo, $cacheKey);
     if (is_array($cached) && isset($cached['map']) && is_array($cached['map']) && $cached['map'] !== []) {
-        $GLOBALS['demeter_company_environment_map'] = $cached['map'];
+        $map = $cached['map'];
         $errors = is_array($cached['errors'] ?? null) ? array_values($cached['errors']) : [];
+        $fetchedAt = (int) ($cached['_fetched_at'] ?? 0);
+        $GLOBALS['demeter_company_environment_map'] = $map;
         $GLOBALS['demeter_company_environment_errors'] = $errors;
+        $GLOBALS['demeter_company_fetched_at'] = $fetchedAt;
+        if (isset($cached['by_environment']) && is_array($cached['by_environment'])) {
+            $GLOBALS['demeter_companies_by_environment'] = $cached['by_environment'];
+        }
         return [
-            'companies' => mimir_companies_from_map($cached['map']),
+            'companies' => mimir_companies_from_map($map),
             'errors' => $errors,
+            'fetched_at' => $fetchedAt > 0 ? $fetchedAt : null,
+            'source' => 'nightly',
         ];
     }
 
-    $discovered = auth_discover_companies_across_active_environments();
-    $map = is_array($discovered['map'] ?? null) ? $discovered['map'] : [];
-    $errors = is_array($discovered['errors'] ?? null) ? array_values($discovered['errors']) : [];
-    $GLOBALS['demeter_company_environment_errors'] = $errors;
-    if ($map !== [] && $errors === []) {
-        mimir_meta_put($pdo, $cacheKey, ['map' => $map, 'errors' => []], $now);
+    if (!$allowLive) {
+        return [
+            'companies' => [],
+            'errors' => ['Geen bedrijfscache. Draai eerst nightly.php om bedrijven te ontdekken.'],
+            'fetched_at' => null,
+            'source' => 'empty',
+        ];
     }
+
+    $refreshed = mimir_refresh_companies($pdo, $now);
     return [
-        'companies' => mimir_companies_from_map($map),
-        'errors' => $errors,
+        'companies' => $refreshed['companies'],
+        'errors' => $refreshed['errors'],
+        'fetched_at' => $refreshed['fetched_at'],
+        'source' => 'live',
     ];
 }
 
@@ -504,8 +566,14 @@ function mimir_ui_main(): void
 
         mimir_load_auth(true);
         if ($action === 'companies' && $method === 'GET') {
-            $catalog = mimir_company_catalog($pdo, $now);
-            mimir_json(['value' => $catalog['companies'], 'errors' => $catalog['errors']]);
+            $allowLive = in_array(strtolower(trim((string) ($_GET['live'] ?? ''))), ['1', 'true', 'yes'], true);
+            $catalog = mimir_company_catalog($pdo, $now, $allowLive);
+            mimir_json([
+                'value' => $catalog['companies'],
+                'errors' => $catalog['errors'],
+                'fetched_at' => $catalog['fetched_at'],
+                'source' => $catalog['source'],
+            ]);
         }
         if ($action === 'tables' && $method === 'GET') {
             $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);

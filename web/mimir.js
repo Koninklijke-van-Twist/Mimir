@@ -90,19 +90,22 @@
             }).join('');
             const twist = items.find(function (item) { return /twist/i.test(item.name); });
             if (twist) companyEl.value = twist.name;
-            setStatus('');
+            if (items.length === 0) {
+                companyEl.innerHTML = '<option value="">— geen bedrijven —</option>';
+                runEl.disabled = true;
+                setStatus((data.errors && data.errors.length ? data.errors.join(' | ') : 'Geen bedrijven in cache.') + ' Draai nightly.php.', true);
+                return;
+            }
+            const age = data.fetched_at ? (' (cache ' + new Date(data.fetched_at * 1000).toLocaleString('nl-NL') + ')') : '';
+            setStatus('Bron: ' + (data.source || 'nightly') + age);
             await loadTables();
             if (data.errors && data.errors.length) {
                 setStatus('Sommige environments gaven geen bedrijven: ' + data.errors.join(' | '), true);
             }
         } catch (error) {
-            companyEl.innerHTML = '';
-            const input = document.createElement('input');
-            input.id = 'company-text';
-            input.placeholder = 'Bedrijfsnaam';
-            companyEl.replaceWith(input);
-            input.addEventListener('change', loadTables);
-            setStatus(error.message, true);
+            companyEl.innerHTML = '<option value="">— geen bedrijven —</option>';
+            runEl.disabled = true;
+            setStatus(error.message + ' Draai nightly.php als de lijst leeg blijft.', true);
         }
     }
 

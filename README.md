@@ -57,6 +57,13 @@ Bijvoorbeeld `https://kvtmd365.kvt.nl:7148/kvtgermanylive_aad/ODataV4/Company('K
 
 `$metadata` (tabellen en velden) wordt per environment van het gekozen bedrijf opgehaald. Germany heeft een eigen lijst; die wordt niet gedeeld met KVT/HVT. Dezelfde bedrijfsnaam in twee actieve environments wordt geweigerd.
 
+## Nightly
+
+`web/nightly.php` ontdekt alle bedrijven over de actieve environments (Penates-stijl) en schrijft die kaart in SQLite. De UI-dropdown **Bedrijf** leest alleen die cache — geen live Company-discovery bij page load. Metadata (`$metadata`) per environment wordt tegelijk ververst.
+
+Lokaal: `php web/nightly.php`  
+Productie: `GET /mimir/nightly.php` (zelfde auth/logincheck als andere apps).
+
 ## Cache
 
 Elke rij uit BC staat in SQLite met een eigen `fetched_at` (unix). De cachesleutel is **environment + bedrijf + entity set + rijsleutel**. Een rij uit `kvtgermanylive_aad` botst daardoor nooit met KVT of HVT op `kvtmdlive_aad`, ook als de bedrijfsnaam of het artikelnummer gelijk is. De rijsleutel komt uit de OData-key van de metadata van dát environment.

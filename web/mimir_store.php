@@ -346,6 +346,22 @@ function mimir_meta_get(PDO $pdo, string $key, int $ttl, int $now): ?array
     return is_array($decoded) ? $decoded : null;
 }
 
+function mimir_meta_get_raw(PDO $pdo, string $key): ?array
+{
+    $stmt = $pdo->prepare('SELECT payload, fetched_at FROM meta_cache WHERE cache_key = :key');
+    $stmt->execute([':key' => $key]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!is_array($row)) {
+        return null;
+    }
+    $decoded = json_decode((string) $row['payload'], true);
+    if (!is_array($decoded)) {
+        return null;
+    }
+    $decoded['_fetched_at'] = (int) ($row['fetched_at'] ?? 0);
+    return $decoded;
+}
+
 function mimir_meta_put(PDO $pdo, string $key, array $payload, int $now): void
 {
     $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
