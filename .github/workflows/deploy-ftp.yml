@@ -30,11 +30,16 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
 
-      # Stap 1: web/ spiegelen. auth.php, sqlite en schrijfbare runtime-mappen
-      # blijven op de server staan. --no-perms zodat lokale git-modes (755)
-      # de serverrechten niet overschrijven. data/** cache/** analytics/**
-      # volledig uitsluiten, anders zet mirror de mapmodus terug voordat chmod
-      # draait (ook via .gitkeep). .htaccess in data/ gaat er daarna apart heen.
+      # Mirror web/ only. Deliberately do not chmod after deploy: server
+      # permissions are managed on the host, and a trailing SITE CHMOD keeps
+      # resetting production modes. --no-perms stops lftp from applying local
+      # git modes (755). Excluding the writable dirs (data/**, cache/**,
+      # analytics/**) stops the mirror from resetting them, including via
+      # .gitkeep. auth.php stays on the server. data/.htaccess is uploaded
+      # explicitly after the mirror.
+      # NL: bewust geen chmod na deploy. Rechten worden op de host beheerd.
+      # --no-perms plus uitsluiten van data/**, cache/** en analytics/**
+      # voorkomt dat deploy die rechten terugzet.
       - name: Deploy web/ to FTP (with delete & excludes)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
@@ -70,48 +75,6 @@ jobs:
             ./web .
 
           put -O data web/data/.htaccess
-
-          bye
-          EOF
-
-      # Chmod is best-effort and runs only after mirror/bye succeeded.
-      # cache returns FTP 550 (SITE CHMOD command failed) on this host;
-      # analytics and data usually succeed. `set cmd:fail-exit false` in the
-      # same lftp session as the mirror is not enough: lftp still exits 1 and
-      # the Actions job (bash -e) goes red after a successful upload.
-      # This separate session uses fail-exit false so one 550 does not skip
-      # the other chmods, and `|| true` so any chmod failure cannot fail the job.
-      # NL: chmod is best-effort, pas na een geslaagde mirror. Een 550 op cache
-      # (of een andere chmod) mag de deploy niet rood maken.
-      - name: chmod analytics, data, cache (best-effort)
-        env:
-          FTP_HOST: ${{ secrets.FTP_HOST }}
-          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
-          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
-        run: |
-          # noglob: data/*.sqlite* must reach lftp, not the Actions checkout.
-          set -f
-          lftp -u "$FTP_USERNAME","$FTP_PASSWORD" "$FTP_HOST" << EOF || true
-          set cmd:fail-exit false
-          set net:max-retries 1
-          set net:timeout 20
-          set ftp:ssl-allow false
-          set ftp:passive-mode yes
-
-          cd "$FTP_REMOTE_DIR"
-
-          chmod 777 analytics
-          chmod 777 data
-          chmod 777 cache
-
-          # Ontbrekende sqlite-bestanden geven SITE CHMOD 550; fail-exit false
-          # hierboven laat de rest doorgaan, en || true houdt de job groen.
-          chmod 666 data/mimir.sqlite
-          chmod 666 data/mimir.sqlite-wal
-          chmod 666 data/mimir.sqlite-shm
-          chmod 666 data/*.sqlite
-          chmod 666 data/*.sqlite-*
 
           bye
           EOF
