@@ -212,7 +212,7 @@ Push naar `master` start `.github/workflows/deploy-ftp.yml` (zelfde patroon als 
 - `FTP_PASSWORD`
 - `FTP_REMOTE_DIR` — het FTP-pad dat live `https://sleutels.kvt.nl/mimir/` is, doorgaans `/var/www/html/mimir`
 
-De mirror zet `web/` daar neer met `--no-perms` (lokale git-modes overschrijven de server niet) en laat `auth.php` plus de runtime-mappen `data/**`, `cache/**` en `analytics/**` met rust. `data/.htaccess` gaat er daarna apart heen. Na de deploy doen we bewust geen chmod: de serverrechten worden op de host beheerd, en `--no-perms` plus het uitsluiten van die schrijfbare mappen voorkomt dat een deploy ze terugzet.
+De mirror zet `web/` daar neer met `--no-perms` (lokale git-modes overschrijven de server niet). Deploy wijzigt nooit de modus van `data/`, `cache/` en `analytics/`: die rechten zijn alleen host-beheerd. Zowel de map zelf als de inhoud blijft buiten de mirror (`data`, `data/**`, `cache`, `cache/**`, `analytics`, `analytics/**`), samen met `auth.php` en de sqlite-globs, zodat lftp die directory-nodes niet aanmaakt of aanraakt. `web/data/.htaccess` staat in git voor nieuwe installs en blijft op de server staan; deploy uploadt dat bestand niet.
 
 Zet `web/auth.php` eenmalig op de server. Die blijft bij volgende deploys staan.
 

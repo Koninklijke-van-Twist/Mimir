@@ -30,16 +30,19 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
 
-      # Mirror web/ only. Deliberately do not chmod after deploy: server
-      # permissions are managed on the host, and a trailing SITE CHMOD keeps
-      # resetting production modes. --no-perms stops lftp from applying local
-      # git modes (755). Excluding the writable dirs (data/**, cache/**,
-      # analytics/**) stops the mirror from resetting them, including via
-      # .gitkeep. auth.php stays on the server. data/.htaccess is uploaded
-      # explicitly after the mirror.
-      # NL: bewust geen chmod na deploy. Rechten worden op de host beheerd.
-      # --no-perms plus uitsluiten van data/**, cache/** en analytics/**
-      # voorkomt dat deploy die rechten terugzet.
+      # Mirror web/ only. Deploy must never alter modes on data/, cache/, or
+      # analytics/: those permissions are host-managed only. No SITE CHMOD.
+      # --no-perms stops lftp from applying local git modes (755). Exclude the
+      # directory node itself (data, cache, analytics) as well as its contents
+      # (data/**, cache/**, analytics/**). Contents-only globs still let mirror
+      # mkdir or touch the directory, and the FTP user's umask (often 755)
+      # then leaves Apache unable to write sqlite and the other runtime files.
+      # auth.php and the sqlite globs stay excluded. data/.htaccess remains in
+      # git for new installs but is a server-only file: do not upload it.
+      # A put into data/ recreates or touches that directory the same way.
+      # NL: deploy mag nooit de modus van data/, cache/ of analytics/ wijzigen.
+      # Rechten zijn alleen host-beheerd. data/.htaccess blijft op de server;
+      # die uploaden we niet.
       - name: Deploy web/ to FTP (with delete & excludes)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
@@ -58,12 +61,15 @@ jobs:
 
           mirror -R --delete --no-perms \
             --exclude-glob .htaccess \
+            --exclude-glob data \
+            --exclude-glob data/** \
+            --exclude-glob cache \
             --exclude-glob cache/** \
+            --exclude-glob analytics \
             --exclude-glob analytics/** \
             --exclude-glob analytics/*.sqlite \
             --exclude-glob analytics/*.sqlite-* \
             --exclude-glob auth.php \
-            --exclude-glob data/** \
             --exclude-glob data/*.sqlite \
             --exclude-glob data/*.sqlite-* \
             --exclude-glob data/*.db \
@@ -73,8 +79,6 @@ jobs:
             --exclude-glob data/*.checkpoint \
             --exclude-glob data/*.checkpoint/** \
             ./web .
-
-          put -O data web/data/.htaccess
 
           bye
           EOF
