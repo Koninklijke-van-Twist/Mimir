@@ -1,0 +1,11 @@
+web/auth.php
+
+web/cache/*
+!web/cache/.gitkeep
+
+web/data/*.sqlite
+web/data/*.sqlite-*
+web/data/*.db
+
+web/analytics/*.sqlite
+web/analytics/*.sqlite-*

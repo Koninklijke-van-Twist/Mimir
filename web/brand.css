@@ -1,0 +1,32 @@
+:root {
+    --kvt-perkins-blue: #00529B;
+    --kvt-main-blue: #0099cc;
+    --kvt-light-blue: #33ccff;
+    --kvt-page-bg: #ffffff;
+    --kvt-panel-bg: #ffffff;
+    --kvt-text: #111827;
+    --kvt-muted: #475569;
+    --kvt-line: #d7dee8;
+    --kvt-danger: #b42318;
+    --kvt-font-display: "Museo Sans Display Black", "Montserrat", "Segoe UI", Arial, sans-serif;
+    --kvt-font-body: "Montserrat", "Segoe UI", Arial, sans-serif;
+}
+
+body {
+    font-family: var(--kvt-font-body);
+}
+
+h1,
+h2,
+h3,
+.brand-display {
+    font-family: var(--kvt-font-display);
+}
+
+button,
+.btn,
+label,
+th {
+    font-family: var(--kvt-font-body);
+    font-weight: 700;
+}

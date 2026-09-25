@@ -1,0 +1,7 @@
+{
+    "name": "Mímir",
+    "short_name": "Mímir",
+    "theme_color": "#0099cc",
+    "background_color": "#ffffff",
+    "display": "standalone"
+}

@@ -1,0 +1,101 @@
+name: Deploy to FTP on master push
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install lftp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lftp
+
+      - name: Debug env
+        run: |
+          echo "Host: $FTP_HOST"
+          echo "User: $FTP_USERNAME"
+          # echo "Pass: $FTP_PASSWORD"  # liever niet loggen 😉
+          echo "Remote dir: $FTP_REMOTE_DIR"
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+
+      # Stap 1: web/ spiegelen. auth.php, sqlite en cache blijven op de server staan.
+      - name: Deploy web/ to FTP (with delete & excludes)
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          lftp -u "$FTP_USERNAME","$FTP_PASSWORD" "$FTP_HOST" << EOF
+          set cmd:fail-exit true
+          set net:max-retries 1
+          set net:timeout 20
+          set ftp:ssl-allow false
+          set ftp:passive-mode yes
+
+          cd "$FTP_REMOTE_DIR"
+
+          mirror -R --delete \
+            --exclude-glob .htaccess \
+            --exclude-glob cache/** \
+            --exclude-glob analytics/*.sqlite \
+            --exclude-glob analytics/*.sqlite-* \
+            --exclude-glob auth.php \
+            --exclude-glob data/*.sqlite \
+            --exclude-glob data/*.sqlite-* \
+            --exclude-glob data/*.db \
+            --exclude-glob data/*.json \
+            --exclude-glob data/*.json.tmp.* \
+            --exclude-glob data/*.lock \
+            --exclude-glob data/*.checkpoint \
+            --exclude-glob data/*.checkpoint/** \
+            ./web .
+
+          put -O data web/data/.htaccess
+
+          bye
+          EOF
+
+      # Chmod is best-effort and runs only after mirror/bye succeeded.
+      # cache returns FTP 550 (SITE CHMOD command failed) on this host;
+      # analytics and data usually succeed. `set cmd:fail-exit false` in the
+      # same lftp session as the mirror is not enough: lftp still exits 1 and
+      # the Actions job (bash -e) goes red after a successful upload.
+      # This separate session uses fail-exit false so one 550 does not skip
+      # the other chmods, and `|| true` so any chmod failure cannot fail the job.
+      # NL: chmod is best-effort, pas na een geslaagde mirror. Een 550 op cache
+      # (of een andere chmod) mag de deploy niet rood maken.
+      - name: chmod analytics, data, cache (best-effort)
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          lftp -u "$FTP_USERNAME","$FTP_PASSWORD" "$FTP_HOST" << EOF || true
+          set cmd:fail-exit false
+          set net:max-retries 1
+          set net:timeout 20
+          set ftp:ssl-allow false
+          set ftp:passive-mode yes
+
+          cd "$FTP_REMOTE_DIR"
+
+          chmod 777 analytics
+          chmod 777 data
+          chmod 777 cache
+
+          bye
+          EOF
