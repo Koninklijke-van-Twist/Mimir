@@ -138,56 +138,66 @@ const AUTH_COMPANIES_ODATA_TTL = 2592000; // 30 dagen
  */
 function auth_fetch_companies_for_environment(string $environment, int $ttlSeconds = AUTH_COMPANIES_ODATA_TTL): array
 {
-    $auth = auth_get_auth_for_environment($environment);
-    $urls = auth_build_companies_urls($environment);
+    $run = static function () use ($environment, $ttlSeconds): array {
+        $auth = auth_get_auth_for_environment($environment);
+        $urls = auth_build_companies_urls($environment);
 
-    $rows = [];
-    $lastErrorMessage = '';
+        $rows = [];
+        $lastErrorMessage = '';
 
-    foreach ($urls as $url) {
-        try {
-            if (function_exists('odata_get_all')) {
-                $rows = odata_get_all($url, $auth, $ttlSeconds);
-            } else {
-                $rows = auth_fetch_companies_for_environment_via_curl($url, $auth);
+        foreach ($urls as $url) {
+            try {
+                if (function_exists('odata_get_all')) {
+                    $rows = odata_get_all($url, $auth, $ttlSeconds);
+                } else {
+                    $rows = auth_fetch_companies_for_environment_via_curl($url, $auth);
+                }
+
+                if (is_array($rows) && $rows !== []) {
+                    break;
+                }
+            } catch (Throwable $error) {
+                $lastErrorMessage = $error->getMessage();
+            }
+        }
+
+        if (!is_array($rows) || $rows === []) {
+            $details = $lastErrorMessage !== '' ? (': ' . $lastErrorMessage) : '';
+            throw new RuntimeException('Geen bedrijven gevonden voor environment ' . $environment . $details);
+        }
+
+        $companies = [];
+        $seen = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
             }
 
-            if (is_array($rows) && $rows !== []) {
-                break;
+            $name = trim((string) ($row['Name'] ?? $row['Display_Name'] ?? ''));
+            if ($name === '') {
+                continue;
             }
-        } catch (Throwable $error) {
-            $lastErrorMessage = $error->getMessage();
+
+            $lowerName = strtolower($name);
+            if (isset($seen[$lowerName])) {
+                continue;
+            }
+
+            $seen[$lowerName] = true;
+            $companies[] = $name;
         }
+
+        natcasesort($companies);
+        return array_values($companies);
+    };
+
+    if (function_exists('mimir_bc_with_slot')) {
+        return mimir_bc_with_slot($environment, static function () use ($run): array {
+            return $run();
+        });
     }
 
-    if (!is_array($rows) || $rows === []) {
-        $details = $lastErrorMessage !== '' ? (': ' . $lastErrorMessage) : '';
-        throw new RuntimeException('Geen bedrijven gevonden voor environment ' . $environment . $details);
-    }
-
-    $companies = [];
-    $seen = [];
-    foreach ($rows as $row) {
-        if (!is_array($row)) {
-            continue;
-        }
-
-        $name = trim((string) ($row['Name'] ?? $row['Display_Name'] ?? ''));
-        if ($name === '') {
-            continue;
-        }
-
-        $lowerName = strtolower($name);
-        if (isset($seen[$lowerName])) {
-            continue;
-        }
-
-        $seen[$lowerName] = true;
-        $companies[] = $name;
-    }
-
-    natcasesort($companies);
-    return array_values($companies);
+    return $run();
 }
 
 /**

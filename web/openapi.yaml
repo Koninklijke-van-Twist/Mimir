@@ -339,6 +339,15 @@ components:
           enum: [none, bc, mixed, local]
         filter_note: { type: string, nullable: true }
         filter_batches: { type: integer }
+        queue_wait_ms:
+          type: integer
+          description: Milliseconden gewacht op een BC-concurrency-slot (0 als geen wachtrij of volledig uit cache)
+        bc_slots_used:
+          type: integer
+          description: Actieve BC-slots voor dit environment op het moment van de response (0 bij pure cache)
+        bc_slots_max:
+          type: integer
+          description: Max gelijktijdige live BC-fetches per environment (default 3)
     QueryResult:
       type: object
       required: [value, meta]

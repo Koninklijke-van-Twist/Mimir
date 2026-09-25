@@ -5,6 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/mimir_auth.php';
 require_once __DIR__ . '/odata.php';
 require_once __DIR__ . '/mimir_store.php';
+require_once __DIR__ . '/mimir_bc_limit.php';
 require_once __DIR__ . '/auth_helper.php';
 
 function mimir_json(array $payload, int $status = 200): never
@@ -250,10 +251,12 @@ function mimir_metadata_for_environment(PDO $pdo, string $environment, int $now)
     }
 
     $auth = auth_get_auth_for_environment($environment);
-    $xml = odata_get_text(rtrim($prefix, '/') . '/$metadata', $auth);
-    $parsed = odata_parse_metadata($xml);
-    mimir_meta_put($pdo, $cacheKey, $parsed, $now);
-    return $parsed;
+    return mimir_bc_with_slot($environment, static function () use ($pdo, $prefix, $auth, $cacheKey, $now): array {
+        $xml = odata_get_text(rtrim($prefix, '/') . '/$metadata', $auth);
+        $parsed = odata_parse_metadata($xml);
+        mimir_meta_put($pdo, $cacheKey, $parsed, $now);
+        return $parsed;
+    });
 }
 
 /**

@@ -12,6 +12,7 @@ De pagina staat in `web/` en gaat via FTP naar `/var/www/html/mimir/`.
 - `web/openapi.yaml` / `web/openapi.json` — OpenAPI 3-specificatie (publiek, geen sleutel).
 - `web/odata.php` — BC-client (basic of NTLM, paginering via `@odata.nextLink`, `$metadata`).
 - `web/mimir_store.php` — SQLite: rijcache, dekking van een fetch, API-sleutels, usage.
+- `web/mimir_bc_limit.php` — cross-process limiet op gelijktijdige live BC-requests per environment.
 - `web/mimir_filter.php` — filterboom `and` / `or` / `xor`.
 - `web/logincheck.php` + `web/auth_helper.php` — SSO-poort als Consus; company-discovery als Penates (meerdere environments).
 - `web/data/mimir.sqlite` — runtime, niet in git.
@@ -91,6 +92,11 @@ Een rij is vers als `now - fetched_at <= max_age`. Daarnaast onthoudt Mímir of 
 Voor aaneengesloten ranges op **één** vergelijkbaar veld (`eq` / `ge` / `gt` / `le` / `lt` en AND daarvan): als er verse overlappinge rangedekking is, haalt Mímir alleen de **ontbrekende subranges** uit BC, merge’t met gecachte rijen, en zet `meta.gap_fill=1`. Zonder veiligheidsbewijs (geen passende dekking, of onveilig filter zoals `contains` / cross-field OR) blijft het volledige BC-fetch voor dat filter.
 
 `meta.shared` / `meta.bc_hit` / `from_cache` / `from_live` blijven de meetlat: shared = volledig uit andermans/legacy cache zonder BC; bc_hit zodra BC werd gebeld (ook bij partial gap fill).
+
+### BC-concurrency
+
+Business Central laat ongeveer vijf gelijktijdige requests per environment toe. Mímir beperkt live BC-fetches tot **3** tegelijk per environment (`kvtmdlive_aad` en `kvtgermanylive_aad` hebben aparte tellers), met een FIFO-wachtlijst in SQLite (`web/data/bc_limit.sqlite`). Antwoorden die volledig uit de cache komen nemen geen slot. Wie moest wachten krijgt `meta.queue_wait_ms` (en optioneel `bc_slots_used` / `bc_slots_max`). Na **120** seconden wachten volgt HTTP **503** in plaats van oneindig hangen. Constanten: `MIMIR_BC_MAX_CONCURRENT`, `MIMIR_BC_QUEUE_WAIT_SECONDS` in `web/mimir_bc_limit.php`.
+
 
 De UI gebruikt altijd `max_age` 600. De API laat de aanroeper dat bepalen (default 3600, maximum 365 dagen).
 

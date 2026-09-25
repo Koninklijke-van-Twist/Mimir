@@ -5,6 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/mimir_filter.php';
 require_once __DIR__ . '/odata.php';
 require_once __DIR__ . '/mimir_heatmap.php';
+require_once __DIR__ . '/mimir_bc_limit.php';
 
 const MIMIR_UI_MAX_AGE = 600;
 const MIMIR_ODATA_PAGE_SIZE = 2000;
@@ -945,6 +946,20 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         ? (int) $job['key_id']
         : null;
     $allowBroad = mimir_filter_allows_local($filter);
+
+    $slotHeld = false;
+    $queueWaitMs = 0;
+    $innerFetch = $fetch;
+    $fetch = static function (string $url) use ($innerFetch, $environment, &$slotHeld, &$queueWaitMs): array {
+        if (!$slotHeld) {
+            $queueWaitMs = mimir_bc_slot_acquire($environment);
+            $slotHeld = true;
+        }
+
+        return $innerFetch($url);
+    };
+
+    try {
     $coverage = mimir_coverage_find(
         $pdo,
         $environment,
@@ -1161,11 +1176,19 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     if ($batchCount > 1) {
         $meta['filter_batches'] = $batchCount;
     }
+    $meta['queue_wait_ms'] = $queueWaitMs;
+    $meta['bc_slots_max'] = mimir_bc_limit_max_concurrent();
+    $meta['bc_slots_used'] = $slotHeld ? mimir_bc_slots_used($environment) : 0;
 
     return [
         'value' => $value,
         'meta' => $meta,
     ];
+    } finally {
+        if ($slotHeld) {
+            mimir_bc_slot_release($environment);
+        }
+    }
 }
 
 
