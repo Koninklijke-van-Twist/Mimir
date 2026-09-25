@@ -1,6 +1,12 @@
 <?php
 
 /**
+ * Multi-environment auth, gelijk aan Penates web/auth_helper.php.
+ * $environment is de actieve lijst; alleen sleutels die ook in $auth_list staan tellen mee.
+ * Een bedrijfsnaam wijst naar precies één environment via auth_get_environment_for_company.
+ */
+
+/**
  * Normaliseert environment-input naar een unieke lijst.
  */
 function auth_normalize_environment_list(mixed $value): array
@@ -190,45 +196,52 @@ function auth_fetch_companies_for_environment(string $environment, int $ttlSecon
 function auth_fetch_companies_for_environment_via_curl(string $url, array $auth): array
 {
     $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => false,
-        CURLOPT_CONNECTTIMEOUT => 30,
-        CURLOPT_TIMEOUT => 120,
-        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-        CURLOPT_HTTPHEADER => [
-            'Accept: application/json',
-            'Accept-Language: nl-NL,nl;q=0.9,en;q=0.8',
-        ],
-    ]);
-
-    if (($auth['mode'] ?? '') === 'basic') {
-        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        curl_setopt($ch, CURLOPT_USERPWD, (string) ($auth['user'] ?? '') . ':' . (string) ($auth['pass'] ?? ''));
-    } elseif (($auth['mode'] ?? '') === 'ntlm') {
-        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_NTLM);
-        curl_setopt($ch, CURLOPT_USERPWD, (string) ($auth['user'] ?? '') . ':' . (string) ($auth['pass'] ?? ''));
+    if ($ch === false) {
+        throw new RuntimeException('cURL kon niet worden gestart.');
     }
 
-    $raw = curl_exec($ch);
-    if ($raw === false) {
-        $error = curl_error($ch);
-        throw new RuntimeException('cURL fout bij ophalen companies: ' . $error);
+    try {
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_CONNECTTIMEOUT => 30,
+            CURLOPT_TIMEOUT => 120,
+            CURLOPT_HTTPHEADER => [
+                'Accept: application/json',
+                'Accept-Language: nl-NL,nl;q=0.9,en;q=0.8',
+            ],
+        ]);
+
+        if (($auth['mode'] ?? '') === 'basic') {
+            curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+            curl_setopt($ch, CURLOPT_USERPWD, (string) ($auth['user'] ?? '') . ':' . (string) ($auth['pass'] ?? ''));
+        } elseif (($auth['mode'] ?? '') === 'ntlm') {
+            curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_NTLM);
+            curl_setopt($ch, CURLOPT_USERPWD, (string) ($auth['user'] ?? '') . ':' . (string) ($auth['pass'] ?? ''));
+        }
+
+        $raw = curl_exec($ch);
+        if ($raw === false) {
+            $error = curl_error($ch);
+            throw new RuntimeException('cURL fout bij ophalen companies: ' . $error);
+        }
+
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if ($code < 200 || $code >= 300) {
+            throw new RuntimeException('HTTP ' . $code . ' bij ophalen companies.');
+        }
+
+        $decoded = json_decode((string) $raw, true);
+        if (!is_array($decoded)) {
+            throw new RuntimeException('Ongeldige JSON response bij ophalen companies.');
+        }
+
+        $rows = $decoded['value'] ?? null;
+        return is_array($rows) ? $rows : [];
+    } finally {
+        curl_close($ch);
     }
-
-    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-    if ($code < 200 || $code >= 300) {
-        throw new RuntimeException('HTTP ' . $code . ' bij ophalen companies.');
-    }
-
-    $decoded = json_decode((string) $raw, true);
-    if (!is_array($decoded)) {
-        throw new RuntimeException('Ongeldige JSON response bij ophalen companies.');
-    }
-
-    $rows = $decoded['value'] ?? null;
-    return is_array($rows) ? $rows : [];
 }
 
 /**

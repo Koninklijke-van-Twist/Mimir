@@ -37,6 +37,7 @@ function mimir_job(array $overrides = []): array
 {
     global $schema, $prefix;
     return array_merge([
+        'environment' => 'kvtmdlive_aad',
         'company' => 'KVT',
         'entity' => 'ItemList',
         'service_prefix' => $prefix,
@@ -49,12 +50,12 @@ function mimir_job(array $overrides = []): array
 }
 
 $pdo = mimir_db(':memory:');
-mimir_cache_upsert($pdo, 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
     'No' => 'A',
     'Description' => 'Pomp',
     'Inventory' => 3,
 ], $now - 30);
-mimir_coverage_put($pdo, 'KVT', 'ItemList', '', '*', $now - 30, 1);
+mimir_coverage_put($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', '', '*', $now - 30, 1);
 $calls = [];
 $cached = mimir_query_entity($pdo, mimir_job(), function (string $url) use (&$calls): array {
     $calls[] = $url;
@@ -66,11 +67,11 @@ mimir_cache_same($cached['meta']['from_live'], 0, 'nothing live');
 mimir_cache_same($cached['value'][0]['Description'], 'Pomp', 'cached description');
 
 $pdo = mimir_db(':memory:');
-mimir_cache_upsert($pdo, 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
     'No' => 'A',
     'Description' => 'Pomp',
 ], $now - 20);
-mimir_coverage_put($pdo, 'KVT', 'ItemList', '', '*', $now - 20, 1);
+mimir_coverage_put($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', '', '*', $now - 20, 1);
 $calls = [];
 $refreshed = mimir_query_entity($pdo, mimir_job([
     'select' => ['No', 'Description', 'Inventory'],
@@ -89,7 +90,7 @@ mimir_cache_same($refreshed['meta']['from_live'], 1, 'refreshed row counts as li
 mimir_cache_same($refreshed['value'][0]['Inventory'], 9, 'inventory came from BC');
 
 $pdo = mimir_db(':memory:');
-mimir_cache_upsert($pdo, 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
     'No' => 'A',
     'Description' => 'oud',
 ], $now - 5000);

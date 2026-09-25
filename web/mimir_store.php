@@ -47,30 +47,75 @@ function mimir_db_path(): string
     return __DIR__ . '/data/mimir.sqlite';
 }
 
+/**
+ * @return list<string>
+ */
+function mimir_sqlite_columns(PDO $pdo, string $table): array
+{
+    if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $table) !== 1) {
+        throw new RuntimeException('Ongeldige tabelnaam.');
+    }
+    $columns = [];
+    $stmt = $pdo->query('PRAGMA table_info(' . $table . ')');
+    if ($stmt === false) {
+        return [];
+    }
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $columns[] = (string) ($row['name'] ?? '');
+    }
+    return $columns;
+}
+
 function mimir_migrate(PDO $pdo): void
 {
+    $rowColumns = mimir_sqlite_columns($pdo, 'cache_rows');
+    if ($rowColumns !== [] && !in_array('environment', $rowColumns, true)) {
+        $pdo->exec('ALTER TABLE cache_rows RENAME TO cache_rows_legacy');
+    }
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS cache_rows (
+            environment TEXT NOT NULL,
             company TEXT NOT NULL,
             entity TEXT NOT NULL,
             row_key TEXT NOT NULL,
             payload TEXT NOT NULL,
             fetched_at INTEGER NOT NULL,
-            PRIMARY KEY (company, entity, row_key)
+            PRIMARY KEY (environment, company, entity, row_key)
         )'
     );
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_cache_rows_entity ON cache_rows(company, entity, fetched_at)');
+    if (mimir_sqlite_columns($pdo, 'cache_rows_legacy') !== []) {
+        $pdo->exec(
+            "INSERT OR IGNORE INTO cache_rows (environment, company, entity, row_key, payload, fetched_at)
+             SELECT '', company, entity, row_key, payload, fetched_at FROM cache_rows_legacy"
+        );
+        $pdo->exec('DROP TABLE cache_rows_legacy');
+    }
+    $pdo->exec('DROP INDEX IF EXISTS idx_cache_rows_entity');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_cache_rows_lookup ON cache_rows(environment, company, entity, fetched_at)');
+
+    $coverageColumns = mimir_sqlite_columns($pdo, 'cache_coverage');
+    if ($coverageColumns !== [] && !in_array('environment', $coverageColumns, true)) {
+        $pdo->exec('ALTER TABLE cache_coverage RENAME TO cache_coverage_legacy');
+    }
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS cache_coverage (
+            environment TEXT NOT NULL,
             company TEXT NOT NULL,
             entity TEXT NOT NULL,
             filter_sig TEXT NOT NULL,
             select_sig TEXT NOT NULL,
             fetched_at INTEGER NOT NULL,
             row_count INTEGER NOT NULL,
-            PRIMARY KEY (company, entity, filter_sig, select_sig)
+            PRIMARY KEY (environment, company, entity, filter_sig, select_sig)
         )'
     );
+    if (mimir_sqlite_columns($pdo, 'cache_coverage_legacy') !== []) {
+        $pdo->exec(
+            "INSERT OR IGNORE INTO cache_coverage (environment, company, entity, filter_sig, select_sig, fetched_at, row_count)
+             SELECT '', company, entity, filter_sig, select_sig, fetched_at, row_count FROM cache_coverage_legacy"
+        );
+        $pdo->exec('DROP TABLE cache_coverage_legacy');
+    }
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS meta_cache (
             cache_key TEXT PRIMARY KEY,
@@ -298,17 +343,19 @@ function mimir_meta_put(PDO $pdo, string $key, array $payload, int $now): void
 /**
  * @param array<string, mixed> $payload
  */
-function mimir_cache_upsert(PDO $pdo, string $company, string $entity, string $rowKey, array $payload, int $fetchedAt): void
+function mimir_cache_upsert(PDO $pdo, string $environment, string $company, string $entity, string $rowKey, array $payload, int $fetchedAt): void
 {
     $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     if ($json === false) {
         throw new RuntimeException('Rij kon niet worden gecachet.');
     }
     $stmt = $pdo->prepare(
-        'INSERT INTO cache_rows (company, entity, row_key, payload, fetched_at) VALUES (:company, :entity, :row_key, :payload, :at)
-         ON CONFLICT(company, entity, row_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
+        'INSERT INTO cache_rows (environment, company, entity, row_key, payload, fetched_at)
+         VALUES (:environment, :company, :entity, :row_key, :payload, :at)
+         ON CONFLICT(environment, company, entity, row_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
     );
     $stmt->execute([
+        ':environment' => $environment,
         ':company' => $company,
         ':entity' => $entity,
         ':row_key' => $rowKey,
@@ -317,19 +364,28 @@ function mimir_cache_upsert(PDO $pdo, string $company, string $entity, string $r
     ]);
 }
 
-function mimir_cache_delete(PDO $pdo, string $company, string $entity, string $rowKey): void
+function mimir_cache_delete(PDO $pdo, string $environment, string $company, string $entity, string $rowKey): void
 {
-    $stmt = $pdo->prepare('DELETE FROM cache_rows WHERE company = :company AND entity = :entity AND row_key = :row_key');
-    $stmt->execute([':company' => $company, ':entity' => $entity, ':row_key' => $rowKey]);
+    $stmt = $pdo->prepare(
+        'DELETE FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity AND row_key = :row_key'
+    );
+    $stmt->execute([
+        ':environment' => $environment,
+        ':company' => $company,
+        ':entity' => $entity,
+        ':row_key' => $rowKey,
+    ]);
 }
 
 /**
  * @return list<array{row_key: string, payload: array<string, mixed>, fetched_at: int}>
  */
-function mimir_cache_all(PDO $pdo, string $company, string $entity): array
+function mimir_cache_all(PDO $pdo, string $environment, string $company, string $entity): array
 {
-    $stmt = $pdo->prepare('SELECT row_key, payload, fetched_at FROM cache_rows WHERE company = :company AND entity = :entity');
-    $stmt->execute([':company' => $company, ':entity' => $entity]);
+    $stmt = $pdo->prepare(
+        'SELECT row_key, payload, fetched_at FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity'
+    );
+    $stmt->execute([':environment' => $environment, ':company' => $company, ':entity' => $entity]);
     $rows = [];
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $payload = json_decode((string) $row['payload'], true);
@@ -342,14 +398,15 @@ function mimir_cache_all(PDO $pdo, string $company, string $entity): array
     return $rows;
 }
 
-function mimir_coverage_put(PDO $pdo, string $company, string $entity, string $filterSig, string $selectSig, int $fetchedAt, int $rowCount): void
+function mimir_coverage_put(PDO $pdo, string $environment, string $company, string $entity, string $filterSig, string $selectSig, int $fetchedAt, int $rowCount): void
 {
     $stmt = $pdo->prepare(
-        'INSERT INTO cache_coverage (company, entity, filter_sig, select_sig, fetched_at, row_count)
-         VALUES (:company, :entity, :filter_sig, :select_sig, :at, :count)
-         ON CONFLICT(company, entity, filter_sig, select_sig) DO UPDATE SET fetched_at = excluded.fetched_at, row_count = excluded.row_count'
+        'INSERT INTO cache_coverage (environment, company, entity, filter_sig, select_sig, fetched_at, row_count)
+         VALUES (:environment, :company, :entity, :filter_sig, :select_sig, :at, :count)
+         ON CONFLICT(environment, company, entity, filter_sig, select_sig) DO UPDATE SET fetched_at = excluded.fetched_at, row_count = excluded.row_count'
     );
     $stmt->execute([
+        ':environment' => $environment,
         ':company' => $company,
         ':entity' => $entity,
         ':filter_sig' => $filterSig,
@@ -362,11 +419,12 @@ function mimir_coverage_put(PDO $pdo, string $company, string $entity, string $f
 /**
  * @return array{filter_sig: string, select_sig: string, fetched_at: int}|null
  */
-function mimir_coverage_find(PDO $pdo, string $company, string $entity, ?string $pushedFilter, string $selectSig, int $maxAge, int $now): ?array
+function mimir_coverage_find(PDO $pdo, string $environment, string $company, string $entity, ?string $pushedFilter, string $selectSig, int $maxAge, int $now): ?array
 {
     $sql = 'SELECT filter_sig, select_sig, fetched_at FROM cache_coverage
-            WHERE company = :company AND entity = :entity AND fetched_at >= :min_at';
+            WHERE environment = :environment AND company = :company AND entity = :entity AND fetched_at >= :min_at';
     $params = [
+        ':environment' => $environment,
         ':company' => $company,
         ':entity' => $entity,
         ':min_at' => $now - $maxAge,
@@ -508,6 +566,7 @@ function mimir_project_row(array $row, array $select): array
 
 /**
  * @param array{
+ *   environment: string,
  *   company: string,
  *   entity: string,
  *   service_prefix: string,
@@ -522,9 +581,13 @@ function mimir_project_row(array $row, array $select): array
  */
 function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): array
 {
+    $environment = trim((string) ($job['environment'] ?? ''));
     $company = trim((string) ($job['company'] ?? ''));
     $entity = trim((string) ($job['entity'] ?? ''));
     $prefix = (string) ($job['service_prefix'] ?? '');
+    if ($environment === '') {
+        throw new MimirUserException('environment is verplicht.');
+    }
     if ($company === '') {
         throw new MimirUserException('company is verplicht.');
     }
@@ -581,7 +644,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     }
     $selectSig = mimir_select_sig($select);
     $required = array_values(array_unique(array_merge($select, mimir_filter_fields($filter))));
-    $coverage = mimir_coverage_find($pdo, $company, $entity, $pushed, $selectSig, $maxAge, $now);
+    $coverage = mimir_coverage_find($pdo, $environment, $company, $entity, $pushed, $selectSig, $maxAge, $now);
 
     $fromCache = 0;
     $fromLive = 0;
@@ -591,6 +654,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     if ($coverage !== null) {
         $served = mimir_serve_from_coverage(
             $pdo,
+            $environment,
             $company,
             $entity,
             $prefix,
@@ -614,6 +678,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     if (!$usedCoverage) {
         $live = mimir_fetch_collection(
             $pdo,
+            $environment,
             $company,
             $entity,
             $prefix,
@@ -653,6 +718,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     return [
         'value' => $value,
         'meta' => [
+            'environment' => $environment,
             'from_cache' => $fromCache,
             'from_live' => $fromLive,
             'max_age' => $maxAge,
@@ -674,6 +740,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
  */
 function mimir_serve_from_coverage(
     PDO $pdo,
+    string $environment,
     string $company,
     string $entity,
     string $prefix,
@@ -689,7 +756,7 @@ function mimir_serve_from_coverage(
 ): array {
     $window = [];
     $needsRefresh = 0;
-    foreach (mimir_cache_all($pdo, $company, $entity) as $stored) {
+    foreach (mimir_cache_all($pdo, $environment, $company, $entity) as $stored) {
         if ($stored['fetched_at'] + 2 < $coverageAt) {
             continue;
         }
@@ -711,7 +778,7 @@ function mimir_serve_from_coverage(
         if ($item['reason'] === 'ok') {
             $current = ['payload' => $stored['payload'], 'fetched_at' => $stored['fetched_at'], 'live' => false];
         } else {
-            $refreshed = mimir_refresh_whole_row($pdo, $company, $entity, $prefix, $stored['payload'], $keys, $types, $required, $fetch, $now);
+            $refreshed = mimir_refresh_whole_row($pdo, $environment, $company, $entity, $prefix, $stored['payload'], $keys, $types, $required, $fetch, $now);
             if ($refreshed === null) {
                 continue;
             }
@@ -746,6 +813,7 @@ function mimir_serve_from_coverage(
  */
 function mimir_refresh_whole_row(
     PDO $pdo,
+    string $environment,
     string $company,
     string $entity,
     string $prefix,
@@ -770,7 +838,7 @@ function mimir_refresh_whole_row(
         $decoded = $fetch($url);
     } catch (Throwable $error) {
         if (mimir_exception_status($error) === 404) {
-            mimir_cache_delete($pdo, $company, $entity, $rowKey);
+            mimir_cache_delete($pdo, $environment, $company, $entity, $rowKey);
             return null;
         }
         throw $error;
@@ -790,9 +858,9 @@ function mimir_refresh_whole_row(
     }
     $newKey = mimir_row_key($fresh, $keys);
     if ($newKey !== $rowKey) {
-        mimir_cache_delete($pdo, $company, $entity, $rowKey);
+        mimir_cache_delete($pdo, $environment, $company, $entity, $rowKey);
     }
-    mimir_cache_upsert($pdo, $company, $entity, $newKey, $fresh, $now);
+    mimir_cache_upsert($pdo, $environment, $company, $entity, $newKey, $fresh, $now);
     return ['payload' => $fresh, 'fetched_at' => $now];
 }
 
@@ -805,6 +873,7 @@ function mimir_refresh_whole_row(
  */
 function mimir_fetch_collection(
     PDO $pdo,
+    string $environment,
     string $company,
     string $entity,
     string $prefix,
@@ -859,14 +928,14 @@ function mimir_fetch_collection(
             }
         }
         $rowKey = mimir_row_key($clean, $keys);
-        mimir_cache_upsert($pdo, $company, $entity, $rowKey, $clean, $now);
+        mimir_cache_upsert($pdo, $environment, $company, $entity, $rowKey, $clean, $now);
         $stored[] = ['payload' => $clean, 'fetched_at' => $now];
     }
 
     if (!$pages['truncated']) {
         $filterSig = $pushed ?? '';
         $selectSig = mimir_select_sig($select);
-        mimir_coverage_put($pdo, $company, $entity, $filterSig, $selectSig, $now, count($stored));
+        mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($stored));
     }
 
     return ['rows' => $stored, 'mode' => $mode, 'pushed' => $pushed];

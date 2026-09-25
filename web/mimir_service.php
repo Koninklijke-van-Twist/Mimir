@@ -96,32 +96,80 @@ function mimir_public_error(Throwable $error): string
 }
 
 /**
- * @return list<string>
+ * @param array<string, string> $map
+ * @return list<array{name: string, environment: string}>
  */
-function mimir_company_names(PDO $pdo, int $now): array
+function mimir_companies_from_map(array $map): array
 {
+    $companies = [];
+    foreach ($map as $name => $environment) {
+        $companyName = trim((string) $name);
+        $environmentName = trim((string) $environment);
+        if ($companyName === '' || $environmentName === '') {
+            continue;
+        }
+        $companies[] = [
+            'name' => $companyName,
+            'environment' => $environmentName,
+        ];
+    }
+    usort($companies, static function (array $left, array $right): int {
+        return strcasecmp($left['name'], $right['name']);
+    });
+    return $companies;
+}
+
+/**
+ * Bedrijven over alle actieve environments. De map wordt alleen gecachet
+ * als elk environment antwoordde, zodat een tijdelijke fout Germany niet een dag verstopt.
+ *
+ * @return array{companies: list<array{name: string, environment: string}>, errors: list<string>}
+ */
+function mimir_company_catalog(PDO $pdo, int $now): array
+{
+    $current = $GLOBALS['demeter_company_environment_map'] ?? null;
+    if (is_array($current) && $current !== []) {
+        $errors = $GLOBALS['demeter_company_environment_errors'] ?? [];
+        return [
+            'companies' => mimir_companies_from_map($current),
+            'errors' => is_array($errors) ? array_values($errors) : [],
+        ];
+    }
+
     $fragment = auth_get_environment_key_fragment();
     $cacheKey = 'company-map:' . $fragment;
     $cached = mimir_meta_get($pdo, $cacheKey, MIMIR_COMPANY_TTL, $now);
     if (is_array($cached) && isset($cached['map']) && is_array($cached['map']) && $cached['map'] !== []) {
         $GLOBALS['demeter_company_environment_map'] = $cached['map'];
-        $names = array_keys($cached['map']);
-        natcasesort($names);
-        return array_values($names);
+        $errors = is_array($cached['errors'] ?? null) ? array_values($cached['errors']) : [];
+        $GLOBALS['demeter_company_environment_errors'] = $errors;
+        return [
+            'companies' => mimir_companies_from_map($cached['map']),
+            'errors' => $errors,
+        ];
     }
 
     $discovered = auth_discover_companies_across_active_environments();
     $map = is_array($discovered['map'] ?? null) ? $discovered['map'] : [];
-    mimir_meta_put($pdo, $cacheKey, ['map' => $map], $now);
-    $names = array_keys($map);
-    natcasesort($names);
-    return array_values($names);
+    $errors = is_array($discovered['errors'] ?? null) ? array_values($discovered['errors']) : [];
+    $GLOBALS['demeter_company_environment_errors'] = $errors;
+    if ($map !== [] && $errors === []) {
+        mimir_meta_put($pdo, $cacheKey, ['map' => $map, 'errors' => []], $now);
+    }
+    return [
+        'companies' => mimir_companies_from_map($map),
+        'errors' => $errors,
+    ];
 }
 
 function mimir_environment_for_company(PDO $pdo, string $company, int $now): string
 {
-    mimir_company_names($pdo, $now);
-    return auth_get_environment_for_company($company);
+    mimir_company_catalog($pdo, $now);
+    try {
+        return auth_get_environment_for_company($company);
+    } catch (RuntimeException $error) {
+        throw new MimirUserException($error->getMessage(), 404);
+    }
 }
 
 /**
@@ -169,6 +217,7 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
     $maxAge = $forceMaxAge ?? ($spec['max_age'] ?? MIMIR_DEFAULT_MAX_AGE);
 
     return mimir_query_entity($pdo, [
+        'environment' => $environment,
         'company' => $company,
         'entity' => $schema['name'],
         'service_prefix' => $prefix,
@@ -296,11 +345,15 @@ function mimir_apply_combine(array $results, mixed $combine): array
 /**
  * @return list<array{name: string, entity_type: string}>
  */
+/**
+ * @return array{environment: string, tables: list<array{name: string, entity_type: string}>}
+ */
 function mimir_list_tables(PDO $pdo, string $company, string $query, int $now): array
 {
-    $environment = $company === ''
-        ? auth_get_primary_environment()
-        : mimir_environment_for_company($pdo, $company, $now);
+    if (trim($company) === '') {
+        throw new MimirUserException('company is verplicht. De tabellenlijst komt uit het environment van dat bedrijf.');
+    }
+    $environment = mimir_environment_for_company($pdo, $company, $now);
     $metadata = mimir_metadata_for_environment($pdo, $environment, $now);
     $needle = strtolower($query);
     $tables = [];
@@ -314,7 +367,7 @@ function mimir_list_tables(PDO $pdo, string $company, string $query, int $now): 
             'entity_type' => (string) ($set['entity_type'] ?? ''),
         ];
     }
-    return $tables;
+    return ['environment' => $environment, 'tables' => $tables];
 }
 
 /**
@@ -322,9 +375,10 @@ function mimir_list_tables(PDO $pdo, string $company, string $query, int $now): 
  */
 function mimir_table_schema(PDO $pdo, string $company, string $table, int $now): array
 {
-    $environment = $company === ''
-        ? auth_get_primary_environment()
-        : mimir_environment_for_company($pdo, $company, $now);
+    if (trim($company) === '') {
+        throw new MimirUserException('company is verplicht. Het schema komt uit het environment van dat bedrijf.');
+    }
+    $environment = mimir_environment_for_company($pdo, $company, $now);
     $metadata = mimir_metadata_for_environment($pdo, $environment, $now);
     try {
         $schema = mimir_schema_for_set($metadata, $table);
@@ -338,6 +392,7 @@ function mimir_table_schema(PDO $pdo, string $company, string $table, int $now):
     return [
         'name' => $schema['name'],
         'entity_type' => $schema['entity_type'],
+        'environment' => $environment,
         'keys' => $schema['keys'],
         'properties' => $properties,
     ];
@@ -378,8 +433,8 @@ function mimir_api_main(?string $forcedRoute = null): void
             if ($method !== 'GET') {
                 mimir_json(['error' => 'GET verwacht.'], 405);
             }
-            $tables = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
-            mimir_json(['value' => $tables]);
+            $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
+            mimir_json(['value' => $listed['tables'], 'environment' => $listed['environment']]);
         }
         if ($parsed['action'] === 'schema') {
             if ($method !== 'GET') {
@@ -449,11 +504,12 @@ function mimir_ui_main(): void
 
         mimir_load_auth(true);
         if ($action === 'companies' && $method === 'GET') {
-            mimir_json(['value' => mimir_company_names($pdo, $now)]);
+            $catalog = mimir_company_catalog($pdo, $now);
+            mimir_json(['value' => $catalog['companies'], 'errors' => $catalog['errors']]);
         }
         if ($action === 'tables' && $method === 'GET') {
-            $tables = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
-            mimir_json(['value' => $tables]);
+            $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
+            mimir_json(['value' => $listed['tables'], 'environment' => $listed['environment']]);
         }
         if ($action === 'schema' && $method === 'GET') {
             $schema = mimir_table_schema($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['table'] ?? '')), $now);

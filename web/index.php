@@ -45,7 +45,7 @@ function mimir_h(string $value): string
         <section class="panel">
             <div class="panel-head">
                 <h2>Tabel</h2>
-                <p>Maximale cacheleeftijd in deze pagina is 10 minuten. Ouder dan dat haalt Mímir de rij opnieuw op uit Business Central.</p>
+                <p>Maximale cacheleeftijd in deze pagina is 10 minuten. Ouder dan dat haalt Mímir de rij opnieuw op uit Business Central. Het gekozen bedrijf bepaalt de database (KVT/HVT of KVT Germany) en daarmee de tabellenlijst.</p>
             </div>
             <div class="toolbar">
                 <label class="field">

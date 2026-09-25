@@ -139,7 +139,7 @@ function mimir_company_segment(string $company): string
  */
 function mimir_collection_url(string $prefix, string $company, string $entity, array $query = []): string
 {
-    $url = rtrim($prefix, '/') . '/' . mimir_company_segment($company) . '/' . $entity;
+    $url = rtrim($prefix, '/') . '/' . mimir_company_segment($company) . '/' . rawurlencode($entity);
     if ($query !== []) {
         $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
     }
@@ -148,7 +148,7 @@ function mimir_collection_url(string $prefix, string $company, string $entity, a
 
 function mimir_entity_key_url(string $prefix, string $company, string $entity, string $predicate): string
 {
-    return rtrim($prefix, '/') . '/' . mimir_company_segment($company) . '/' . $entity . '(' . $predicate . ')';
+    return rtrim($prefix, '/') . '/' . mimir_company_segment($company) . '/' . rawurlencode($entity) . '(' . $predicate . ')';
 }
 
 /**

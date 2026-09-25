@@ -12,22 +12,34 @@ De pagina staat in `web/` en gaat via FTP naar `/var/www/html/mimir/`.
 - `web/odata.php` — BC-client (basic of NTLM, paginering via `@odata.nextLink`, `$metadata`).
 - `web/mimir_store.php` — SQLite: rijcache, dekking van een fetch, API-sleutels, usage.
 - `web/mimir_filter.php` — filterboom `and` / `or` / `xor`.
-- `web/logincheck.php` + `web/auth_helper.php` — dezelfde SSO-poort als Consus.
+- `web/logincheck.php` + `web/auth_helper.php` — SSO-poort als Consus; company-discovery als Penates (meerdere environments).
 - `web/data/mimir.sqlite` — runtime, niet in git.
 
 ## auth.php
 
 Geen `auth.php` in deze repository. Lokaal wordt eerst `~/Repositories/auth.php` geladen (dezelfde gedeelde file als de andere apps), tenzij `MIMIR_AUTH_FILE` naar een ander bestand wijst. Op de server blijft het `web/auth.php`. Die staat in `.gitignore` en de FTP-deploy overschrijft hem niet.
 
-Verwachte variabelen, hetzelfde als bij Consus:
+Verwachte variabelen, hetzelfde model als Penates. `$baseUrl` is alleen de host. Elke BC-database is een sleutel in `$auth_list`. `$environment` is de lijst die Mímir echt gebruikt (ook een string mag; leeg valt terug op de eerste sleutel van `$auth_list`). Een naam telt alleen mee als hij in beide staat. Fat-omgevingen mogen in die lijst staan zodra ze credentials hebben.
+
+KVT en HVT delen `kvtmdlive_aad`. KVT Germany is een aparte database, `kvtgermanylive_aad`, met eigen credentials.
 
 ```php
 <?php
 $baseUrl = 'https://kvtmd365.kvt.nl:7148';
-$environment = 'kvtmdlive_aad';
+$environment = [
+    'kvtmdlive_aad',
+    'kvtgermanylive_aad',
+    // optioneel, als de sleutel ook in $auth_list staat:
+    // 'kvtmdlive_fat',
+];
 $auth_list = [
     'kvtmdlive_aad' => [
         'mode' => 'basic', // of 'ntlm'
+        'user' => '...',
+        'pass' => '...',
+    ],
+    'kvtgermanylive_aad' => [
+        'mode' => 'basic',
         'user' => '...',
         'pass' => '...',
     ],
@@ -37,11 +49,19 @@ $allowedUsers = [
 ];
 ```
 
-Het OData-pad wordt `$baseUrl/$environment/ODataV4/`, dus de live service is `https://kvtmd365.kvt.nl:7148/kvtmdlive_aad/ODataV4/`.
+Een aanroep noemt het **bedrijf**, niet het environment. `auth_get_environment_for_company` zoekt het bedrijf in alle actieve environments en kiest daarbij de credentials. De URL wordt:
+
+`{baseUrl}/{environment}/ODataV4/Company('{company}')/{entity}`
+
+Bijvoorbeeld `https://kvtmd365.kvt.nl:7148/kvtgermanylive_aad/ODataV4/Company('KVT%20Germany')/ItemList`.
+
+`$metadata` (tabellen en velden) wordt per environment van het gekozen bedrijf opgehaald. Germany heeft een eigen lijst; die wordt niet gedeeld met KVT/HVT. Dezelfde bedrijfsnaam in twee actieve environments wordt geweigerd.
 
 ## Cache
 
-Elke rij uit BC staat in SQLite met een eigen `fetched_at` (unix), per bedrijf en entity set. De sleutel komt uit de OData-key van de metadata.
+Elke rij uit BC staat in SQLite met een eigen `fetched_at` (unix). De cachesleutel is **environment + bedrijf + entity set + rijsleutel**. Een rij uit `kvtgermanylive_aad` botst daardoor nooit met KVT of HVT op `kvtmdlive_aad`, ook als de bedrijfsnaam of het artikelnummer gelijk is. De rijsleutel komt uit de OData-key van de metadata van dát environment.
+
+Een bestaande cache zonder `environment`-kolom wordt bij de eerste start omgezet. Die oude rijen krijgen een lege environment en worden niet meer uitgeserveerd.
 
 Een rij is vers als `now - fetched_at <= max_age`. Daarnaast onthoudt Mímir of een fetch van die tabel (plus het `$filter` dat naar BC ging, of de hele tabel) binnen `max_age` compleet binnen was. Alleen dan komt het antwoord uit de cache.
 
@@ -49,7 +69,7 @@ Vraagt `select` een kolom die op een verder verse rij ontbreekt, dan haalt Mími
 
 De UI gebruikt altijd `max_age` 600. De API laat de aanroeper dat bepalen (default 3600, maximum 365 dagen).
 
-Metadata (tabellen en velden) blijft een uur staan. De bedrijvenlijst een dag.
+Metadata blijft een uur staan, apart per environment. De bedrijvenlijst een dag, en alleen als elk actief environment antwoordde. `company` is verplicht bij tabellen, schema en query.
 
 ## Filtergrens naar Business Central
 
@@ -82,8 +102,8 @@ Authenticatie: `Authorization: Bearer <sleutel>` of `X-API-Key: <sleutel>`.
 
 | Methode | Pad | Doel |
 | --- | --- | --- |
-| GET | `/mimir/api/tables.php` | entity sets. `q` filtert op naam, `company` kiest de environment |
-| GET | `/mimir/api/schema.php?table=ItemList` | velden, types, sleutels |
+| GET | `/mimir/api/tables.php?company=…` | entity sets van het environment van dat bedrijf. `q` filtert op naam |
+| GET | `/mimir/api/schema.php?table=ItemList&company=…` | velden, types, sleutels van dat environment |
 | POST | `/mimir/api/query.php` | één tabel, of meerdere via `queries` |
 
 Zonder `PATH_INFO` werken ook:
@@ -97,7 +117,7 @@ Eén tabel:
 ```sh
 curl -sS \
   -H "Authorization: Bearer mimir_…" \
-  "https://sleutels.kvt.nl/mimir/api/tables.php?q=item"
+  "https://sleutels.kvt.nl/mimir/api/tables.php?company=Koninklijke%20van%20Twist&q=item"
 
 curl -sS \
   -H "X-API-Key: mimir_…" \
@@ -110,7 +130,7 @@ curl -sS \
   "https://sleutels.kvt.nl/mimir/api/query.php"
 ```
 
-Antwoord: `{ "value": [ … ], "meta": { "from_cache", "from_live", "max_age", "fetched_at_min", "fetched_at_max", "bc_filter", "filter_mode", "filter_note" } }`.
+Antwoord: `{ "value": [ … ], "meta": { "environment", "from_cache", "from_live", "max_age", "fetched_at_min", "fetched_at_max", "bc_filter", "filter_mode", "filter_note" } }`. `environment` is de BC-database die bij het bedrijf hoort.
 
 Meerdere tabellen in één verzoek, met een optionele equijoin (v1, één sleutel, na het ophalen — geen join in BC):
 
@@ -153,4 +173,6 @@ Zonder Business Central:
 php tests/mimir_filter_test.php
 php tests/mimir_cache_test.php
 php tests/mimir_keys_test.php
+php tests/mimir_heatmap_test.php
+php tests/mimir_auth_env_test.php
 ```

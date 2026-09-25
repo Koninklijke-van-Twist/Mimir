@@ -80,14 +80,21 @@
         setStatus('Bedrijven ophalen…');
         try {
             const data = await api('ui_api.php?action=companies');
-            const names = data.value || [];
-            companyEl.innerHTML = names.map(function (name) {
-                return '<option value="' + esc(name) + '">' + esc(name) + '</option>';
+            const items = (data.value || []).map(function (item) {
+                if (typeof item === 'string') return { name: item, environment: '' };
+                return { name: String(item.name || ''), environment: String(item.environment || '') };
+            }).filter(function (item) { return item.name !== ''; });
+            companyEl.innerHTML = items.map(function (item) {
+                const label = item.environment ? item.name + ' — ' + item.environment : item.name;
+                return '<option value="' + esc(item.name) + '">' + esc(label) + '</option>';
             }).join('');
-            const twist = names.find(function (name) { return /twist/i.test(name); });
-            if (twist) companyEl.value = twist;
+            const twist = items.find(function (item) { return /twist/i.test(item.name); });
+            if (twist) companyEl.value = twist.name;
             setStatus('');
             await loadTables();
+            if (data.errors && data.errors.length) {
+                setStatus('Sommige environments gaven geen bedrijven: ' + data.errors.join(' | '), true);
+            }
         } catch (error) {
             companyEl.innerHTML = '';
             const input = document.createElement('input');
