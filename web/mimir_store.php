@@ -663,6 +663,47 @@ function mimir_select_sig_covers(string $stored, string $needed): bool
 }
 
 /**
+ * Business-column names currently stored for an entity (union across cached rows).
+ *
+ * @return list<string>
+ */
+function mimir_on_file_columns(PDO $pdo, string $environment, string $company, string $entity): array
+{
+    $cols = [];
+    foreach (mimir_cache_all($pdo, $environment, $company, $entity) as $stored) {
+        foreach (array_keys($stored['payload']) as $key) {
+            if (!is_string($key) || $key === '' || str_starts_with($key, '@')) {
+                continue;
+            }
+            $cols[$key] = $key;
+        }
+    }
+    $out = array_values($cols);
+    sort($out, SORT_STRING);
+    return $out;
+}
+
+/**
+ * Age-refresh: if request $select is a subset of columns already on file, fetch the
+ * full on-file set from BC so the cache does not shrink. Otherwise keep $select.
+ *
+ * @param list<string> $select
+ * @param list<string> $onFile
+ * @return list<string>
+ */
+function mimir_select_for_bc_refresh(array $select, array $onFile): array
+{
+    if ($select === [] || $onFile === []) {
+        return $select;
+    }
+    if (array_diff($select, $onFile) !== []) {
+        // Request asks for columns not on file — existing widen/refresh path.
+        return $select;
+    }
+    return $onFile;
+}
+
+/**
  * @param list<string> $requiredColumns
  * @param array{payload: array<string, mixed>, fetched_at: int}|null $stored
  */
@@ -834,6 +875,12 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $batchCount = $filterBatches === null ? 1 : count($filterBatches);
     $selectSig = mimir_select_sig($select);
     $required = array_values(array_unique(array_merge($select, mimir_filter_fields($filter))));
+    // Age-refresh must not shrink on-file columns: if $select ⊆ cache columns, fetch that union.
+    $fetchSelect = mimir_select_for_bc_refresh(
+        $select,
+        mimir_on_file_columns($pdo, $environment, $company, $entity)
+    );
+    $fetchSelectSig = mimir_select_sig($fetchSelect);
     $keyId = array_key_exists('key_id', $job) && $job['key_id'] !== null && $job['key_id'] !== ''
         ? (int) $job['key_id']
         : null;
@@ -884,7 +931,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                     $filter,
                     $types,
                     $keys,
-                    $select,
+                    $fetchSelect,
                     $batchFilter,
                     'bc',
                     $fetch,
@@ -909,7 +956,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
             }
             if (!$anyTruncated) {
                 $filterSig = $pushed ?? '';
-                mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($merged), $keyId);
+                mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $fetchSelectSig, $now, count($merged), $keyId);
             }
             foreach ($merged as $row) {
                 if (!mimir_filter_match($row['payload'], $filter, $types)) {
@@ -927,7 +974,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                 $filter,
                 $types,
                 $keys,
-                $select,
+                $fetchSelect,
                 $pushed,
                 $mode,
                 $fetch,

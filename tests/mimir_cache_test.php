@@ -219,4 +219,59 @@ mimir_cache_same(count($calls), 2, 'string OR batched');
 mimir_cache_same($strBatched['meta']['filter_mode'], 'bc', 'string filter mode bc');
 mimir_cache_same(count($strBatched['value']), 42, 'string filter returned all');
 
+
+// Age-refresh with subset $select: widen BC fetch to on-file columns, project response to request select.
+$pdo = mimir_db(':memory:');
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
+    'No' => 'A',
+    'Description' => 'oud',
+    'Inventory' => 3,
+], $now - 5000);
+$calls = [];
+$subset = mimir_query_entity($pdo, mimir_job([
+    'select' => ['No', 'Description'],
+]), function (string $url) use (&$calls): array {
+    $calls[] = $url;
+    return ['value' => [['No' => 'A', 'Description' => 'nieuw', 'Inventory' => 8]]];
+}, $now);
+mimir_cache_same(count($calls), 1, 'stale subset triggers one collection fetch');
+if (!preg_match('/(\$select|%24select)=([^&]+)/', $calls[0], $m)) {
+    mimir_cache_fail('age-refresh subset must send $select: ' . $calls[0]);
+}
+$selectCols = explode(',', rawurldecode($m[2]));
+sort($selectCols);
+mimir_cache_same($selectCols, ['Description', 'Inventory', 'No'], 'BC $select is full on-file set');
+mimir_cache_same(array_keys($subset['value'][0]), ['No', 'Description'], 'response projected to request select');
+mimir_cache_same($subset['value'][0]['Description'], 'nieuw', 'subset response has fresh description');
+if (array_key_exists('Inventory', $subset['value'][0])) {
+    mimir_cache_fail('response must not include Inventory when not selected');
+}
+$cachedRows = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
+mimir_cache_same(count($cachedRows), 1, 'one cached row after subset age-refresh');
+mimir_cache_same($cachedRows[0]['payload']['Inventory'] ?? null, 8, 'on-file Inventory preserved/refreshed');
+mimir_cache_same(mimir_on_file_columns($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList'), ['Description', 'Inventory', 'No'], 'on-file columns helper');
+mimir_cache_same(mimir_select_for_bc_refresh(['No', 'Description'], ['Description', 'Inventory', 'No']), ['Description', 'Inventory', 'No'], 'subset widens to on-file');
+mimir_cache_same(mimir_select_for_bc_refresh(['No', 'Description', 'Inventory'], ['Description', 'No']), ['No', 'Description', 'Inventory'], 'superset keeps request select');
+mimir_cache_same(mimir_select_for_bc_refresh([], ['Description', 'No']), [], 'empty select unchanged');
+
+// Age-refresh with equal select: no extra widen beyond request.
+$pdo = mimir_db(':memory:');
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
+    'No' => 'A',
+    'Description' => 'oud',
+], $now - 5000);
+$calls = [];
+mimir_query_entity($pdo, mimir_job([
+    'select' => ['No', 'Description'],
+]), function (string $url) use (&$calls): array {
+    $calls[] = $url;
+    return ['value' => [['No' => 'A', 'Description' => 'nieuw']]];
+}, $now);
+if (!preg_match('/(\$select|%24select)=([^&]+)/', $calls[0], $m)) {
+    mimir_cache_fail('equal select age-refresh must send $select: ' . $calls[0]);
+}
+$selectCols = explode(',', rawurldecode($m[2]));
+sort($selectCols);
+mimir_cache_same($selectCols, ['Description', 'No'], 'equal on-file select stays as request');
+
 fwrite(STDOUT, "ok\n");

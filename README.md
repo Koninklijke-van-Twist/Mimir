@@ -74,6 +74,8 @@ Een rij is vers als `now - fetched_at <= max_age`. Daarnaast onthoudt Mímir of 
 
 Vraagt `select` een kolom die op een verder verse rij ontbreekt, dan haalt Mímir **de hele rij** opnieuw op (geen `$select` op die ene rij) en vervangt de cache. Een losse kolom bijplakken doen we niet.
 
+Is de cache verouderd (`max_age`) en is de gevraagde `select` een echte deelverzameling van de kolommen die al op die entity staan, dan haalt Mímir bij BC opnieuw **alle kolommen die al op file stonden** op (zodat de cache niet smaller wordt) en projecteert het API-antwoord alsnog op alleen de gevraagde `select`. Zonder `select`, of als `select` gelijk is aan / breder is dan wat op file staat, blijft het huidige gedrag.
+
 De UI gebruikt altijd `max_age` 600. De API laat de aanroeper dat bepalen (default 3600, maximum 365 dagen).
 
 Metadata blijft een uur staan, apart per environment. De bedrijvenlijst een dag, en alleen als elk actief environment antwoordde. `company` is verplicht bij tabellen, schema en query.
