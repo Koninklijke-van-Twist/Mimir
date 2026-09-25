@@ -45,7 +45,6 @@ function mimir_h(string $value): string
         <section class="panel">
             <div class="panel-head">
                 <h2>Tabel</h2>
-                <p>Maximale cacheleeftijd in deze pagina is 10 minuten. Ouder dan dat haalt Mímir de rij opnieuw op uit Business Central. Het gekozen bedrijf bepaalt de database (KVT/HVT of KVT Germany) en daarmee de tabellenlijst.</p>
             </div>
             <div class="toolbar">
                 <label class="field">
@@ -66,7 +65,6 @@ function mimir_h(string $value): string
         <section class="panel" id="schema-panel" hidden>
             <div class="panel-head">
                 <h2>Filters en kolommen</h2>
-                <p>OR over verschillende velden en XOR gaan niet naar Business Central (dat geeft daar vaak HTTP 501). Die blijven in Mímir. Een verse rij die een gevraagde kolom mist, wordt in zijn geheel ververst.</p>
             </div>
             <div class="split">
                 <div class="filters-pane">
@@ -102,7 +100,7 @@ function mimir_h(string $value): string
         <section class="panel">
             <div class="panel-head">
                 <h2>API-sleutels</h2>
-                <p>De volledige sleutel blijft zichtbaar voor jou. Hij staat in leesbare vorm in de SQLite-database achter deze login, en de lookup gebruikt SHA-256. Per sleutel zie je het daggemiddelde van de laatste maand en een weekraster van de aanroepen (maandag tot zondag). De database wordt niet via het web geserveerd en niet meegenomen in git of de FTP-deploy.</p>
+                <p>De volledige sleutel blijft zichtbaar voor jou. Hij staat in leesbare vorm in de SQLite-database achter deze login, en de lookup gebruikt SHA-256. Per sleutel zie je het daggemiddelde van de laatste maand en een weekraster van de aanroepen (maandag tot zondag).</p>
             </div>
             <form id="key-form" class="key-form">
                 <label class="field grow">
