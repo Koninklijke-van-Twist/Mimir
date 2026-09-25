@@ -17,7 +17,7 @@ De pagina staat in `web/` en gaat via FTP naar `/var/www/html/mimir/`.
 
 ## auth.php
 
-Geen `auth.php` in deze repository. Lokaal wordt eerst `~/Repositories/auth.php` geladen (dezelfde gedeelde file als de andere apps), tenzij `MIMIR_AUTH_FILE` naar een ander bestand wijst. Op de server blijft het `web/auth.php`. Die staat in `.gitignore` en de FTP-deploy overschrijft hem niet.
+Geen `auth.php` in deze repository. Lokaal wordt eerst `web/auth.php` geladen (dezelfde gedeelde file als de andere apps), tenzij `MIMIR_AUTH_FILE` naar een ander bestand wijst. Op de server blijft het `web/auth.php`. Die staat in `.gitignore` en de FTP-deploy overschrijft hem niet.
 
 Verwachte variabelen, hetzelfde model als Penates. `$baseUrl` is alleen de host. Elke BC-database is een sleutel in `$auth_list`. `$environment` is de lijst die Mímir echt gebruikt (ook een string mag; leeg valt terug op de eerste sleutel van `$auth_list`). Een naam telt alleen mee als hij in beide staat. Fat-omgevingen mogen in die lijst staan zodra ze credentials hebben.
 
