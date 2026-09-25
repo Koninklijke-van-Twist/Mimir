@@ -4,14 +4,14 @@ declare(strict_types=1);
 
 /**
  * Weekraster zoals Mithra: kolommen ma–zo, rijen zijn weken, oudste week bovenaan.
- * INTENSITY_MAX staat lager dan Mithra (500 scans). Een API-sleutel heeft zelden
- * honderden calls per dag; 20 maakt de stappen in het raster zichtbaar.
+ * INTENSITY_MAX (3500) is de dagelijkse call-cap voor de kleurstappen; daarboven
+ * wordt level-over. De unit-test gebruikt een lager max om de stappen te checken.
  */
 const MIMIR_HEATMAP_COLS = 7;
 const MIMIR_HEATMAP_ROWS = 4;
 const MIMIR_HEATMAP_CELL_PX = 14;
 const MIMIR_HEATMAP_CELL_GAP = 2;
-const MIMIR_HEATMAP_INTENSITY_MAX = 2500;
+const MIMIR_HEATMAP_INTENSITY_MAX = 3500;
 const MIMIR_HEATMAP_OVER_LIMIT_MULTIPLIER = 5;
 const MIMIR_HEATMAP_TZ = 'Europe/Amsterdam';
 

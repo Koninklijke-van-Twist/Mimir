@@ -36,13 +36,15 @@ mimir_heat_same($byDate['2026-09-24']['future'], true, 'tomorrow is future');
 mimir_heat_same($byDate['2026-09-24']['count'], 0, 'future days do not keep a count');
 mimir_heat_same($byDate['2026-09-01']['count'], 0, 'a quiet day stays zero');
 
-mimir_heat_same(mimir_heatmap_activity_level(0), '', 'zero has no level');
-mimir_heat_same(mimir_heatmap_activity_level(1), 'level-1', 'one call is the lightest step');
-mimir_heat_same(mimir_heatmap_activity_level(5), 'level-2', 'quarter of the max');
-mimir_heat_same(mimir_heatmap_activity_level(10), 'level-3', 'half of the max');
-mimir_heat_same(mimir_heatmap_activity_level(15), 'level-4', 'three quarters of the max');
-mimir_heat_same(mimir_heatmap_activity_level(20), 'level-max', 'the cap is max');
-mimir_heat_same(mimir_heatmap_activity_level(21), 'level-over', 'above the cap is over');
+mimir_heat_same(MIMIR_HEATMAP_INTENSITY_MAX, 3500, 'production intensity max');
+$max = 20;
+mimir_heat_same(mimir_heatmap_activity_level(0, $max), '', 'zero has no level');
+mimir_heat_same(mimir_heatmap_activity_level(1, $max), 'level-1', 'one call is the lightest step');
+mimir_heat_same(mimir_heatmap_activity_level(5, $max), 'level-2', 'quarter of the max');
+mimir_heat_same(mimir_heatmap_activity_level(10, $max), 'level-3', 'half of the max');
+mimir_heat_same(mimir_heatmap_activity_level(15, $max), 'level-4', 'three quarters of the max');
+mimir_heat_same(mimir_heatmap_activity_level(20, $max), 'level-max', 'the cap is max');
+mimir_heat_same(mimir_heatmap_activity_level(21, $max), 'level-over', 'above the cap is over');
 
 $zone = new DateTimeZone('Europe/Amsterdam');
 $now = (new DateTimeImmutable('2026-09-23 15:00:00', $zone))->getTimestamp();
