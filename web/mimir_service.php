@@ -472,8 +472,8 @@ function mimir_ui_main(): void
     @set_time_limit(300);
     try {
         $pdo = mimir_db(mimir_db_path());
-    } catch (Throwable) {
-        mimir_json(['error' => 'Database niet beschikbaar.'], 500);
+    } catch (Throwable $error) {
+        mimir_json(['error' => 'Database niet beschikbaar: ' . mimir_public_error($error)], 500);
     }
 
     $action = trim((string) ($_GET['action'] ?? ''));

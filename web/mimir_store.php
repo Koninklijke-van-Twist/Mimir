@@ -27,16 +27,35 @@ function mimir_db(string $path): PDO
 {
     if ($path !== ':memory:') {
         $dir = dirname($path);
-        if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
-            throw new RuntimeException('Datamap kon niet worden aangemaakt.');
+        if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+            throw new RuntimeException('Datamap kon niet worden aangemaakt: ' . $dir);
+        }
+        // Apache (user http) en CLI (tim) moeten beide kunnen schrijven, net als Consus data/.
+        @chmod($dir, 0777);
+        if (is_file($path)) {
+            @chmod($path, 0666);
         }
     }
-    $pdo = new PDO('sqlite:' . $path, null, null, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-    ]);
-    $pdo->exec('PRAGMA busy_timeout = 5000');
-    if ($path !== ':memory:') {
-        $pdo->exec('PRAGMA journal_mode = WAL');
+    try {
+        $pdo = new PDO('sqlite:' . $path, null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        ]);
+        $pdo->exec('PRAGMA busy_timeout = 5000');
+        if ($path !== ':memory:') {
+            $pdo->exec('PRAGMA journal_mode = WAL');
+            @chmod($path, 0666);
+            foreach ([$path . '-wal', $path . '-shm'] as $side) {
+                if (is_file($side)) {
+                    @chmod($side, 0666);
+                }
+            }
+        }
+    } catch (Throwable $error) {
+        throw new RuntimeException(
+            'SQLite openen mislukt (' . $path . '): ' . $error->getMessage(),
+            0,
+            $error
+        );
     }
     mimir_migrate($pdo);
     return $pdo;
