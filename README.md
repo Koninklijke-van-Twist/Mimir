@@ -210,7 +210,7 @@ Push naar `master` start `.github/workflows/deploy-ftp.yml` (zelfde patroon als 
 - `FTP_PASSWORD`
 - `FTP_REMOTE_DIR` — het FTP-pad dat live `https://sleutels.kvt.nl/mimir/` is, doorgaans `/var/www/html/mimir`
 
-De mirror zet `web/` daar neer en laat `auth.php`, `data/*.sqlite*` en `cache/**` met rust (die worden niet gewist). `chmod 777` op `analytics`, `data` en `cache` is best-effort; een 550 op cache maakt de job niet rood.
+De mirror zet `web/` daar neer met `--no-perms` (lokale git-modes overschrijven de server niet) en laat `auth.php` plus de runtime-mappen `data/**`, `cache/**` en `analytics/**` met rust. `data/.htaccess` gaat er daarna apart heen. `chmod 777` op die mappen en `chmod 666` op `data/*.sqlite*` is best-effort; een 550 maakt de job niet rood.
 
 Zet `web/auth.php` eenmalig op de server. Die blijft bij volgende deploys staan.
 
@@ -225,4 +225,5 @@ php tests/mimir_bc_reduce_test.php
 php tests/mimir_keys_test.php
 php tests/mimir_heatmap_test.php
 php tests/mimir_auth_env_test.php
+php tests/mimir_sqlite_test.php
 ```

@@ -30,7 +30,11 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
 
-      # Stap 1: web/ spiegelen. auth.php, sqlite en cache blijven op de server staan.
+      # Stap 1: web/ spiegelen. auth.php, sqlite en schrijfbare runtime-mappen
+      # blijven op de server staan. --no-perms zodat lokale git-modes (755)
+      # de serverrechten niet overschrijven. data/** cache/** analytics/**
+      # volledig uitsluiten, anders zet mirror de mapmodus terug voordat chmod
+      # draait (ook via .gitkeep). .htaccess in data/ gaat er daarna apart heen.
       - name: Deploy web/ to FTP (with delete & excludes)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
@@ -47,12 +51,14 @@ jobs:
 
           cd "$FTP_REMOTE_DIR"
 
-          mirror -R --delete \
+          mirror -R --delete --no-perms \
             --exclude-glob .htaccess \
             --exclude-glob cache/** \
+            --exclude-glob analytics/** \
             --exclude-glob analytics/*.sqlite \
             --exclude-glob analytics/*.sqlite-* \
             --exclude-glob auth.php \
+            --exclude-glob data/** \
             --exclude-glob data/*.sqlite \
             --exclude-glob data/*.sqlite-* \
             --exclude-glob data/*.db \
@@ -84,6 +90,8 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
+          # noglob: data/*.sqlite* must reach lftp, not the Actions checkout.
+          set -f
           lftp -u "$FTP_USERNAME","$FTP_PASSWORD" "$FTP_HOST" << EOF || true
           set cmd:fail-exit false
           set net:max-retries 1
@@ -96,6 +104,14 @@ jobs:
           chmod 777 analytics
           chmod 777 data
           chmod 777 cache
+
+          # Ontbrekende sqlite-bestanden geven SITE CHMOD 550; fail-exit false
+          # hierboven laat de rest doorgaan, en || true houdt de job groen.
+          chmod 666 data/mimir.sqlite
+          chmod 666 data/mimir.sqlite-wal
+          chmod 666 data/mimir.sqlite-shm
+          chmod 666 data/*.sqlite
+          chmod 666 data/*.sqlite-*
 
           bye
           EOF

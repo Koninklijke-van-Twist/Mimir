@@ -32,24 +32,20 @@ function mimir_db(string $path): PDO
             throw new RuntimeException('Datamap kon niet worden aangemaakt: ' . $dir);
         }
         // Apache (user http) en CLI (tim) moeten beide kunnen schrijven, net als Consus data/.
-        @chmod($dir, 0777);
-        if (is_file($path)) {
-            @chmod($path, 0666);
-        }
+        mimir_db_relax_perms($path);
     }
+    $journal = 'wal';
     try {
         $pdo = new PDO('sqlite:' . $path, null, null, [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
         ]);
-        $pdo->exec('PRAGMA busy_timeout = 5000');
+        $pdo->exec('PRAGMA busy_timeout = 30000');
         if ($path !== ':memory:') {
             $pdo->exec('PRAGMA journal_mode = WAL');
-            @chmod($path, 0666);
-            foreach ([$path . '-wal', $path . '-shm'] as $side) {
-                if (is_file($side)) {
-                    @chmod($side, 0666);
-                }
-            }
+            $pdo->exec('PRAGMA synchronous = NORMAL');
+            $mode = $pdo->query('PRAGMA journal_mode');
+            $journal = strtolower(trim((string) ($mode === false ? '' : $mode->fetchColumn())));
+            mimir_db_relax_perms($path);
         }
     } catch (Throwable $error) {
         throw new RuntimeException(
@@ -58,8 +54,78 @@ function mimir_db(string $path): PDO
             $error
         );
     }
-    mimir_migrate($pdo);
+    if ($path !== ':memory:' && $journal !== 'wal') {
+        throw new RuntimeException(
+            'SQLite journal_mode is "' . $journal . '" in plaats van wal voor ' . $path
+            . '. De datamap is niet schrijfbaar (directory write permissions; chmod 777 op de datamap).'
+        );
+    }
+    mimir_db_retry(static function () use ($pdo): void {
+        mimir_migrate($pdo);
+    });
+    if ($path !== ':memory:') {
+        mimir_db_relax_perms($path);
+    }
     return $pdo;
+}
+
+/**
+ * Apache (http) en de FTP-eigenaar moeten dezelfde sqlite-bestanden kunnen schrijven.
+ */
+function mimir_db_relax_perms(string $path): void
+{
+    if ($path === ':memory:') {
+        return;
+    }
+    $dir = dirname($path);
+    if (is_dir($dir)) {
+        @chmod($dir, 0777);
+    }
+    if (is_file($path)) {
+        @chmod($path, 0666);
+    }
+    foreach ([$path . '-wal', $path . '-shm'] as $side) {
+        if (is_file($side)) {
+            @chmod($side, 0666);
+        }
+    }
+}
+
+function mimir_sqlite_is_busy(PDOException $error): bool
+{
+    $message = $error->getMessage();
+    if (stripos($message, 'database is locked') !== false || stripos($message, 'SQLITE_BUSY') !== false) {
+        return true;
+    }
+    $info = $error->errorInfo ?? null;
+    if (is_array($info) && (string) ($info[0] ?? '') === 'HY000' && (int) ($info[1] ?? 0) === 5) {
+        return true;
+    }
+    if (preg_match('/SQLSTATE\[HY000\][^\r\n]*\b5\b/', $message) === 1) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Retry only SQLITE_BUSY / "database is locked". Other errors propagate immediately.
+ */
+function mimir_db_retry(callable $fn, int $attempts = 8): mixed
+{
+    if ($attempts < 1) {
+        $attempts = 1;
+    }
+    for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+        try {
+            return $fn();
+        } catch (PDOException $error) {
+            if (!mimir_sqlite_is_busy($error) || $attempt >= $attempts) {
+                throw $error;
+            }
+            usleep(25000 * $attempt);
+        }
+    }
+    throw new RuntimeException('SQLite-retry mislukt.');
 }
 
 function mimir_db_path(): string
@@ -405,19 +471,21 @@ function mimir_usage_log(
     int $fromCache = 0,
     int $fromLive = 0
 ): void {
-    $stmt = $pdo->prepare(
-        'INSERT INTO api_usage (key_id, endpoint, called_at, shared, bc_hit, from_cache, from_live)
-         VALUES (:id, :endpoint, :at, :shared, :bc_hit, :from_cache, :from_live)'
-    );
-    $stmt->execute([
-        ':id' => $keyId,
-        ':endpoint' => $endpoint,
-        ':at' => $now,
-        ':shared' => $shared ? 1 : 0,
-        ':bc_hit' => $bcHit ? 1 : 0,
-        ':from_cache' => max(0, $fromCache),
-        ':from_live' => max(0, $fromLive),
-    ]);
+    mimir_db_retry(static function () use ($pdo, $keyId, $endpoint, $now, $shared, $bcHit, $fromCache, $fromLive): void {
+        $stmt = $pdo->prepare(
+            'INSERT INTO api_usage (key_id, endpoint, called_at, shared, bc_hit, from_cache, from_live)
+             VALUES (:id, :endpoint, :at, :shared, :bc_hit, :from_cache, :from_live)'
+        );
+        $stmt->execute([
+            ':id' => $keyId,
+            ':endpoint' => $endpoint,
+            ':at' => $now,
+            ':shared' => $shared ? 1 : 0,
+            ':bc_hit' => $bcHit ? 1 : 0,
+            ':from_cache' => max(0, $fromCache),
+            ':from_live' => max(0, $fromLive),
+        ]);
+    });
 }
 
 /**
@@ -508,11 +576,13 @@ function mimir_meta_put(PDO $pdo, string $key, array $payload, int $now): void
     if ($json === false) {
         throw new RuntimeException('Metadata kon niet worden opgeslagen.');
     }
-    $stmt = $pdo->prepare(
-        'INSERT INTO meta_cache (cache_key, payload, fetched_at) VALUES (:key, :payload, :at)
-         ON CONFLICT(cache_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
-    );
-    $stmt->execute([':key' => $key, ':payload' => $json, ':at' => $now]);
+    mimir_db_retry(static function () use ($pdo, $key, $json, $now): void {
+        $stmt = $pdo->prepare(
+            'INSERT INTO meta_cache (cache_key, payload, fetched_at) VALUES (:key, :payload, :at)
+             ON CONFLICT(cache_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
+        );
+        $stmt->execute([':key' => $key, ':payload' => $json, ':at' => $now]);
+    });
 }
 
 /**
@@ -524,32 +594,36 @@ function mimir_cache_upsert(PDO $pdo, string $environment, string $company, stri
     if ($json === false) {
         throw new RuntimeException('Rij kon niet worden gecachet.');
     }
-    $stmt = $pdo->prepare(
-        'INSERT INTO cache_rows (environment, company, entity, row_key, payload, fetched_at)
-         VALUES (:environment, :company, :entity, :row_key, :payload, :at)
-         ON CONFLICT(environment, company, entity, row_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
-    );
-    $stmt->execute([
-        ':environment' => $environment,
-        ':company' => $company,
-        ':entity' => $entity,
-        ':row_key' => $rowKey,
-        ':payload' => $json,
-        ':at' => $fetchedAt,
-    ]);
+    mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $rowKey, $json, $fetchedAt): void {
+        $stmt = $pdo->prepare(
+            'INSERT INTO cache_rows (environment, company, entity, row_key, payload, fetched_at)
+             VALUES (:environment, :company, :entity, :row_key, :payload, :at)
+             ON CONFLICT(environment, company, entity, row_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
+        );
+        $stmt->execute([
+            ':environment' => $environment,
+            ':company' => $company,
+            ':entity' => $entity,
+            ':row_key' => $rowKey,
+            ':payload' => $json,
+            ':at' => $fetchedAt,
+        ]);
+    });
 }
 
 function mimir_cache_delete(PDO $pdo, string $environment, string $company, string $entity, string $rowKey): void
 {
-    $stmt = $pdo->prepare(
-        'DELETE FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity AND row_key = :row_key'
-    );
-    $stmt->execute([
-        ':environment' => $environment,
-        ':company' => $company,
-        ':entity' => $entity,
-        ':row_key' => $rowKey,
-    ]);
+    mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $rowKey): void {
+        $stmt = $pdo->prepare(
+            'DELETE FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity AND row_key = :row_key'
+        );
+        $stmt->execute([
+            ':environment' => $environment,
+            ':company' => $company,
+            ':entity' => $entity,
+            ':row_key' => $rowKey,
+        ]);
+    });
 }
 
 /**
@@ -584,24 +658,26 @@ function mimir_coverage_put(
     int $rowCount,
     ?int $keyId = null
 ): void {
-    $stmt = $pdo->prepare(
-        'INSERT INTO cache_coverage (environment, company, entity, filter_sig, select_sig, fetched_at, row_count, key_id)
-         VALUES (:environment, :company, :entity, :filter_sig, :select_sig, :at, :count, :key_id)
-         ON CONFLICT(environment, company, entity, filter_sig, select_sig) DO UPDATE SET
-            fetched_at = excluded.fetched_at,
-            row_count = excluded.row_count,
-            key_id = COALESCE(excluded.key_id, cache_coverage.key_id)'
-    );
-    $stmt->execute([
-        ':environment' => $environment,
-        ':company' => $company,
-        ':entity' => $entity,
-        ':filter_sig' => $filterSig,
-        ':select_sig' => $selectSig,
-        ':at' => $fetchedAt,
-        ':count' => $rowCount,
-        ':key_id' => $keyId,
-    ]);
+    mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $filterSig, $selectSig, $fetchedAt, $rowCount, $keyId): void {
+        $stmt = $pdo->prepare(
+            'INSERT INTO cache_coverage (environment, company, entity, filter_sig, select_sig, fetched_at, row_count, key_id)
+             VALUES (:environment, :company, :entity, :filter_sig, :select_sig, :at, :count, :key_id)
+             ON CONFLICT(environment, company, entity, filter_sig, select_sig) DO UPDATE SET
+                fetched_at = excluded.fetched_at,
+                row_count = excluded.row_count,
+                key_id = COALESCE(excluded.key_id, cache_coverage.key_id)'
+        );
+        $stmt->execute([
+            ':environment' => $environment,
+            ':company' => $company,
+            ':entity' => $entity,
+            ':filter_sig' => $filterSig,
+            ':select_sig' => $selectSig,
+            ':at' => $fetchedAt,
+            ':count' => $rowCount,
+            ':key_id' => $keyId,
+        ]);
+    });
 }
 
 /**
