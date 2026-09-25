@@ -201,3 +201,12 @@ tr.revoked { color: var(--kvt-muted); }
     .hero-aside { align-items: flex-start; margin-top: 16px; text-align: left; }
     .field, .key-form button, .toolbar button { margin-top: 8px; }
 }
+
+.site-footer {
+    width: min(1180px, 100%);
+    margin: 0 auto;
+    padding: 8px 24px 32px;
+    color: #5a6a75;
+    font-size: 0.9rem;
+}
+.site-footer a { color: #0077a3; }

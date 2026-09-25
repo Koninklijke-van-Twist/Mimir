@@ -26,6 +26,8 @@ function mimir_h(string $value): string
     <link rel="stylesheet" href="mimir.css">
     <link rel="manifest" href="site.webmanifest">
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="service-desc" type="application/openapi+yaml" href="openapi.yaml" title="Mímir OpenAPI">
+    <link rel="alternate" type="application/openapi+json" href="openapi.json" title="Mímir OpenAPI JSON">
 </head>
 <body>
     <div class="page">
@@ -131,6 +133,9 @@ function mimir_h(string $value): string
             </div>
         </section>
     </div>
+    <footer class="site-footer">
+        <p>API-documentatie: <a href="openapi.yaml">OpenAPI (YAML)</a> · <a href="openapi.json">JSON</a></p>
+    </footer>
     <script src="mimir.js"></script>
 </body>
 </html>

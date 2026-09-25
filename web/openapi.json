@@ -1,0 +1,695 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Mímir API",
+    "description": "Centrale OData-cache voor Business Central. Clients authenticeren met een API-sleutel\n(`Authorization: Bearer` of `X-API-Key`). Rijen worden gedeeld over sleutels; `meta.shared`\n/ `meta.bc_hit` meten of Business Central nog nodig was.\n\nCachegedrag (BC-callreductie):\n- Gefilterde JSON-queries mogen uit verse lege-filter (full-entity) dekking komen (lokaal filteren).\n- Full-entity fetches naar BC sturen geen `$select`; het antwoord projecteert wel op `select`.\n- Overlappende ranges op één veld kunnen gap-fillen (`meta.gap_fill`).\n",
+    "version": "1.1.0",
+    "contact": {
+      "name": "Koninklijke van Twist"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://sleutels.kvt.nl/mimir/api",
+      "description": "Productie"
+    }
+  ],
+  "tags": [
+    {
+      "name": "catalog"
+    },
+    {
+      "name": "query"
+    }
+  ],
+  "paths": {
+    "/companies.php": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "summary": "Bedrijven uit de nightly-cache",
+        "operationId": "listCompanies",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lijst bedrijven",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "value"
+                  ],
+                  "properties": {
+                    "value": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "name",
+                          "environment"
+                        ],
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "environment": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "fetched_at": {
+                      "type": "integer",
+                      "nullable": true,
+                      "description": "Unix-tijd van de nightly-cache"
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "nightly",
+                        "memory",
+                        "empty",
+                        "live"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/tables.php": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "summary": "Entity sets voor het environment van een bedrijf",
+        "operationId": "listTables",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "company",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optionele naamfilter (substring)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tabellen",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "value",
+                    "environment"
+                  ],
+                  "properties": {
+                    "environment": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "entity_type": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/schema.php": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "summary": "Schema van één tabel",
+        "operationId": "getTableSchema",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "company",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "entity_type": {
+                      "type": "string"
+                    },
+                    "environment": {
+                      "type": "string"
+                    },
+                    "keys": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "properties": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/query.php": {
+      "post": {
+        "tags": [
+          "query"
+        ],
+        "summary": "Query één of meer tabellen via de cache",
+        "operationId": "query",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SingleQuery"
+                  },
+                  {
+                    "$ref": "#/components/schemas/MultiQuery"
+                  }
+                ]
+              },
+              "examples": {
+                "single": {
+                  "summary": "Enkele tabel met range-filter",
+                  "value": {
+                    "company": "Koninklijke van Twist",
+                    "table": "ItemList",
+                    "select": [
+                      "No",
+                      "Description"
+                    ],
+                    "max_age": 3600,
+                    "top": 100,
+                    "filter": {
+                      "and": [
+                        {
+                          "field": "No",
+                          "op": "ge",
+                          "value": "WO0015"
+                        },
+                        {
+                          "field": "No",
+                          "op": "le",
+                          "value": "WO0030"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "multi": {
+                  "summary": "Meerdere queries + combine",
+                  "value": {
+                    "company": "Koninklijke van Twist",
+                    "queries": [
+                      {
+                        "name": "items",
+                        "table": "ItemList",
+                        "select": [
+                          "No",
+                          "Vendor_No"
+                        ],
+                        "top": 1000
+                      },
+                      {
+                        "name": "vendors",
+                        "table": "VendorList",
+                        "select": [
+                          "No",
+                          "Name"
+                        ],
+                        "top": 1000
+                      }
+                    ],
+                    "combine": {
+                      "left": "items",
+                      "right": "vendors",
+                      "left_key": "Vendor_No",
+                      "right_key": "No",
+                      "as": "joined"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Queryresultaat",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/QueryResult"
+                    },
+                    {
+                      "type": "object",
+                      "required": [
+                        "results"
+                      ],
+                      "properties": {
+                        "results": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "$ref": "#/components/schemas/QueryResult"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API-sleutel als Authorization Bearer (mimir_…)"
+      },
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Ontbrekende of ongeldige sleutel",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorBody"
+            }
+          }
+        }
+      },
+      "Error": {
+        "description": "Client- of upstreamfout",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorBody"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ErrorBody": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "FilterLeaf": {
+        "type": "object",
+        "required": [
+          "field",
+          "op",
+          "value"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "contains",
+              "startswith",
+              "endswith"
+            ]
+          },
+          "value": {
+            "nullable": true
+          }
+        }
+      },
+      "FilterNode": {
+        "description": "JSON-filterboom of (elders) een OData $filter-string",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/FilterLeaf"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "and": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/FilterNode"
+                }
+              },
+              "or": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/FilterNode"
+                }
+              },
+              "xor": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/FilterNode"
+                }
+              }
+            }
+          },
+          {
+            "type": "string",
+            "description": "Opaque OData $filter (gaat ongewijzigd naar BC; geen lokale match)",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        ]
+      },
+      "SingleQuery": {
+        "type": "object",
+        "required": [
+          "company",
+          "table"
+        ],
+        "properties": {
+          "company": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string",
+            "description": "Alias voor table"
+          },
+          "select": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projectie in het API-antwoord (BC-$select volgt apart cachebeleid)"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/FilterNode"
+          },
+          "max_age": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 31536000,
+            "default": 3600
+          },
+          "top": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 100,
+            "description": "0 = ongelimiteerd"
+          }
+        }
+      },
+      "MultiQuery": {
+        "type": "object",
+        "required": [
+          "queries"
+        ],
+        "properties": {
+          "company": {
+            "type": "string",
+            "description": "Default company voor child queries"
+          },
+          "max_age": {
+            "type": "integer"
+          },
+          "queries": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/SingleQuery"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "combine": {
+            "type": "object",
+            "description": "v1 inner equijoin na ophalen (geen BC-join)",
+            "properties": {
+              "left": {
+                "type": "string"
+              },
+              "right": {
+                "type": "string"
+              },
+              "left_key": {
+                "type": "string"
+              },
+              "right_key": {
+                "type": "string"
+              },
+              "as": {
+                "type": "string",
+                "default": "joined"
+              }
+            }
+          }
+        }
+      },
+      "QueryMeta": {
+        "type": "object",
+        "properties": {
+          "environment": {
+            "type": "string"
+          },
+          "from_cache": {
+            "type": "integer"
+          },
+          "from_live": {
+            "type": "integer"
+          },
+          "shared": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ],
+            "description": "1 als volledig uit andermans/legacy cache zonder BC"
+          },
+          "bc_hit": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ],
+            "description": "1 zodra Business Central werd aangeroepen"
+          },
+          "gap_fill": {
+            "type": "integer",
+            "enum": [
+              1
+            ],
+            "description": "Gezet bij row-level range gap fill"
+          },
+          "max_age": {
+            "type": "integer"
+          },
+          "fetched_at_min": {
+            "type": "integer",
+            "nullable": true
+          },
+          "fetched_at_max": {
+            "type": "integer",
+            "nullable": true
+          },
+          "bc_filter": {
+            "type": "string",
+            "nullable": true
+          },
+          "filter_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "bc",
+              "mixed",
+              "local"
+            ]
+          },
+          "filter_note": {
+            "type": "string",
+            "nullable": true
+          },
+          "filter_batches": {
+            "type": "integer"
+          }
+        }
+      },
+      "QueryResult": {
+        "type": "object",
+        "required": [
+          "value",
+          "meta"
+        ],
+        "properties": {
+          "value": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/QueryMeta"
+          }
+        }
+      }
+    }
+  }
+}
