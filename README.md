@@ -212,7 +212,7 @@ Push naar `master` start `.github/workflows/deploy-ftp.yml` (zelfde patroon als 
 - `FTP_PASSWORD`
 - `FTP_REMOTE_DIR` — het FTP-pad dat live `https://sleutels.kvt.nl/mimir/` is, doorgaans `/var/www/html/mimir`
 
-De mirror zet `web/` daar neer met `--no-perms` (lokale git-modes overschrijven de server niet). Deploy wijzigt nooit de modus van `data/`, `cache/` en `analytics/`: die rechten zijn alleen host-beheerd. Zowel de map zelf als de inhoud blijft buiten de mirror (`data`, `data/**`, `cache`, `cache/**`, `analytics`, `analytics/**`), samen met `auth.php` en de sqlite-globs, zodat lftp die directory-nodes niet aanmaakt of aanraakt. `web/data/.htaccess` staat in git voor nieuwe installs en blijft op de server staan; deploy uploadt dat bestand niet.
+De mirror zet `web/` daar neer met `--no-perms` (lokale git-modes overschrijven de server niet). Argus-patroon: na een geslaagde mirror alleen `chmod 777` op de schrijfbare mappen `data`, `cache` en `analytics` — niet op sqlite-bestanden. Host/FTP kan modi tijdens de mirror resetten; die stap herstelt de schrijfbare mappen elke deploy (best-effort, een 550 maakt de job niet rood). `data` en `data/**`, `cache` en `cache/**` blijven buiten de mirror, samen met `auth.php`, `.htaccess` en de sqlite/json/lock-globs. `analytics/**` wordt niet uitgesloten zodat `analytics.php` weer meegaat; alleen `analytics/*.sqlite` en `analytics/*.sqlite-*` blijven op de server. Geen put naar `data/`. `web/data/.htaccess` staat in git voor nieuwe installs en blijft op de server staan.
 
 Zet `web/auth.php` eenmalig op de server. Die blijft bij volgende deploys staan.
 
