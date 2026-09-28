@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/mimir_reliability.php';
 require_once __DIR__ . '/mimir_filter.php';
 require_once __DIR__ . '/odata.php';
 require_once __DIR__ . '/mimir_heatmap.php';
@@ -24,108 +25,72 @@ class MimirUserException extends RuntimeException
     }
 }
 
-function mimir_db(string $path): PDO
+function mimir_db(string $path, ?int $busyTimeoutMs = null): PDO
 {
-    if ($path !== ':memory:') {
-        $dir = dirname($path);
-        if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
-            throw new RuntimeException('Datamap kon niet worden aangemaakt: ' . $dir);
-        }
-        // Apache (user http) en CLI (tim) moeten beide kunnen schrijven, net als Consus data/.
-        mimir_db_relax_perms($path);
+    $timeout = $busyTimeoutMs ?? MIMIR_SQLITE_BUSY_TIMEOUT_MS;
+    if ($timeout < 0) {
+        $timeout = 0;
     }
-    $journal = 'wal';
+    $restoreUmask = false;
+    $previousUmask = 0;
+    if ($path !== ':memory:') {
+        // TODO: tijdelijk umask 0 rond het aanmaken van sqlite-bestanden. Zie mimir_db_relax_perms.
+        $previousUmask = umask(0);
+        $restoreUmask = true;
+    }
     try {
-        $pdo = new PDO('sqlite:' . $path, null, null, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        ]);
-        $pdo->exec('PRAGMA busy_timeout = 30000');
         if ($path !== ':memory:') {
-            $pdo->exec('PRAGMA journal_mode = WAL');
-            $pdo->exec('PRAGMA synchronous = NORMAL');
-            $mode = $pdo->query('PRAGMA journal_mode');
-            $journal = strtolower(trim((string) ($mode === false ? '' : $mode->fetchColumn())));
-            mimir_db_relax_perms($path);
-        }
-    } catch (Throwable $error) {
-        throw new RuntimeException(
-            'SQLite openen mislukt (' . $path . '): ' . $error->getMessage(),
-            0,
-            $error
-        );
-    }
-    if ($path !== ':memory:' && $journal !== 'wal') {
-        throw new RuntimeException(
-            'SQLite journal_mode is "' . $journal . '" in plaats van wal voor ' . $path
-            . '. De datamap is niet schrijfbaar (directory write permissions; chmod 777 op de datamap).'
-        );
-    }
-    mimir_db_retry(static function () use ($pdo): void {
-        mimir_migrate($pdo);
-    });
-    if ($path !== ':memory:') {
-        mimir_db_relax_perms($path);
-    }
-    return $pdo;
-}
-
-/**
- * Apache (http) en de FTP-eigenaar moeten dezelfde sqlite-bestanden kunnen schrijven.
- */
-function mimir_db_relax_perms(string $path): void
-{
-    if ($path === ':memory:') {
-        return;
-    }
-    $dir = dirname($path);
-    if (is_dir($dir)) {
-        @chmod($dir, 0777);
-    }
-    if (is_file($path)) {
-        @chmod($path, 0666);
-    }
-    foreach ([$path . '-wal', $path . '-shm'] as $side) {
-        if (is_file($side)) {
-            @chmod($side, 0666);
-        }
-    }
-}
-
-function mimir_sqlite_is_busy(PDOException $error): bool
-{
-    $message = $error->getMessage();
-    if (stripos($message, 'database is locked') !== false || stripos($message, 'SQLITE_BUSY') !== false) {
-        return true;
-    }
-    $info = $error->errorInfo ?? null;
-    if (is_array($info) && (string) ($info[0] ?? '') === 'HY000' && (int) ($info[1] ?? 0) === 5) {
-        return true;
-    }
-    if (preg_match('/SQLSTATE\[HY000\][^\r\n]*\b5\b/', $message) === 1) {
-        return true;
-    }
-    return false;
-}
-
-/**
- * Retry only SQLITE_BUSY / "database is locked". Other errors propagate immediately.
- */
-function mimir_db_retry(callable $fn, int $attempts = 8): mixed
-{
-    if ($attempts < 1) {
-        $attempts = 1;
-    }
-    for ($attempt = 1; $attempt <= $attempts; $attempt++) {
-        try {
-            return $fn();
-        } catch (PDOException $error) {
-            if (!mimir_sqlite_is_busy($error) || $attempt >= $attempts) {
-                throw $error;
+            $dir = dirname($path);
+            if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+                throw new RuntimeException('Datamap kon niet worden aangemaakt: ' . $dir);
             }
-            usleep(25000 * $attempt);
+            // Apache (user http) en CLI (tim) moeten beide kunnen schrijven, net als Consus data/.
+            mimir_db_relax_perms($path);
+            mimir_db_remove_stale_journal($path);
+        }
+        $journal = 'wal';
+        try {
+            $pdo = new PDO('sqlite:' . $path, null, null, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            ]);
+            $pdo->exec('PRAGMA busy_timeout = ' . (int) $timeout);
+            if ($path !== ':memory:') {
+                $pdo->exec('PRAGMA journal_mode = WAL');
+                $pdo->exec('PRAGMA synchronous = NORMAL');
+                $mode = $pdo->query('PRAGMA journal_mode');
+                $journal = strtolower(trim((string) ($mode === false ? '' : $mode->fetchColumn())));
+                mimir_db_relax_perms($path);
+            }
+        } catch (Throwable $error) {
+            throw new RuntimeException(
+                'SQLite openen mislukt (' . $path . '): ' . $error->getMessage(),
+                0,
+                $error
+            );
+        }
+        if ($path !== ':memory:' && $journal !== 'wal') {
+            throw new RuntimeException(
+                'SQLite journal_mode is "' . $journal . '" in plaats van wal voor ' . $path
+                . '. De datamap is niet schrijfbaar (directory write permissions; chmod 777 op de datamap).'
+            );
+        }
+        mimir_db_retry(static function () use ($pdo): void {
+            mimir_migrate($pdo);
+        });
+        if ($path !== ':memory:') {
+            mimir_db_relax_perms($path);
+            mimir_db_track_path($path);
+            if ($path === mimir_reliability_db_path()) {
+                mimir_key_mirror_sync($pdo);
+            }
+        }
+
+        return $pdo;
+    } finally {
+        if ($restoreUmask) {
+            umask($previousUmask);
         }
     }
-    throw new RuntimeException('SQLite-retry mislukt.');
 }
 
 function mimir_db_path(): string
@@ -285,8 +250,11 @@ function mimir_key_create(PDO $pdo, string $ownerEmail, string $label, int $now)
         ':created' => $now,
     ]);
 
+    $createdId = (int) $pdo->lastInsertId();
+    mimir_key_mirror_remember($createdId, $plain);
+
     return [
-        'id' => (int) $pdo->lastInsertId(),
+        'id' => $createdId,
         'label' => $label,
         'key' => $plain,
         'created_at' => $now,
@@ -317,12 +285,15 @@ function mimir_key_lookup(PDO $pdo, string $plain): ?array
         return null;
     }
 
-    return [
+    $record = [
         'id' => (int) $row['id'],
         'owner_email' => (string) $row['owner_email'],
         'label' => (string) $row['label'],
         'key_plain' => (string) $row['key_plain'],
     ];
+    mimir_key_mirror_remember($record['id'], $plain);
+
+    return $record;
 }
 
 function mimir_key_revoke(PDO $pdo, int $id, string $ownerEmail, int $now): bool
@@ -335,7 +306,12 @@ function mimir_key_revoke(PDO $pdo, int $id, string $ownerEmail, int $now): bool
         ':id' => $id,
         ':owner' => strtolower(trim($ownerEmail)),
     ]);
-    return $stmt->rowCount() > 0;
+    $revoked = $stmt->rowCount() > 0;
+    if ($revoked) {
+        mimir_key_mirror_revoke($id);
+    }
+
+    return $revoked;
 }
 
 /**
@@ -1252,6 +1228,11 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     if ($batchCount > 1) {
         $meta['filter_batches'] = $batchCount;
     }
+    if (!empty($GLOBALS['mimir_stamp_bc_live'])) {
+        $meta['source'] = 'bc-live';
+        $meta['bc_hit'] = 1;
+        $meta['shared'] = 0;
+    }
     $meta['queue_wait_ms'] = $queueWaitMs;
     $meta['bc_slots_max'] = mimir_bc_limit_max_concurrent();
     $meta['bc_slots_used'] = $slotHeld ? mimir_bc_slots_used($environment) : 0;
@@ -1607,7 +1588,15 @@ function mimir_refresh_whole_row(
         $decoded = $fetch($url);
     } catch (Throwable $error) {
         if (mimir_exception_status($error) === 404) {
-            mimir_cache_delete($pdo, $environment, $company, $entity, $rowKey);
+            try {
+                mimir_cache_delete($pdo, $environment, $company, $entity, $rowKey);
+            } catch (Throwable $deleteError) {
+                if (!mimir_is_storage_failure($deleteError)) {
+                    throw $deleteError;
+                }
+                mimir_circuit_trip($deleteError->getMessage());
+                mimir_event_log('sqlite', $deleteError->getMessage(), $environment, $entity, 'bypassed-to-BC');
+            }
             return null;
         }
         throw $error;
@@ -1626,10 +1615,19 @@ function mimir_refresh_whole_row(
         }
     }
     $newKey = mimir_row_key($fresh, $keys);
-    if ($newKey !== $rowKey) {
-        mimir_cache_delete($pdo, $environment, $company, $entity, $rowKey);
+    try {
+        if ($newKey !== $rowKey) {
+            mimir_cache_delete($pdo, $environment, $company, $entity, $rowKey);
+        }
+        mimir_cache_upsert($pdo, $environment, $company, $entity, $newKey, $fresh, $now);
+    } catch (Throwable $error) {
+        if (!mimir_is_storage_failure($error)) {
+            throw $error;
+        }
+        $GLOBALS['mimir_stamp_bc_live'] = true;
+        mimir_circuit_trip($error->getMessage());
+        mimir_event_log('sqlite', $error->getMessage(), $environment, $entity, 'bypassed-to-BC');
     }
-    mimir_cache_upsert($pdo, $environment, $company, $entity, $newKey, $fresh, $now);
     return ['payload' => $fresh, 'fetched_at' => $now];
 }
 
@@ -1684,6 +1682,7 @@ function mimir_fetch_collection(
     }
 
     $stored = [];
+    $cacheBroken = false;
     foreach ($pages['rows'] as $payload) {
         $clean = mimir_strip_odata_noise($payload);
         if ($keys !== []) {
@@ -1699,14 +1698,35 @@ function mimir_fetch_collection(
             }
         }
         $rowKey = mimir_row_key($clean, $keys);
-        mimir_cache_upsert($pdo, $environment, $company, $entity, $rowKey, $clean, $now);
+        if (!$cacheBroken) {
+            try {
+                mimir_cache_upsert($pdo, $environment, $company, $entity, $rowKey, $clean, $now);
+            } catch (Throwable $error) {
+                if (!mimir_is_storage_failure($error)) {
+                    throw $error;
+                }
+                $cacheBroken = true;
+                $GLOBALS['mimir_stamp_bc_live'] = true;
+                mimir_circuit_trip($error->getMessage());
+                mimir_event_log('sqlite', $error->getMessage(), $environment, $entity, 'bypassed-to-BC');
+            }
+        }
         $stored[] = ['payload' => $clean, 'fetched_at' => $now];
     }
 
-    if ($writeCoverage && !$pages['truncated']) {
+    if ($writeCoverage && !$pages['truncated'] && !$cacheBroken) {
         $filterSig = $pushed ?? '';
         $selectSig = mimir_select_sig($select);
-        mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($stored), $keyId);
+        try {
+            mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($stored), $keyId);
+        } catch (Throwable $error) {
+            if (!mimir_is_storage_failure($error)) {
+                throw $error;
+            }
+            $GLOBALS['mimir_stamp_bc_live'] = true;
+            mimir_circuit_trip($error->getMessage());
+            mimir_event_log('sqlite', $error->getMessage(), $environment, $entity, 'bypassed-to-BC');
+        }
     }
 
     return ['rows' => $stored, 'mode' => $mode, 'pushed' => $pushed, 'truncated' => $pages['truncated']];

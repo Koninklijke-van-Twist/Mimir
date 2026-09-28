@@ -63,6 +63,9 @@ button:disabled { opacity: .5; cursor: default; }
     white-space: nowrap;
 }
 .shared-global strong { font-size: 1.05rem; font-weight: 700; }
+.circuit { margin: 0; font-size: .85rem; color: rgba(255,255,255,.92); }
+.circuit-normal strong { color: #d8ffe8; }
+.circuit-bypass strong { color: #ffe08a; }
 
 .panel {
     background: #fff;

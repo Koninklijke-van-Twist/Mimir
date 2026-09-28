@@ -6,6 +6,13 @@ web/cache/*
 web/data/*.sqlite
 web/data/*.sqlite-*
 web/data/*.db
+web/data/*.jsonl
+web/data/*.jsonl.*
+web/data/mimir-circuit.json
+web/data/mimir-circuit.json.tmp.*
+web/data/mimir-key-mirror.json
+web/data/mimir-company-map.json
+web/data/mimir-metadata-*.json
 
 web/analytics/*.sqlite
 web/analytics/*.sqlite-*

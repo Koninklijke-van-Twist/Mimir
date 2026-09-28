@@ -31,9 +31,37 @@ require_once __DIR__ . '/mimir_service.php';
 
 $startedAt = hrtime(true);
 $now = time();
+$pdo = null;
+register_shutdown_function(static function () use (&$pdo): void {
+    if ($pdo instanceof PDO) {
+        mimir_pdo_release($pdo);
+        $pdo = null;
+    }
+    mimir_db_relax_perms(mimir_db_path());
+    if (function_exists('mimir_bc_limit_db_path')) {
+        mimir_db_relax_perms(mimir_bc_limit_db_path());
+    }
+});
 
 try {
-    $pdo = mimir_db(mimir_db_path());
+    $openError = null;
+    for ($openAttempt = 1; $openAttempt <= 3; $openAttempt++) {
+        try {
+            $pdo = mimir_db(mimir_db_path());
+            $openError = null;
+            break;
+        } catch (Throwable $error) {
+            $openError = $error;
+            if (!mimir_is_storage_failure($error) || $openAttempt >= 3) {
+                throw $error;
+            }
+            mimir_db_self_repair(mimir_db_path());
+            usleep(100000 * $openAttempt);
+        }
+    }
+    if ($openError !== null || !$pdo instanceof PDO) {
+        throw $openError instanceof Throwable ? $openError : new RuntimeException('SQLite openen mislukt.');
+    }
     $companies = mimir_refresh_companies($pdo, $now);
 
     $metadata = [];
@@ -50,6 +78,13 @@ try {
                 'duration_ms' => (int) round((hrtime(true) - $envStarted) / 1_000_000),
             ];
         } catch (Throwable $error) {
+            mimir_event_log(
+                mimir_is_storage_failure($error) ? 'sqlite' : 'nightly',
+                $error->getMessage(),
+                $environment,
+                '',
+                'failed'
+            );
             $metadata[] = [
                 'environment' => $environment,
                 'ok' => false,
@@ -95,6 +130,17 @@ try {
     http_response_code($payload['ok'] ? 200 : 207);
     echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 } catch (Throwable $error) {
+    if ($pdo instanceof PDO) {
+        mimir_pdo_release($pdo);
+        $pdo = null;
+    }
+    mimir_event_log(
+        mimir_is_storage_failure($error) ? 'sqlite' : 'nightly',
+        $error->getMessage(),
+        '',
+        '',
+        'failed'
+    );
     $payload = [
         'ok' => false,
         'generated_at' => gmdate('c'),

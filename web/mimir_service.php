@@ -160,6 +160,7 @@ function mimir_refresh_companies(PDO $pdo, int $now): array
     // Ook partial resultaat bewaren: UI moet een dropdown houden.
     if ($map !== []) {
         mimir_meta_put($pdo, mimir_company_cache_key(), $payload, $now);
+        mimir_company_map_remember($map);
     }
 
     return [
@@ -180,6 +181,7 @@ function mimir_company_catalog(PDO $pdo, int $now, bool $allowLive = false): arr
 {
     $current = $GLOBALS['demeter_company_environment_map'] ?? null;
     if (is_array($current) && $current !== []) {
+        mimir_company_map_remember($current);
         $errors = $GLOBALS['demeter_company_environment_errors'] ?? [];
         return [
             'companies' => mimir_companies_from_map($current),
@@ -202,6 +204,7 @@ function mimir_company_catalog(PDO $pdo, int $now, bool $allowLive = false): arr
         if (isset($cached['by_environment']) && is_array($cached['by_environment'])) {
             $GLOBALS['demeter_companies_by_environment'] = $cached['by_environment'];
         }
+        mimir_company_map_remember($map);
         return [
             'companies' => mimir_companies_from_map($map),
             'errors' => $errors,
@@ -249,12 +252,28 @@ function mimir_metadata_for_environment(PDO $pdo, string $environment, int $now)
     if (is_array($cached) && isset($cached['entity_sets'], $cached['types']) && is_array($cached['entity_sets']) && is_array($cached['types'])) {
         return $cached;
     }
+    if (!empty($GLOBALS['mimir_live_bypass'])) {
+        $snapshot = mimir_metadata_snapshot_read($environment, MIMIR_METADATA_SNAPSHOT_TTL);
+        if (is_array($snapshot)) {
+            return $snapshot;
+        }
+    }
 
     $auth = auth_get_auth_for_environment($environment);
-    return mimir_bc_with_slot($environment, static function () use ($pdo, $prefix, $auth, $cacheKey, $now): array {
+    return mimir_bc_with_slot($environment, static function () use ($pdo, $prefix, $auth, $cacheKey, $now, $environment): array {
         $xml = odata_get_text(rtrim($prefix, '/') . '/$metadata', $auth);
         $parsed = odata_parse_metadata($xml);
-        mimir_meta_put($pdo, $cacheKey, $parsed, $now);
+        mimir_metadata_snapshot_write($environment, $parsed, $now);
+        try {
+            mimir_meta_put($pdo, $cacheKey, $parsed, $now);
+        } catch (Throwable $error) {
+            if (!mimir_is_storage_failure($error)) {
+                throw $error;
+            }
+            $GLOBALS['mimir_stamp_bc_live'] = true;
+            mimir_circuit_trip($error->getMessage());
+            mimir_event_log('sqlite', $error->getMessage(), $environment, '', 'bypassed-to-BC');
+        }
         return $parsed;
     });
 }
@@ -467,24 +486,177 @@ function mimir_table_schema(PDO $pdo, string $company, string $table, int $now):
     ];
 }
 
+function mimir_prepare_live_globals(): void
+{
+    if (mimir_company_map_restore()) {
+        return;
+    }
+    if (!function_exists('auth_discover_companies_across_active_environments')) {
+        return;
+    }
+    $discovered = auth_discover_companies_across_active_environments();
+    $map = is_array($discovered['map'] ?? null) ? $discovered['map'] : [];
+    $errors = is_array($discovered['errors'] ?? null) ? array_values($discovered['errors']) : [];
+    $GLOBALS['demeter_company_environment_map'] = $map;
+    $GLOBALS['demeter_company_environment_errors'] = $errors;
+    if (isset($discovered['by_environment']) && is_array($discovered['by_environment'])) {
+        $GLOBALS['demeter_companies_by_environment'] = $discovered['by_environment'];
+    }
+    mimir_company_map_remember($map);
+}
+
+/**
+ * @param array<string, mixed> $record
+ * @param array{action: string, table?: string} $parsed
+ * @param array<string, mixed>|null $body
+ * @return array<string, mixed>
+ */
+function mimir_api_cached_payload(PDO $pdo, array $record, array $parsed, int $now, ?array $body): array
+{
+    $keyId = (int) ($record['id'] ?? 0);
+    if ($parsed['action'] === 'tables') {
+        mimir_usage_log_best_effort($pdo, $keyId, $parsed['action'], $now);
+        $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
+
+        return ['value' => $listed['tables'], 'environment' => $listed['environment']];
+    }
+    if ($parsed['action'] === 'companies') {
+        mimir_usage_log_best_effort($pdo, $keyId, $parsed['action'], $now);
+        $catalog = mimir_company_catalog($pdo, $now, false);
+
+        return [
+            'value' => $catalog['companies'],
+            'fetched_at' => $catalog['fetched_at'],
+            'source' => $catalog['source'],
+        ];
+    }
+    if ($parsed['action'] === 'schema') {
+        mimir_usage_log_best_effort($pdo, $keyId, $parsed['action'], $now);
+
+        return mimir_table_schema($pdo, trim((string) ($_GET['company'] ?? '')), (string) ($parsed['table'] ?? ''), $now);
+    }
+    if (!is_array($body)) {
+        throw new MimirUserException('JSON-body ontbreekt.');
+    }
+    $result = mimir_run_request_body($pdo, $body, $now, null, $keyId);
+    $flags = mimir_usage_flags_from_response($result);
+    mimir_usage_log_best_effort(
+        $pdo,
+        $keyId,
+        'query',
+        $now,
+        $flags['shared'],
+        $flags['bc_hit'],
+        $flags['from_cache'],
+        $flags['from_live']
+    );
+
+    return $result;
+}
+
+/**
+ * @param array{action: string, table?: string} $parsed
+ * @param array<string, mixed>|null $body
+ * @return array<string, mixed>
+ */
+function mimir_api_live_payload(array $parsed, int $now, ?array $body, ?int $forceMaxAge = null): array
+{
+    $GLOBALS['mimir_live_bypass'] = true;
+    try {
+        mimir_prepare_live_globals();
+        $pdo = mimir_db(':memory:');
+        if ($parsed['action'] === 'tables') {
+            $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
+
+            return mimir_stamp_bc_live(['value' => $listed['tables'], 'environment' => $listed['environment']]);
+        }
+        if ($parsed['action'] === 'companies') {
+            $map = $GLOBALS['demeter_company_environment_map'] ?? [];
+            if (!is_array($map)) {
+                $map = [];
+            }
+
+            return [
+                'value' => mimir_companies_from_map($map),
+                'fetched_at' => $now,
+                'source' => 'bc-live',
+            ];
+        }
+        if ($parsed['action'] === 'schema') {
+            $schema = mimir_table_schema($pdo, trim((string) ($_GET['company'] ?? '')), (string) ($parsed['table'] ?? ''), $now);
+            $schema['source'] = 'bc-live';
+
+            return $schema;
+        }
+        if (!is_array($body)) {
+            throw new MimirUserException('JSON-body ontbreekt.');
+        }
+
+        return mimir_stamp_bc_live(mimir_run_request_body($pdo, $body, $now, $forceMaxAge, null));
+    } finally {
+        $GLOBALS['mimir_live_bypass'] = false;
+    }
+}
+
+function mimir_usage_log_best_effort(
+    PDO $pdo,
+    int $keyId,
+    string $endpoint,
+    int $now,
+    int $shared = 0,
+    int $bcHit = 0,
+    int $fromCache = 0,
+    int $fromLive = 0
+): void {
+    if ($keyId < 1) {
+        return;
+    }
+    try {
+        mimir_usage_log($pdo, $keyId, $endpoint, $now, $shared, $bcHit, $fromCache, $fromLive);
+    } catch (Throwable $error) {
+        if (!mimir_is_storage_failure($error)) {
+            throw $error;
+        }
+        mimir_circuit_trip($error->getMessage());
+        mimir_event_log('sqlite', $error->getMessage(), '', $endpoint, 'bypassed-to-BC');
+    }
+}
+
+/**
+ * @return array{id: int, owner_email: string, label: string, key_plain: string}|null
+ */
+function mimir_authenticate_api_key(string $apiKey, ?PDO &$pdo): ?array
+{
+    $pdo = null;
+    if (!mimir_circuit_should_bypass()) {
+        try {
+            $pdo = mimir_db(mimir_db_path());
+        } catch (Throwable $error) {
+            if (!mimir_is_storage_failure($error)) {
+                throw $error;
+            }
+            mimir_db_self_repair(mimir_db_path());
+            mimir_circuit_trip($error->getMessage());
+            $pdo = null;
+        }
+    }
+    if ($pdo instanceof PDO) {
+        return mimir_key_lookup($pdo, $apiKey);
+    }
+
+    return mimir_key_mirror_lookup($apiKey);
+}
+
 function mimir_api_main(?string $forcedRoute = null): void
 {
     @set_time_limit(300);
+    $GLOBALS['mimir_stamp_bc_live'] = false;
     $apiKey = mimir_request_api_key();
     if ($apiKey === '') {
         mimir_json(['error' => 'API-sleutel ontbreekt. Gebruik Authorization: Bearer of de header X-API-Key.'], 401);
     }
 
-    try {
-        $pdo = mimir_db(mimir_db_path());
-    } catch (Throwable) {
-        mimir_json(['error' => 'Database niet beschikbaar.'], 500);
-    }
-
-    $record = mimir_key_lookup($pdo, $apiKey);
-    if ($record === null) {
-        mimir_json(['error' => 'API-sleutel is ongeldig of ingetrokken.'], 401);
-    }
+    mimir_load_auth(true);
 
     $route = $forcedRoute ?? mimir_route_from_request();
     $parsed = mimir_parse_route($route);
@@ -492,57 +664,61 @@ function mimir_api_main(?string $forcedRoute = null): void
     if ($parsed['action'] === 'unknown') {
         mimir_json(['error' => 'Onbekend endpoint. Gebruik tables, tables/{naam}/schema, query of companies.'], 404);
     }
+    if ($parsed['action'] === 'tables' || $parsed['action'] === 'companies' || $parsed['action'] === 'schema') {
+        if ($method !== 'GET') {
+            mimir_json(['error' => 'GET verwacht.'], 405);
+        }
+    } elseif ($method !== 'POST') {
+        mimir_json(['error' => 'POST verwacht.'], 405);
+    }
 
-    mimir_load_auth(true);
+    $body = null;
+    if ($parsed['action'] === 'query') {
+        try {
+            $body = mimir_read_json_body();
+        } catch (MimirUserException $error) {
+            mimir_json(['error' => $error->getMessage()], $error->status);
+        }
+    }
 
     try {
-        $now = time();
-        if ($parsed['action'] === 'tables') {
-            if ($method !== 'GET') {
-                mimir_json(['error' => 'GET verwacht.'], 405);
-            }
-            mimir_usage_log($pdo, $record['id'], $parsed['action'], $now);
-            $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
-            mimir_json(['value' => $listed['tables'], 'environment' => $listed['environment']]);
+        $pdo = null;
+        $record = mimir_authenticate_api_key($apiKey, $pdo);
+    } catch (Throwable $error) {
+        mimir_event_log('request', $error->getMessage(), '', (string) ($parsed['table'] ?? ''), 'bc-failed');
+        mimir_json(['error' => 'Database niet beschikbaar.'], 500);
+    }
+    if ($record === null) {
+        if (!$pdo instanceof PDO) {
+            mimir_json(['error' => 'Database niet beschikbaar en de API-sleutel kan niet worden gecontroleerd.'], 503);
         }
-        if ($parsed['action'] === 'companies') {
-            if ($method !== 'GET') {
-                mimir_json(['error' => 'GET verwacht.'], 405);
-            }
-            mimir_usage_log($pdo, $record['id'], $parsed['action'], $now);
-            // Cache only — zelfde pad als de UI zonder ?live=1.
-            $catalog = mimir_company_catalog($pdo, $now, false);
-            mimir_json([
-                'value' => $catalog['companies'],
-                'fetched_at' => $catalog['fetched_at'],
-                'source' => $catalog['source'],
-            ]);
-        }
-        if ($parsed['action'] === 'schema') {
-            if ($method !== 'GET') {
-                mimir_json(['error' => 'GET verwacht.'], 405);
-            }
-            mimir_usage_log($pdo, $record['id'], $parsed['action'], $now);
-            $schema = mimir_table_schema($pdo, trim((string) ($_GET['company'] ?? '')), (string) ($parsed['table'] ?? ''), $now);
-            mimir_json($schema);
-        }
-        if ($method !== 'POST') {
-            mimir_json(['error' => 'POST verwacht.'], 405);
-        }
-        $body = mimir_read_json_body();
-        $result = mimir_run_request_body($pdo, $body, $now, null, $record['id']);
-        $flags = mimir_usage_flags_from_response($result);
-        mimir_usage_log(
-            $pdo,
-            $record['id'],
-            'query',
-            $now,
-            $flags['shared'],
-            $flags['bc_hit'],
-            $flags['from_cache'],
-            $flags['from_live']
+        mimir_json(['error' => 'API-sleutel is ongeldig of ingetrokken.'], 401);
+    }
+
+    $entity = '';
+    if (is_array($body)) {
+        $entity = trim((string) ($body['table'] ?? $body['entity'] ?? ''));
+    }
+    if ($entity === '' && isset($parsed['table'])) {
+        $entity = (string) $parsed['table'];
+    }
+    $now = time();
+
+    try {
+        $payload = mimir_with_cache_or_live(
+            static function () use ($pdo, $record, $parsed, $now, $body): array {
+                if (!$pdo instanceof PDO) {
+                    throw new RuntimeException('SQLite niet beschikbaar.');
+                }
+
+                return mimir_api_cached_payload($pdo, $record, $parsed, $now, $body);
+            },
+            static function () use ($parsed, $now, $body): array {
+                return mimir_api_live_payload($parsed, $now, $body);
+            },
+            ['entity' => $entity, 'category' => 'request']
         );
-        mimir_json($result);
+        mimir_json($payload);
     } catch (MimirUserException $error) {
         mimir_json(['error' => $error->getMessage()], $error->status);
     } catch (Throwable $error) {
@@ -562,66 +738,179 @@ function mimir_session_email(): string
     return $email;
 }
 
+function mimir_ui_open_db(): ?PDO
+{
+    if (mimir_circuit_should_bypass()) {
+        return null;
+    }
+    try {
+        return mimir_db(mimir_db_path());
+    } catch (Throwable $error) {
+        if (!mimir_is_storage_failure($error)) {
+            throw $error;
+        }
+        mimir_db_self_repair(mimir_db_path());
+        mimir_circuit_trip($error->getMessage());
+
+        return null;
+    }
+}
+
+/**
+ * @param array<string, mixed>|null $body
+ * @return array<string, mixed>
+ */
+function mimir_ui_cached_payload(PDO $pdo, string $action, string $email, int $now, ?array $body): array
+{
+    if ($action === 'keys') {
+        return [
+            'value' => mimir_key_list($pdo, $email, $now),
+            'heatmap' => mimir_heatmap_options(),
+            'shared_pct_global' => mimir_usage_shared_pct_global($pdo, $now),
+        ];
+    }
+    if ($action === 'keys_create') {
+        if (!is_array($body)) {
+            throw new MimirUserException('JSON-body ontbreekt.');
+        }
+
+        return mimir_key_create($pdo, $email, (string) ($body['label'] ?? ''), $now);
+    }
+    if ($action === 'keys_revoke') {
+        if (!is_array($body)) {
+            throw new MimirUserException('JSON-body ontbreekt.');
+        }
+        $ok = mimir_key_revoke($pdo, (int) ($body['id'] ?? 0), $email, $now);
+        if (!$ok) {
+            throw new MimirUserException('Sleutel niet gevonden.', 404);
+        }
+
+        return ['ok' => true];
+    }
+    if ($action === 'companies') {
+        $allowLive = in_array(strtolower(trim((string) ($_GET['live'] ?? ''))), ['1', 'true', 'yes'], true);
+        $catalog = mimir_company_catalog($pdo, $now, $allowLive);
+
+        return [
+            'value' => $catalog['companies'],
+            'errors' => $catalog['errors'],
+            'fetched_at' => $catalog['fetched_at'],
+            'source' => $catalog['source'],
+        ];
+    }
+    if ($action === 'tables') {
+        $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
+
+        return ['value' => $listed['tables'], 'environment' => $listed['environment']];
+    }
+    if ($action === 'schema') {
+        return mimir_table_schema($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['table'] ?? '')), $now);
+    }
+    if ($action === 'query') {
+        if (!is_array($body)) {
+            throw new MimirUserException('JSON-body ontbreekt.');
+        }
+
+        return mimir_run_request_body($pdo, $body, $now, MIMIR_UI_MAX_AGE);
+    }
+
+    throw new MimirUserException('Onbekende actie.', 404);
+}
+
+/**
+ * @param array<string, mixed>|null $body
+ * @return array<string, mixed>
+ */
+function mimir_ui_live_payload(string $action, int $now, ?array $body): array
+{
+    $parsed = ['action' => $action];
+    if ($action === 'schema') {
+        $parsed['table'] = trim((string) ($_GET['table'] ?? ''));
+    }
+    if ($action === 'companies') {
+        $payload = mimir_api_live_payload($parsed, $now, null);
+
+        return [
+            'value' => $payload['value'] ?? [],
+            'errors' => [],
+            'fetched_at' => $payload['fetched_at'] ?? $now,
+            'source' => 'bc-live',
+        ];
+    }
+    if ($action === 'tables' || $action === 'schema') {
+        return mimir_api_live_payload($parsed, $now, null);
+    }
+    if ($action === 'query') {
+        return mimir_api_live_payload($parsed, $now, $body, MIMIR_UI_MAX_AGE);
+    }
+
+    throw new MimirUserException('Onbekende actie.', 404);
+}
+
 function mimir_ui_main(): void
 {
     @set_time_limit(300);
-    try {
-        $pdo = mimir_db(mimir_db_path());
-    } catch (Throwable $error) {
-        mimir_json(['error' => 'Database niet beschikbaar: ' . mimir_public_error($error)], 500);
-    }
-
+    $GLOBALS['mimir_stamp_bc_live'] = false;
     $action = trim((string) ($_GET['action'] ?? ''));
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     $now = time();
+    $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST'];
+    $dataActions = ['companies' => 'GET', 'tables' => 'GET', 'schema' => 'GET', 'query' => 'POST'];
 
     try {
         $email = mimir_session_email();
-        if ($action === 'keys' && $method === 'GET') {
-            mimir_json([
-                'value' => mimir_key_list($pdo, $email, $now),
-                'heatmap' => mimir_heatmap_options(),
-                'shared_pct_global' => mimir_usage_shared_pct_global($pdo, $now),
-            ]);
-        }
-        if ($action === 'keys_create' && $method === 'POST') {
-            $body = mimir_read_json_body();
-            $created = mimir_key_create($pdo, $email, (string) ($body['label'] ?? ''), $now);
-            mimir_json($created, 201);
-        }
-        if ($action === 'keys_revoke' && $method === 'POST') {
-            $body = mimir_read_json_body();
-            $ok = mimir_key_revoke($pdo, (int) ($body['id'] ?? 0), $email, $now);
-            if (!$ok) {
-                throw new MimirUserException('Sleutel niet gevonden.', 404);
-            }
-            mimir_json(['ok' => true]);
-        }
+    } catch (MimirUserException $error) {
+        mimir_json(['error' => $error->getMessage()], $error->status);
+    }
 
-        mimir_load_auth(true);
-        if ($action === 'companies' && $method === 'GET') {
-            $allowLive = in_array(strtolower(trim((string) ($_GET['live'] ?? ''))), ['1', 'true', 'yes'], true);
-            $catalog = mimir_company_catalog($pdo, $now, $allowLive);
-            mimir_json([
-                'value' => $catalog['companies'],
-                'errors' => $catalog['errors'],
-                'fetched_at' => $catalog['fetched_at'],
-                'source' => $catalog['source'],
-            ]);
-        }
-        if ($action === 'tables' && $method === 'GET') {
-            $listed = mimir_list_tables($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['q'] ?? '')), $now);
-            mimir_json(['value' => $listed['tables'], 'environment' => $listed['environment']]);
-        }
-        if ($action === 'schema' && $method === 'GET') {
-            $schema = mimir_table_schema($pdo, trim((string) ($_GET['company'] ?? '')), trim((string) ($_GET['table'] ?? '')), $now);
-            mimir_json($schema);
-        }
-        if ($action === 'query' && $method === 'POST') {
-            $body = mimir_read_json_body();
-            mimir_json(mimir_run_request_body($pdo, $body, $now, MIMIR_UI_MAX_AGE));
-        }
+    if (!isset($keyActions[$action]) && !isset($dataActions[$action])) {
         mimir_json(['error' => 'Onbekende actie.'], 404);
+    }
+    $expected = $keyActions[$action] ?? $dataActions[$action];
+    if ($method !== $expected) {
+        mimir_json(['error' => $expected . ' verwacht.'], 405);
+    }
+
+    $body = null;
+    if ($method === 'POST') {
+        try {
+            $body = mimir_read_json_body();
+        } catch (MimirUserException $error) {
+            mimir_json(['error' => $error->getMessage()], $error->status);
+        }
+    }
+
+    if (isset($dataActions[$action])) {
+        mimir_load_auth(true);
+    }
+
+    try {
+        $pdo = mimir_ui_open_db();
+        if (isset($keyActions[$action])) {
+            if (!$pdo instanceof PDO) {
+                mimir_json(['error' => 'Database niet beschikbaar.'], 503);
+            }
+            $payload = mimir_ui_cached_payload($pdo, $action, $email, $now, $body);
+            mimir_json($payload, $action === 'keys_create' ? 201 : 200);
+        }
+        $entity = trim((string) ($_GET['table'] ?? ''));
+        if ($entity === '' && is_array($body)) {
+            $entity = trim((string) ($body['table'] ?? $body['entity'] ?? ''));
+        }
+        $payload = mimir_with_cache_or_live(
+            static function () use ($pdo, $action, $email, $now, $body): array {
+                if (!$pdo instanceof PDO) {
+                    throw new RuntimeException('SQLite niet beschikbaar.');
+                }
+
+                return mimir_ui_cached_payload($pdo, $action, $email, $now, $body);
+            },
+            static function () use ($action, $now, $body): array {
+                return mimir_ui_live_payload($action, $now, $body);
+            },
+            ['entity' => $entity, 'category' => 'request']
+        );
+        mimir_json($payload);
     } catch (MimirUserException $error) {
         mimir_json(['error' => $error->getMessage()], $error->status);
     } catch (Throwable $error) {

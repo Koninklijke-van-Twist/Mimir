@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/mimir_reliability.php';
+
 /**
  * OData-client voor Business Central, afgeleid van Consus.
  * Paginering volgt @odata.nextLink. De bestandscache van Consus zit hier niet
@@ -42,48 +44,101 @@ function odata_init_curl(array $auth, string $accept = 'application/json')
     return $ch;
 }
 
-function odata_get_json(string $url, array $auth): array
+/**
+ * @return array{raw: string, code: int}
+ */
+function odata_perform(string $url, array $auth, string $accept): array
 {
-    $ch = odata_init_curl($auth, 'application/json');
+    $ch = odata_init_curl($auth, $accept);
+    $responseHeaders = [];
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($curl, string $header) use (&$responseHeaders): int {
+        unset($curl);
+        $length = strlen($header);
+        $pieces = explode(':', $header, 2);
+        if (count($pieces) === 2) {
+            $responseHeaders[strtolower(trim($pieces[0]))] = trim($pieces[1]);
+        }
+
+        return $length;
+    });
     try {
         curl_setopt($ch, CURLOPT_URL, $url);
+        $started = microtime(true);
         $raw = curl_exec($ch);
+        $elapsed = microtime(true) - $started;
         if ($raw === false) {
-            throw new RuntimeException('cURL error: ' . curl_error($ch));
+            $err = curl_error($ch);
+            $errno = curl_errno($ch);
+            $message = 'cURL error: ' . $err;
+            if (odata_curl_error_is_transient($errno, $err, $elapsed)) {
+                throw new MimirBcTransientException($message);
+            }
+            throw new RuntimeException($message);
         }
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         if ($code < 200 || $code >= 300) {
             $body = substr((string) $raw, 0, 800);
-            throw new RuntimeException('HTTP ' . $code . ' from OData: ' . $body);
+            $message = 'HTTP ' . $code . ' from OData: ' . $body;
+            $retryAfter = null;
+            if (isset($responseHeaders['retry-after'])) {
+                $retryAfter = mimir_retry_after_seconds((string) $responseHeaders['retry-after']);
+            }
+            if ($code === 429 || ($code >= 500 && $code <= 599)) {
+                throw new MimirBcTransientException($message, $retryAfter, $code);
+            }
+            throw new RuntimeException($message);
         }
-        $json = json_decode((string) $raw, true);
-        if (!is_array($json)) {
-            throw new RuntimeException('Invalid JSON from OData');
-        }
-        return $json;
+
+        return ['raw' => (string) $raw, 'code' => $code];
     } finally {
         curl_close($ch);
     }
 }
 
+function odata_curl_error_is_transient(int $errno, string $err, float $elapsed): bool
+{
+    $timeout = $errno === 28 || stripos($err, 'timed out') !== false || stripos($err, 'timeout') !== false;
+    if ($timeout && $elapsed >= MIMIR_BC_TIMEOUT_NO_RETRY_SECONDS) {
+        return false;
+    }
+    if ($timeout) {
+        return true;
+    }
+    if ($errno === 7 || $errno === 52 || $errno === 55 || $errno === 56) {
+        return true;
+    }
+    if (stripos($err, 'Connection reset') !== false
+        || stripos($err, 'connection reset') !== false
+        || stripos($err, 'Recv failure') !== false
+        || stripos($err, 'Could not connect') !== false
+        || stripos($err, 'Connection refused') !== false
+    ) {
+        return true;
+    }
+
+    return false;
+}
+
+function odata_get_json(string $url, array $auth): array
+{
+    $result = mimir_bc_retry(static function () use ($url, $auth): array {
+        return odata_perform($url, $auth, 'application/json');
+    });
+    $json = json_decode($result['raw'], true);
+    if (!is_array($json)) {
+        throw new RuntimeException('Invalid JSON from OData');
+    }
+
+    return $json;
+}
+
 function odata_get_text(string $url, array $auth): string
 {
-    $ch = odata_init_curl($auth, 'application/xml, application/json;q=0.5');
-    try {
-        curl_setopt($ch, CURLOPT_URL, $url);
-        $raw = curl_exec($ch);
-        if ($raw === false) {
-            throw new RuntimeException('cURL error: ' . curl_error($ch));
-        }
-        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        if ($code < 200 || $code >= 300) {
-            $body = substr((string) $raw, 0, 800);
-            throw new RuntimeException('HTTP ' . $code . ' from OData: ' . $body);
-        }
-        return (string) $raw;
-    } finally {
-        curl_close($ch);
-    }
+    $result = mimir_bc_retry(static function () use ($url, $auth): array {
+        return odata_perform($url, $auth, 'application/xml, application/json;q=0.5');
+    });
+
+    return $result['raw'];
 }
 
 /**

@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/mimir_reliability.php';
+
 /**
  * Cross-process limiet op gelijktijdige live Business Central-requests.
  * Per environment (bijv. kvtmdlive_aad) apart, FIFO-wachtlijst via SQLite.
@@ -116,12 +118,17 @@ function mimir_bc_limit_new_id(): string
 function mimir_bc_limit_db(): PDO
 {
     $path = mimir_bc_limit_db_path();
+    $restoreUmask = false;
+    $previousUmask = 0;
     if ($path !== ':memory:') {
+        $previousUmask = umask(0);
+        $restoreUmask = true;
         $dir = dirname($path);
         if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+            umask($previousUmask);
             throw new RuntimeException('BC-limit datamap kon niet worden aangemaakt: ' . $dir);
         }
-        @chmod($dir, 0777);
+        mimir_db_relax_perms($path);
     }
 
     if (!isset($GLOBALS['mimir_bc_limit_pdo_cache']) || !is_array($GLOBALS['mimir_bc_limit_pdo_cache'])) {
@@ -129,26 +136,32 @@ function mimir_bc_limit_db(): PDO
     }
     $cache = &$GLOBALS['mimir_bc_limit_pdo_cache'];
     if (isset($cache[$path]) && $cache[$path] instanceof PDO) {
+        if ($restoreUmask) {
+            umask($previousUmask);
+        }
+
         return $cache[$path];
     }
 
-    $pdo = new PDO('sqlite:' . $path, null, null, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-    ]);
-    $pdo->exec('PRAGMA busy_timeout = 5000');
-    if ($path !== ':memory:') {
-        $pdo->exec('PRAGMA journal_mode = WAL');
-        @chmod($path, 0666);
-        foreach ([$path . '-wal', $path . '-shm'] as $side) {
-            if (is_file($side)) {
-                @chmod($side, 0666);
-            }
+    try {
+        $pdo = new PDO('sqlite:' . $path, null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        ]);
+        $pdo->exec('PRAGMA busy_timeout = ' . (int) MIMIR_SQLITE_BUSY_TIMEOUT_MS);
+        if ($path !== ':memory:') {
+            $pdo->exec('PRAGMA journal_mode = WAL');
+            mimir_db_relax_perms($path);
+            mimir_db_track_path($path);
+        }
+        mimir_bc_limit_migrate($pdo);
+        $cache[$path] = $pdo;
+
+        return $pdo;
+    } finally {
+        if ($restoreUmask) {
+            umask($previousUmask);
         }
     }
-    mimir_bc_limit_migrate($pdo);
-    $cache[$path] = $pdo;
-
-    return $pdo;
 }
 
 /**
@@ -229,24 +242,52 @@ function mimir_bc_slot_acquire(string $environment): int
 
     $max = mimir_bc_limit_max_concurrent();
     $waitSeconds = mimir_bc_limit_queue_wait_seconds();
-    $pdo = mimir_bc_limit_db();
+    try {
+        $pdo = mimir_bc_limit_db();
+    } catch (Throwable $error) {
+        if (mimir_is_storage_failure($error)) {
+            mimir_event_log('sqlite', 'BC-limietdatabase niet bruikbaar; live-call zonder slot. ' . $error->getMessage(), $environment, '', 'bypassed-to-BC');
+            $GLOBALS['mimir_bc_held'][$environment] = [
+                'refs' => 1,
+                'holder_id' => '',
+                'wait_ms' => 0,
+                'untracked' => true,
+            ];
+
+            return 0;
+        }
+        throw $error;
+    }
     $holderId = mimir_bc_limit_new_id();
     $waiterId = mimir_bc_limit_new_id();
     $started = mimir_bc_limit_now();
     $deadline = $started + $waitSeconds;
 
-    $ins = $pdo->prepare(
-        'INSERT INTO bc_waiters (environment, waiter_id, enqueued_at) VALUES (:e, :w, :t)'
-    );
-    $ins->execute([':e' => $environment, ':w' => $waiterId, ':t' => $started]);
-    $waiterRowId = (int) $pdo->lastInsertId();
+    $waiterRowId = 0;
     $acquired = false;
 
     try {
+        $ins = $pdo->prepare(
+            'INSERT INTO bc_waiters (environment, waiter_id, enqueued_at) VALUES (:e, :w, :t)'
+        );
+        $ins->execute([':e' => $environment, ':w' => $waiterId, ':t' => $started]);
+        $waiterRowId = (int) $pdo->lastInsertId();
+
         while (true) {
             mimir_bc_limit_cleanup_stale($pdo, $environment);
 
-            $pdo->exec('BEGIN IMMEDIATE');
+            try {
+                $pdo->exec('BEGIN IMMEDIATE');
+            } catch (PDOException $error) {
+                if (mimir_sqlite_is_transient($error)) {
+                    mimir_bc_limit_sleep(MIMIR_BC_LIMIT_POLL_US);
+                    if (mimir_bc_limit_now() >= $deadline) {
+                        mimir_bc_limit_throw_timeout($environment, $waitSeconds, $max);
+                    }
+                    continue;
+                }
+                throw $error;
+            }
             try {
                 $countStmt = $pdo->prepare('SELECT COUNT(*) FROM bc_holders WHERE environment = :e');
                 $countStmt->execute([':e' => $environment]);
@@ -297,11 +338,28 @@ function mimir_bc_slot_acquire(string $environment): int
             mimir_bc_limit_sleep(MIMIR_BC_LIMIT_POLL_US);
         }
     } catch (Throwable $error) {
-        if (!$acquired) {
+        if (!$acquired && $waiterRowId > 0) {
             try {
                 $pdo->prepare('DELETE FROM bc_waiters WHERE id = :id')->execute([':id' => $waiterRowId]);
             } catch (Throwable) {
             }
+        }
+        try {
+            if ($pdo->inTransaction()) {
+                $pdo->exec('ROLLBACK');
+            }
+        } catch (Throwable) {
+        }
+        if (mimir_is_storage_failure($error)) {
+            mimir_event_log('sqlite', 'BC-limietdatabase niet bruikbaar; live-call zonder slot. ' . $error->getMessage(), $environment, '', 'bypassed-to-BC');
+            $GLOBALS['mimir_bc_held'][$environment] = [
+                'refs' => 1,
+                'holder_id' => '',
+                'wait_ms' => 0,
+                'untracked' => true,
+            ];
+
+            return 0;
         }
         throw $error;
     }
@@ -319,8 +377,12 @@ function mimir_bc_slot_release(string $environment): void
         return;
     }
 
+    $untracked = !empty($GLOBALS['mimir_bc_held'][$environment]['untracked']);
     $holderId = (string) $GLOBALS['mimir_bc_held'][$environment]['holder_id'];
     unset($GLOBALS['mimir_bc_held'][$environment]);
+    if ($untracked || $holderId === '') {
+        return;
+    }
 
     try {
         $pdo = mimir_bc_limit_db();

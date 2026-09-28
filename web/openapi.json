@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Mímir API",
-    "description": "Centrale OData-cache voor Business Central. Clients authenticeren met een API-sleutel\n(`Authorization: Bearer` of `X-API-Key`). Rijen worden gedeeld over sleutels; `meta.shared`\n/ `meta.bc_hit` meten of Business Central nog nodig was.\n\nCachegedrag (BC-callreductie):\n- Gefilterde JSON-queries mogen uit verse lege-filter (full-entity) dekking komen (lokaal filteren).\n- Full-entity fetches naar BC sturen geen `$select`; het antwoord projecteert wel op `select`.\n- Overlappende ranges op één veld kunnen gap-fillen (`meta.gap_fill`).\n",
-    "version": "1.1.0",
+    "description": "Centrale OData-cache voor Business Central. Clients authenticeren met een API-sleutel\n(`Authorization: Bearer` of `X-API-Key`). Rijen worden gedeeld over sleutels; `meta.shared`\n/ `meta.bc_hit` meten of Business Central nog nodig was.\n\nCachegedrag (BC-callreductie):\n- Gefilterde JSON-queries mogen uit verse lege-filter (full-entity) dekking komen (lokaal filteren).\n- Full-entity fetches naar BC sturen geen `$select`; het antwoord projecteert wel op `select`.\n- Overlappende ranges op één veld kunnen gap-fillen (`meta.gap_fill`).\n- Als de SQLite-cache niet bruikbaar is, komt het antwoord live uit Business Central (`meta.source=bc-live`).\n",
+    "version": "1.2.0",
     "contact": {
       "name": "Koninklijke van Twist"
     }
@@ -78,8 +78,10 @@
                         "nightly",
                         "memory",
                         "empty",
-                        "live"
-                      ]
+                        "live",
+                        "bc-live"
+                      ],
+                      "description": "bc-live als de SQLite-cache is overgeslagen en de lijst live uit Business Central komt"
                     }
                   }
                 }
@@ -680,6 +682,13 @@
           "bc_slots_max": {
             "type": "integer",
             "description": "Max gelijktijdige live BC-fetches per environment (default 3)"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "bc-live"
+            ],
+            "description": "Aanwezig en gelijk aan bc-live wanneer Mímir de cache heeft overgeslagen (circuit open, of SQLite locked/onleesbaar/readonly/corrupt) en het antwoord rechtstreeks uit Business Central komt, in hetzelfde response-formaat. Afwezig bij normaal cachegedrag."
           }
         }
       },
