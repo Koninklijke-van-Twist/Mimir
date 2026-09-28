@@ -10,7 +10,8 @@ info:
     - Gefilterde JSON-queries mogen uit verse lege-filter (full-entity) dekking komen (lokaal filteren).
     - Full-entity fetches naar BC sturen geen `$select`; het antwoord projecteert wel op `select`.
     - Overlappende ranges op één veld kunnen gap-fillen (`meta.gap_fill`).
-  version: "1.1.0"
+    - Als de SQLite-cache niet bruikbaar is, komt het antwoord live uit Business Central (`meta.source=bc-live`).
+  version: "1.2.0"
   contact:
     name: Koninklijke van Twist
 servers:
@@ -51,7 +52,8 @@ paths:
                     description: Unix-tijd van de nightly-cache
                   source:
                     type: string
-                    enum: [nightly, memory, empty, live]
+                    enum: [nightly, memory, empty, live, bc-live]
+                    description: bc-live als de SQLite-cache is overgeslagen en de lijst live uit Business Central komt
         "401":
           $ref: "#/components/responses/Unauthorized"
   /tables.php:
@@ -348,6 +350,14 @@ components:
         bc_slots_max:
           type: integer
           description: Max gelijktijdige live BC-fetches per environment (default 3)
+        source:
+          type: string
+          enum: [bc-live]
+          description: >
+            Aanwezig en gelijk aan bc-live wanneer Mímir de cache heeft overgeslagen
+            (circuit open, of SQLite locked/onleesbaar/readonly/corrupt) en het antwoord
+            rechtstreeks uit Business Central komt, in hetzelfde response-formaat.
+            Afwezig bij normaal cachegedrag.
     QueryResult:
       type: object
       required: [value, meta]

@@ -8,8 +8,11 @@ error_reporting(E_ALL);
 require_once __DIR__ . '/mimir_auth.php';
 mimir_load_auth();
 require_once __DIR__ . '/logincheck.php';
+require_once __DIR__ . '/mimir_reliability.php';
 
 $email = (string) ($_SESSION['user']['email'] ?? '');
+$mimirCircuit = mimir_circuit_public_state();
+$mimirEvents = mimir_event_log_recent(40);
 function mimir_h(string $value): string
 {
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -43,6 +46,9 @@ function mimir_h(string $value): string
             </div>
             <div class="hero-aside">
                 <p class="who"><?= mimir_h($email) ?></p>
+                <p class="circuit <?= $mimirCircuit['open'] ? 'circuit-bypass' : 'circuit-normal' ?>">
+                    Circuit: <strong><?= mimir_event_escape($mimirCircuit['label']) ?></strong><?php if ($mimirCircuit['since'] !== ''): ?> sinds <?= mimir_event_escape($mimirCircuit['since']) ?><?php endif; ?>
+                </p>
                 <p class="shared-global" id="shared-global" title="Percentage van alle query-API-aanroepen (alle sleutels) in de afgelopen 7 dagen dat volledig uit cache kwam die door een andere sleutel is gevuld — zonder Business Central te bellen.">Gedeeld <strong>—</strong></p>
             </div>
         </header>
@@ -129,6 +135,43 @@ function mimir_h(string $value): string
                         </tr>
                     </thead>
                     <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel" id="reliability">
+            <div class="panel-head">
+                <h2>Gebeurtenissen</h2>
+                <p>Circuit <strong><?= mimir_event_escape($mimirCircuit['label']) ?></strong><?php if ($mimirCircuit['since'] !== ''): ?> sinds <?= mimir_event_escape($mimirCircuit['since']) ?><?php endif; ?>. Tijden in Europe/Amsterdam. Het log staat buiten de SQLite-database.</p>
+            </div>
+            <div class="table-wrap">
+                <table id="events">
+                    <thead>
+                        <tr>
+                            <th>Tijd</th>
+                            <th>Categorie</th>
+                            <th>Omgeving</th>
+                            <th>Entity</th>
+                            <th>Actie</th>
+                            <th>Bericht</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if ($mimirEvents === []): ?>
+                            <tr><td colspan="6" class="empty">Nog geen gebeurtenissen.</td></tr>
+                        <?php else: ?>
+                            <?php foreach (array_reverse($mimirEvents) as $event): ?>
+                                <tr>
+                                    <td><?= mimir_event_escape((string) $event['ts']) ?></td>
+                                    <td><?= mimir_event_escape((string) $event['category']) ?></td>
+                                    <td><?= mimir_event_escape((string) $event['environment']) ?></td>
+                                    <td><?= mimir_event_escape((string) $event['entity']) ?></td>
+                                    <td><?= mimir_event_escape((string) $event['action']) ?></td>
+                                    <td><?= mimir_event_escape((string) $event['message']) ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </tbody>
                 </table>
             </div>
         </section>

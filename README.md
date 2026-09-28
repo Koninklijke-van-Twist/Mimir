@@ -99,6 +99,16 @@ Business Central laat ongeveer vijf gelijktijdige requests per environment toe. 
 
 Een worker die midden in een request sterft (PHP-timeout, OOM, deploy) laat anders een slot of een wacht-rij achter. Houders ouder dan **360** seconden (`MIMIR_BC_SLOT_STALE_SECONDS`, net boven `CURLOPT_TIMEOUT` 300 in `odata.php`) worden vrijgegeven. Wacht-rijen ouder dan max(wachtbudget, 30) + 30 seconden (`mimir_bc_limit_waiter_stale_seconds()`, standaard `MIMIR_BC_WAITER_STALE_SECONDS` = 150) gaan op elke poll weg, zodat een dode FIFO-kop de limiet niet blijvend blokkeert. Daarnaast geeft een shutdown-handler slots van dit proces vrij als `finally` niet liep. Staat de wachtrij al vast vóór deze versie live is, dan eenmalig in `web/data/bc_limit.sqlite`: `DELETE FROM bc_holders; DELETE FROM bc_waiters;`.
 
+## Als de database vastzit
+
+SQLite krijgt `busy_timeout` van 3 seconden. Tijdelijke fouten (`SQLITE_BUSY` / `SQLITE_LOCKED`, "database is locked", disk I/O error) worden een paar keer opnieuw geprobeerd met exponentiële backoff en jitter, binnen een begrensde wachttijd. Timeouts, HTTP 429, 5xx en connection resets naar Business Central ook, met respect voor `Retry-After`.
+
+Blijft de database locked, onleesbaar, readonly of corrupt, of zijn de retries op, dan gaat het verzoek **live naar Business Central** in hetzelfde JSON-formaat. `meta.source` is dan `bc-live`. Een circuit houdt dat vol tot een health probe (`PRAGMA quick_check`) de database weer gezond vindt. Andere interne fouten vallen ook terug op BC zolang de credentials er zijn. Clientfouten (ontbrekend veld, ongeldig filter) blijven een foutantwoord.
+
+Het gebeurtenislog (`web/data/mimir-events.jsonl`, tijdzone Europe/Amsterdam) staat buiten SQLite en is zichtbaar op de Mímir-pagina, samen met de circuit-staat (normal of bypass-to-BC) en sinds wanneer. Er komen geen secrets in dat log.
+
+`nightly.php` probeert de database opnieuw te openen, draait een open transactie bij afbreken terug (shutdown, want `exit` slaat `finally` over) en laat geen lock achter. Een leeg `-journal` wordt alleen verwijderd als de database in WAL staat, het bestand 0 bytes is en er een exclusieve lock op zit. `-wal`, `-shm` en het databasebestand zelf worden niet gewist.
+
 
 De UI gebruikt altijd `max_age` 600. De API laat de aanroeper dat bepalen (default 3600, maximum 365 dagen).
 
@@ -212,7 +222,9 @@ Push naar `master` start `.github/workflows/deploy-ftp.yml` (zelfde patroon als 
 - `FTP_PASSWORD`
 - `FTP_REMOTE_DIR` — het FTP-pad dat live `https://sleutels.kvt.nl/mimir/` is, doorgaans `/var/www/html/mimir`
 
-Voor de mirror zet de runner `./web` op 755 (mappen) en 644 (bestanden). De mirror gaat zonder `--no-perms`, zodat lftp die modi meestuurt: PHP moet voor Apache minstens 644 zijn. Mode 600 kwam van `--no-perms` plus de umask van de FTP-server. Argus-patroon: na een geslaagde mirror alleen `chmod 777` op de schrijfbare mappen `data`, `cache` en `analytics` — niet op sqlite-bestanden. Host/FTP kan mapmodi tijdens de mirror resetten; die stap herstelt de schrijfbare runtime-mappen elke deploy (best-effort, een 550 maakt de job niet rood). `data` en `data/**`, `cache` en `cache/**` blijven buiten de mirror, samen met `auth.php`, `.htaccess` en de sqlite/json/lock-globs. `analytics/**` wordt niet uitgesloten zodat `analytics.php` weer meegaat; alleen `analytics/*.sqlite` en `analytics/*.sqlite-*` blijven op de server. Geen put naar `data/`. `web/data/.htaccess` staat in git voor nieuwe installs en blijft op de server staan.
+Voor de mirror zet de runner `./web` op 755 (mappen) en 644 (bestanden). De mirror gaat zonder `--no-perms`, zodat lftp die modi meestuurt: PHP moet voor Apache minstens 644 zijn. Mode 600 kwam van `--no-perms` plus de umask van de FTP-server. `data` en `data/**`, `cache` en `cache/**` blijven buiten de mirror, samen met `auth.php`, `.htaccess` en de sqlite/json/lock-globs, zodat een deploy de database, `-wal`, `-shm`, `-journal` en het gebeurtenislog niet overschrijft of verwijdert. `analytics/**` wordt niet uitgesloten zodat `analytics.php` weer meegaat; alleen `analytics/*.sqlite` en `analytics/*.sqlite-*` blijven op de server. Geen put naar `data/`. `web/data/.htaccess` staat in git voor nieuwe installs en blijft op de server staan.
+
+Na de mirror, in een aparte lftp-sessie: `chmod 777` op de mappen `data`, `cache` en `analytics`, en (tijdelijk) ook op de sqlite-bestanden plus `-wal`/`-shm`/`-journal`. Een mapmode 777 maakt een bestand van een andere gebruiker niet schrijfbaar; de bestandschmod wel. Best-effort: een 550 maakt de job niet rood. PHP zet bij openen dezelfde 0777 (umask 0, fouten onderdrukt) tot de eigenaar-oorzaak vaststaat.
 
 Zet `web/auth.php` eenmalig op de server. Die blijft bij volgende deploys staan.
 
@@ -229,4 +241,5 @@ php tests/mimir_keys_test.php
 php tests/mimir_heatmap_test.php
 php tests/mimir_auth_env_test.php
 php tests/mimir_sqlite_test.php
+php tests/mimir_reliability_test.php
 ```

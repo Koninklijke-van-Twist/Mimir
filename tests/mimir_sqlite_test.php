@@ -27,7 +27,7 @@ function mimir_sqlite_pragma(PDO $pdo, string $name): string
 }
 
 $memory = mimir_db(':memory:');
-mimir_sqlite_same((int) mimir_sqlite_pragma($memory, 'busy_timeout'), 30000, 'in-memory busy_timeout is 30s');
+mimir_sqlite_same((int) mimir_sqlite_pragma($memory, 'busy_timeout'), MIMIR_SQLITE_BUSY_TIMEOUT_MS, 'in-memory busy_timeout matches MIMIR_SQLITE_BUSY_TIMEOUT_MS');
 
 $root = sys_get_temp_dir() . '/mimir-sqlite-' . bin2hex(random_bytes(4));
 register_shutdown_function(static function () use ($root): void {
@@ -44,14 +44,14 @@ register_shutdown_function(static function () use ($root): void {
 
 $path = $root . '/mimir.sqlite';
 $pdo = mimir_db($path);
-mimir_sqlite_same((int) mimir_sqlite_pragma($pdo, 'busy_timeout'), 30000, 'file db busy_timeout is 30s');
+mimir_sqlite_same((int) mimir_sqlite_pragma($pdo, 'busy_timeout'), MIMIR_SQLITE_BUSY_TIMEOUT_MS, 'file db busy_timeout matches MIMIR_SQLITE_BUSY_TIMEOUT_MS');
 mimir_sqlite_same(strtolower(mimir_sqlite_pragma($pdo, 'journal_mode')), 'wal', 'file db uses WAL');
 mimir_sqlite_same((int) mimir_sqlite_pragma($pdo, 'synchronous'), 1, 'WAL uses synchronous NORMAL');
 mimir_sqlite_same(fileperms($root) & 0777, 0777, 'data directory is 0777');
-mimir_sqlite_same(fileperms($path) & 0777, 0666, 'sqlite file is 0666');
-foreach ([$path . '-wal', $path . '-shm'] as $side) {
+mimir_sqlite_same(fileperms($path) & 0777, 0777, 'sqlite file is 0777');
+foreach ([$path . '-wal', $path . '-shm', $path . '-journal'] as $side) {
     if (is_file($side)) {
-        mimir_sqlite_same(fileperms($side) & 0777, 0666, basename($side) . ' is 0666');
+        mimir_sqlite_same(fileperms($side) & 0777, 0777, basename($side) . ' is 0777');
     }
 }
 
@@ -60,9 +60,9 @@ $stored = mimir_meta_get($pdo, 'probe', 60, 1_700_000_000);
 if (!is_array($stored) || ($stored['ok'] ?? null) !== true) {
     mimir_sqlite_fail('meta put/get on WAL file db failed');
 }
-foreach ([$path . '-wal', $path . '-shm'] as $side) {
+foreach ([$path . '-wal', $path . '-shm', $path . '-journal'] as $side) {
     if (is_file($side)) {
-        mimir_sqlite_same(fileperms($side) & 0777, 0666, basename($side) . ' stays 0666 after a write');
+        mimir_sqlite_same(fileperms($side) & 0777, 0777, basename($side) . ' stays 0777 after a write');
     }
 }
 
