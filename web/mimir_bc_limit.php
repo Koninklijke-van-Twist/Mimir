@@ -22,8 +22,10 @@ require_once __DIR__ . '/mimir_reliability.php';
  * als `finally` niet liep.
  *
  * Lukt het openen van de slotbestanden niet, dan valt dit proces terug op
- * één exclusive flock (1 slot) voor dat environment. Lukt ook dat niet,
- * dan stopt acquire met HTTP 503. Live BC gaat nooit ongelimiteerd door.
+ * één exclusive flock (1 slot) voor dat environment. Is ook die lock
+ * onmogelijk (geen directory, geen rechten, I/O-fout), dan gaat het verzoek
+ * live naar BC zonder slot — liever een antwoord dan een fout naar de
+ * client. Een volle wachtrij is dat niet: die blijft HTTP 503.
  *
  * Geen strikte FIFO-ticketlijst: de eerste waiter die een vrij slot ziet
  * krijgt het. Een gecrashte waiter houdt geen lock en blokkeert niemand.
@@ -180,14 +182,36 @@ function mimir_bc_limit_throw_timeout(string $environment, int $waitSeconds, int
     throw new RuntimeException($message, 503);
 }
 
-function mimir_bc_limit_throw_unavailable(string $environment): void
+/**
+ * Lockmechanisme zelf stuk: niet wachten, niet 503. De aanroeper (live fetch)
+ * gaat door naar Business Central. Een bezette semaphore hoort hier niet.
+ */
+function mimir_bc_limit_bypass_live(string $environment): int
 {
-    $message = 'BC-slotcoördinatie niet beschikbaar voor environment ' . $environment
-        . '; live BC wordt niet ongelimiteerd doorgelaten.';
-    if (class_exists('MimirUserException', false)) {
-        throw new MimirUserException($message, 503);
+    if (!isset($GLOBALS['mimir_bc_held']) || !is_array($GLOBALS['mimir_bc_held'])) {
+        $GLOBALS['mimir_bc_held'] = [];
     }
-    throw new RuntimeException($message, 503);
+    $GLOBALS['mimir_bc_held'][$environment] = [
+        'refs' => 1,
+        'handle' => null,
+        'slot' => -1,
+        'wait_ms' => 0,
+        'fallback' => false,
+        'untracked' => true,
+    ];
+    mimir_bc_limit_register_shutdown_release();
+    if (function_exists('mimir_event_log')) {
+        mimir_event_log(
+            'bc-limit',
+            'BC-slotcoördinatie onmogelijk voor environment ' . $environment
+                . ': lockbestanden niet te openen. Verzoek gaat live naar Business Central zonder concurrency-slot.',
+            $environment,
+            '',
+            'bypassed-to-BC'
+        );
+    }
+
+    return 0;
 }
 
 function mimir_bc_limit_log_fallback(string $environment): void
@@ -237,9 +261,12 @@ function mimir_bc_limit_open_slot_handles(string $environment, int $max): ?array
 }
 
 /**
- * @return array{handles: list<resource>, fallback: bool}
+ * Null alleen als er geen enkel lockbestand open kan: dat is een harde
+ * fout van het lockmechanisme, geen bezette semaphore.
+ *
+ * @return array{handles: list<resource>, fallback: bool}|null
  */
-function mimir_bc_limit_open_candidates(string $environment, int $max): array
+function mimir_bc_limit_open_candidates(string $environment, int $max): ?array
 {
     $forceFallback = !empty($GLOBALS['mimir_bc_limit_force_fallback']);
     if (!$forceFallback) {
@@ -251,8 +278,7 @@ function mimir_bc_limit_open_candidates(string $environment, int $max): array
 
     $handle = mimir_bc_limit_open_lock_file(mimir_bc_limit_fallback_path($environment));
     if ($handle === null) {
-        mimir_bc_limit_throw_unavailable($environment);
-        throw new RuntimeException('BC-slotcoördinatie niet beschikbaar.');
+        return null;
     }
     mimir_bc_limit_log_fallback($environment);
 
@@ -270,7 +296,7 @@ function mimir_bc_limit_wait_lock(array $handles, float $deadline, string $envir
 {
     $count = count($handles);
     if ($count < 1) {
-        mimir_bc_limit_throw_unavailable($environment);
+        throw new RuntimeException('BC-slotwacht zonder lockbestand.');
     }
     try {
         $start = random_int(0, $count - 1);
@@ -308,7 +334,8 @@ function mimir_bc_limit_wait_lock(array $handles, float $deadline, string $envir
         }
     }
     if ($winner === null) {
-        mimir_bc_limit_throw_unavailable($environment);
+        mimir_bc_limit_throw_timeout($environment, $waitSeconds, $max);
+        throw new RuntimeException('BC-slotwacht zonder toekenning.');
     }
 
     return $winner;
@@ -362,6 +389,9 @@ function mimir_bc_slot_acquire(string $environment): int
     $started = mimir_bc_limit_now();
     $deadline = $started + $waitSeconds;
     $candidates = mimir_bc_limit_open_candidates($environment, $max);
+    if ($candidates === null) {
+        return mimir_bc_limit_bypass_live($environment);
+    }
     $effectiveMax = $candidates['fallback'] ? 1 : $max;
     $winner = mimir_bc_limit_wait_lock(
         $candidates['handles'],
@@ -528,6 +558,9 @@ function mimir_bc_slot_force_hold(string $environment, string $holderId): void
 
     $max = mimir_bc_limit_max_concurrent();
     $candidates = mimir_bc_limit_open_candidates($environment, $max);
+    if ($candidates === null) {
+        throw new RuntimeException('Geen BC-slotbestand voor force_hold.');
+    }
     $winner = null;
     foreach ($candidates['handles'] as $index => $handle) {
         if (is_resource($handle) && @flock($handle, LOCK_EX | LOCK_NB)) {

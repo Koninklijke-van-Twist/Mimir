@@ -190,6 +190,7 @@ mimir_bcl_same(mimir_bc_slots_used('kvtgermanylive_aad'), 0, 'germany released')
 
 // --- (4) Max concurrent: 4th times out without taking a slot or failing over ---
 mimir_bcl_reset(3, 0);
+@unlink(mimir_event_log_path());
 foreach (['a', 'b', 'c'] as $id) {
     mimir_bc_slot_force_hold('kvtmdlive_aad', 'foreign-' . $id);
 }
@@ -212,6 +213,13 @@ try {
 mimir_bcl_same($timedOut, true, 'fourth waiter times out');
 mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 3, 'still three after timeout');
 mimir_bcl_same($GLOBALS['mimir_bc_held'], [], 'timed-out acquire holds nothing');
+$timeoutBypass = false;
+foreach (mimir_event_log_recent(20) as $row) {
+    if (($row['action'] ?? '') === 'bypassed-to-BC') {
+        $timeoutBypass = true;
+    }
+}
+mimir_bcl_same($timeoutBypass, false, 'a full queue is not a coordination failure');
 mimir_bc_slot_force_release('kvtmdlive_aad', 'foreign-a');
 $afterFree = mimir_bc_slot_acquire('kvtmdlive_aad');
 mimir_bcl_same($afterFree, 0, 'acquire proceeds once a slot is free');
@@ -422,33 +430,56 @@ foreach (mimir_event_log_recent(20) as $row) {
 mimir_bcl_same($loggedFallback, true, 'fallback is logged');
 mimir_bcl_same($loggedBypass, false, 'fallback does not log an unlimited BC bypass');
 
-// --- (12) If the fallback lock cannot be opened either, fail closed ---
-mimir_bcl_reset(3, 0);
+// --- (12) Lock files impossible: call live BC, do not error the client ---
+mimir_bcl_reset(3, 120);
 $savedDir = mimir_bc_limit_dir();
 mimir_bc_limit_set_dir('/proc/mimir-bc-slots-denied');
 $GLOBALS['mimir_bc_limit_fallback_path'] = '/proc/mimir-bc-fallback-denied';
 @unlink(mimir_event_log_path());
-$closed = false;
-try {
-    mimir_bc_slot_acquire('kvtmdlive_aad');
-} catch (MimirUserException $error) {
-    $closed = true;
-    mimir_bcl_same($error->status, 503, 'fail closed is 503');
-    if (!str_contains($error->getMessage(), 'niet ongelimiteerd')) {
-        mimir_bcl_fail('fail-closed message should refuse unlimited BC');
+$polledOnHardFailure = false;
+$GLOBALS['mimir_bc_limit_sleep'] = static function (int $us) use (&$polledOnHardFailure): void {
+    $polledOnHardFailure = true;
+};
+$sawUntracked = false;
+$live = mimir_bc_with_slot('kvtmdlive_aad', static function (int $waitMs) use (&$sawUntracked): string {
+    $sawUntracked = !empty($GLOBALS['mimir_bc_held']['kvtmdlive_aad']['untracked']);
+    if ($waitMs !== 0) {
+        throw new RuntimeException('hard failure must not report queue wait');
     }
-    mimir_bcl_same(mimir_should_failover_to_bc($error), false, 'coordination failure does not fail over to BC');
-    mimir_bcl_same(mimir_is_storage_failure($error), false, 'coordination failure is not classified as storage bypass');
-}
-mimir_bcl_same($closed, true, 'acquire fails closed when no lock file can be opened');
-mimir_bcl_same($GLOBALS['mimir_bc_held'], [], 'fail closed does not record an untracked hold');
-$closedBypass = false;
+
+    return 'live-bc';
+});
+unset($GLOBALS['mimir_bc_limit_sleep']);
+mimir_bcl_same($polledOnHardFailure, false, 'hard failure does not poll like a busy queue');
+mimir_bcl_same($sawUntracked, true, 'bypass hold is untracked');
+mimir_bcl_same($live, 'live-bc', 'caller still invokes live BC');
+mimir_bcl_same($GLOBALS['mimir_bc_held'], [], 'with_slot releases the bypass hold');
+mimir_bcl_same(mimir_bc_slots_used('kvtmdlive_aad'), 0, 'bypass takes no flock');
+$bypassMessage = '';
+$bypassCount = 0;
+$fallbackLogged = false;
 foreach (mimir_event_log_recent(20) as $row) {
     if (($row['action'] ?? '') === 'bypassed-to-BC') {
-        $closedBypass = true;
+        $bypassCount++;
+        $bypassMessage = (string) ($row['message'] ?? '');
+    }
+    if (($row['action'] ?? '') === 'fallback-one-slot') {
+        $fallbackLogged = true;
     }
 }
-mimir_bcl_same($closedBypass, false, 'fail closed does not log bypassed-to-BC');
+mimir_bcl_same($bypassCount, 1, 'hard failure logs one bypass');
+mimir_bcl_same($fallbackLogged, false, 'total failure is not the one-slot fallback');
+if (!str_contains($bypassMessage, 'live naar Business Central')) {
+    mimir_bcl_fail('bypass log should say the request goes live to Business Central');
+}
+$again = mimir_bc_slot_acquire('kvtmdlive_aad');
+mimir_bcl_same($again, 0, 'direct bypass acquire returns 0');
+mimir_bcl_same(!empty($GLOBALS['mimir_bc_held']['kvtmdlive_aad']['untracked']), true, 'direct bypass is untracked');
+mimir_bcl_same(mimir_bc_slot_acquire('kvtmdlive_aad'), 0, 'nested bypass does not take a lock');
+mimir_bc_slot_release('kvtmdlive_aad');
+mimir_bcl_same(isset($GLOBALS['mimir_bc_held']['kvtmdlive_aad']), true, 'refcount keeps the bypass hold');
+mimir_bc_slot_release('kvtmdlive_aad');
+mimir_bcl_same(isset($GLOBALS['mimir_bc_held']['kvtmdlive_aad']), false, 'bypass fully released');
 mimir_bc_limit_set_dir($savedDir);
 unset($GLOBALS['mimir_bc_limit_fallback_path']);
 
