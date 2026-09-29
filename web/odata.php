@@ -8,15 +8,44 @@ require_once __DIR__ . '/mimir_reliability.php';
  * OData-client voor Business Central, afgeleid van Consus.
  * Paginering volgt @odata.nextLink. De bestandscache van Consus zit hier niet
  * in: Mímir bewaart rijen in SQLite met een fetched_at per rij.
+ *
+ * Pagina-grootte gaat via Prefer: odata.maxpagesize, niet via $top.
+ * $top is bij BC een totaalplafond en onderdrukt nextLink, waardoor een set
+ * na één pagina stilvalt. Ontbreekt $top, dan blijft de service zelf
+ * nextLink sturen (eigen Max Page Size) ook als Prefer wordt genegeerd.
+ * $skip+$top als client-paging gebruiken we niet: BC raadt dat af.
  */
 
 const MIMIR_ODATA_PAGE_GUARD = 100;
+const MIMIR_ODATA_PAGE_SIZE = 2000;
 
-function odata_init_curl(array $auth, string $accept = 'application/json')
+function odata_maxpagesize_header(int $pageSize = MIMIR_ODATA_PAGE_SIZE): string
+{
+    if ($pageSize < 1) {
+        $pageSize = MIMIR_ODATA_PAGE_SIZE;
+    }
+
+    return 'Prefer: odata.maxpagesize=' . $pageSize;
+}
+
+/**
+ * @param list<string> $extraHeaders
+ */
+function odata_init_curl(array $auth, string $accept = 'application/json', array $extraHeaders = [])
 {
     $ch = curl_init();
     if ($ch === false) {
         throw new RuntimeException('cURL kon niet worden gestart.');
+    }
+
+    $headers = [
+        'Accept: ' . $accept,
+        'Accept-Language: nl-NL,nl;q=0.9,en;q=0.8',
+    ];
+    foreach ($extraHeaders as $header) {
+        if (is_string($header) && $header !== '') {
+            $headers[] = $header;
+        }
     }
 
     curl_setopt_array($ch, [
@@ -27,10 +56,7 @@ function odata_init_curl(array $auth, string $accept = 'application/json')
         CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
         CURLOPT_USERAGENT => 'Mimir-ODataClient/1.0 (nl-NL)',
         CURLOPT_ENCODING => '',
-        CURLOPT_HTTPHEADER => [
-            'Accept: ' . $accept,
-            'Accept-Language: nl-NL,nl;q=0.9,en;q=0.8',
-        ],
+        CURLOPT_HTTPHEADER => $headers,
     ]);
 
     if (($auth['mode'] ?? '') === 'basic') {
@@ -45,11 +71,12 @@ function odata_init_curl(array $auth, string $accept = 'application/json')
 }
 
 /**
+ * @param list<string> $extraHeaders
  * @return array{raw: string, code: int}
  */
-function odata_perform(string $url, array $auth, string $accept): array
+function odata_perform(string $url, array $auth, string $accept, array $extraHeaders = []): array
 {
-    $ch = odata_init_curl($auth, $accept);
+    $ch = odata_init_curl($auth, $accept, $extraHeaders);
     $responseHeaders = [];
     curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($curl, string $header) use (&$responseHeaders): int {
         unset($curl);
@@ -119,11 +146,37 @@ function odata_curl_error_is_transient(int $errno, string $err, float $elapsed):
     return false;
 }
 
+function odata_prefer_rejected(Throwable $error): bool
+{
+    $status = null;
+    if (preg_match('/HTTP (\d{3})/', $error->getMessage(), $match) === 1) {
+        $status = (int) $match[1];
+    }
+    if ($status !== 400 && $status !== 406) {
+        return false;
+    }
+    $message = strtolower($error->getMessage());
+
+    return str_contains($message, 'prefer') || str_contains($message, 'maxpagesize');
+}
+
 function odata_get_json(string $url, array $auth): array
 {
-    $result = mimir_bc_retry(static function () use ($url, $auth): array {
-        return odata_perform($url, $auth, 'application/json');
-    });
+    $prefer = [odata_maxpagesize_header()];
+    try {
+        $result = mimir_bc_retry(static function () use ($url, $auth, $prefer): array {
+            return odata_perform($url, $auth, 'application/json', $prefer);
+        });
+    } catch (Throwable $error) {
+        // Prefer is een hint. Wijst BC de header af, dan dezelfde URL zonder
+        // Prefer: zonder $top levert server-paging alsnog de hele set via nextLink.
+        if (!odata_prefer_rejected($error)) {
+            throw $error;
+        }
+        $result = mimir_bc_retry(static function () use ($url, $auth): array {
+            return odata_perform($url, $auth, 'application/json');
+        });
+    }
     $json = json_decode($result['raw'], true);
     if (!is_array($json)) {
         throw new RuntimeException('Invalid JSON from OData');

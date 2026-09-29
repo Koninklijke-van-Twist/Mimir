@@ -129,7 +129,25 @@ mimir_test_same($stringPlan['odata'], "No eq 'A'", 'string filter odata passthro
 mimir_test_same(mimir_filter_validate(''), 'Filter-string mag niet leeg zijn.', 'empty string rejected');
 mimir_test_same(mimir_filter_validate(str_repeat('x', MIMIR_FILTER_MAX_STRING + 1)) !== null, true, 'long string rejected');
 mimir_test_same(mimir_filter_validate("No eq 'A'"), null, 'string filter ok');
-mimir_test_same(mimir_filter_match(['No' => 'Z'], "No eq 'A'", $types), true, 'string filter match always true');
+mimir_test_same(mimir_filter_match(['No' => 'Z'], "No eq 'A'", $types), false, 'simple string eq filters locally');
+mimir_test_same(mimir_filter_match(['No' => 'A'], "No eq 'A'", $types), true, 'simple string eq hit');
+mimir_test_same(mimir_filter_match(['No' => "O'Brien"], "No eq 'O''Brien'", $types), true, 'doubled quotes in string eq');
+mimir_test_same(mimir_filter_match(['Open' => true], 'Open eq true', ['Open' => 'Edm.Boolean']), true, 'Open eq true hit');
+mimir_test_same(mimir_filter_match(['Open' => false], 'Open eq true', ['Open' => 'Edm.Boolean']), false, 'Open eq true rejects closed');
+mimir_test_same(mimir_filter_match(['Open' => false], '(Open eq false)', ['Open' => 'Edm.Boolean']), true, 'parenthesised Open eq false');
+mimir_test_same(mimir_filter_match(['Open' => 'true'], 'Open eq true'), true, 'boolean literal without schema type');
+mimir_test_same(mimir_filter_match(['Name' => 'x'], 'Open eq true'), false, 'missing Open is not Open eq true');
+mimir_test_same(odata_maxpagesize_header(), 'Prefer: odata.maxpagesize=2000', 'prefer maxpagesize header');
+mimir_test_same(odata_prefer_rejected(new RuntimeException('HTTP 400 from OData: Prefer maxpagesize rejected')), true, 'prefer rejection is retried');
+mimir_test_same(odata_prefer_rejected(new RuntimeException('HTTP 400 from OData: filter invalid')), false, 'other 400 is not a prefer rejection');
+mimir_test_same(odata_prefer_rejected(new RuntimeException('HTTP 501 from OData: nope')), false, '501 is not a prefer rejection');
+mimir_test_same(mimir_filter_match(['Open' => false], "contains(Name,'x')"), true, 'unparsed string still trusts BC');
+mimir_test_same(mimir_filter_coverage_servable('Open eq true'), true, 'simple eq may use coverage');
+mimir_test_same(mimir_filter_coverage_servable("No eq 'A'"), true, 'literal eq may use coverage');
+mimir_test_same(mimir_filter_coverage_servable("(Open eq true) and (Name eq 'A')"), false, 'complex string skips coverage');
+mimir_test_same(mimir_filter_coverage_servable("contains(Description,'x')"), false, 'function string skips coverage');
+mimir_test_same(mimir_filter_coverage_servable(['field' => 'No', 'op' => 'eq', 'value' => 'A']), true, 'json filter may use coverage');
+mimir_test_same(mimir_filter_parse_simple_eq('Open eq TRUE'), ['field' => 'Open', 'op' => 'eq', 'value' => true, 'type' => 'Edm.Boolean'], 'boolean eq parse');
 
 $many = [];
 for ($i = 0; $i < 85; $i++) {

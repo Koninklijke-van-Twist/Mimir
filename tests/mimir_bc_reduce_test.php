@@ -91,6 +91,52 @@ mimir_bc_same(count($calls), 1, 'opaque string filter still hits BC');
 mimir_bc_same($stringHit['meta']['bc_hit'], 1, 'opaque string bc_hit');
 mimir_bc_same($stringHit['value'][0]['Description'], 'live', 'opaque string used BC row');
 
+// Exact "Open eq true" coverage must not leak later closed rows.
+$pdo = mimir_db(':memory:');
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'WorkOrders', mimir_row_key(['No' => 'WO0001'], ['No']), [
+    'No' => 'WO0001',
+    'Description' => 'open',
+    'Open' => true,
+], $now - 5);
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'WorkOrders', mimir_row_key(['No' => 'WO0002'], ['No']), [
+    'No' => 'WO0002',
+    'Description' => 'dicht',
+    'Open' => false,
+], $now - 1);
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'WorkOrders', mimir_row_key(['No' => 'WO0003'], ['No']), [
+    'No' => 'WO0003',
+    'Description' => 'zonder open-veld',
+], $now - 1);
+mimir_coverage_put($pdo, 'kvtmdlive_aad', 'KVT', 'WorkOrders', 'Open eq true', '*', $now - 5, 1);
+$calls = [];
+$openOnly = mimir_query_entity($pdo, mimir_bc_job([
+    'filter' => 'Open eq true',
+    'select' => ['No', 'Description'],
+]), function (string $url) use (&$calls): array {
+    $calls[] = $url;
+    return ['value' => []];
+}, $now);
+mimir_bc_same($calls, [], 'simple Open eq true stays on exact coverage');
+mimir_bc_same(count($openOnly['value']), 1, 'closed row does not leak into Open eq true');
+mimir_bc_same($openOnly['value'][0]['No'], 'WO0001', 'only the open row is served');
+
+// Unparsed string with exact coverage must hit live BC, not the shared cache.
+$pdo = mimir_db(':memory:');
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'WorkOrders', mimir_row_key(['No' => 'WO0009'], ['No']), [
+    'No' => 'WO0009',
+    'Description' => 'cached',
+], $now - 5);
+mimir_coverage_put($pdo, 'kvtmdlive_aad', 'KVT', 'WorkOrders', "contains(Description,'x')", '*', $now - 5, 1);
+$calls = [];
+$complex = mimir_query_entity($pdo, mimir_bc_job([
+    'filter' => "contains(Description,'x')",
+]), function (string $url) use (&$calls): array {
+    $calls[] = $url;
+    return ['value' => [['No' => 'WO0011', 'Description' => 'xyz']]];
+}, $now);
+mimir_bc_same(count($calls), 1, 'unparsed string ignores coverage and hits BC');
+mimir_bc_same($complex['value'][0]['No'], 'WO0011', 'unparsed string returns the live row');
+
 // --- (2) Empty-filter warm omits $select; response still projected ---
 $pdo = mimir_db(':memory:');
 $calls = [];
