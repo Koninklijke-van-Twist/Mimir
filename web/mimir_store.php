@@ -1670,15 +1670,9 @@ function mimir_refresh_whole_row(
         throw new RuntimeException('Sleutel-verzoek gaf een lijst terug in plaats van één rij.');
     }
     $fresh = mimir_strip_odata_noise($decoded);
-    // Eerst mergen, daarna alleen ontbrekende verplichte kolommen op null zetten.
-    // Null vóór de merge zou een weggelaten veld (smallere response) als expliciete
-    // null de cache in duwen en de oude waarde wissen.
+    // $required niet als null in de payload zetten. Een ontbrekende kolom is
+    // weggelaten, geen geleegd veld; null zou de merge een oude waarde laten wissen.
     $fresh = mimir_cache_merge_payload($payload, $fresh);
-    foreach ($required as $column) {
-        if (!array_key_exists($column, $fresh)) {
-            $fresh[$column] = null;
-        }
-    }
     $newKey = mimir_row_key($fresh, $keys);
     try {
         if ($newKey !== $rowKey) {
