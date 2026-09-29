@@ -12,7 +12,7 @@ De pagina staat in `web/` en gaat via FTP naar `/var/www/html/mimir/`.
 - `web/openapi.yaml` / `web/openapi.json` — OpenAPI 3-specificatie (publiek, geen sleutel).
 - `web/odata.php` — BC-client (basic of NTLM, paginering via `@odata.nextLink`, `$metadata`).
 - `web/mimir_store.php` — SQLite: rijcache, dekking van een fetch, API-sleutels, usage.
-- `web/mimir_bc_limit.php` — cross-process limiet op gelijktijdige live BC-requests per environment.
+- `web/mimir_bc_limit.php` — cross-process limiet (`flock`-semaphore) op gelijktijdige live BC-requests per environment.
 - `web/mimir_filter.php` — filterboom `and` / `or` / `xor`.
 - `web/logincheck.php` + `web/auth_helper.php` — SSO-poort als Consus; company-discovery als Penates (meerdere environments).
 - `web/data/mimir.sqlite` — runtime, niet in git.
@@ -95,9 +95,9 @@ Voor aaneengesloten ranges op **één** vergelijkbaar veld (`eq` / `ge` / `gt` /
 
 ### BC-concurrency
 
-Business Central laat ongeveer vijf gelijktijdige requests per environment toe. Mímir beperkt live BC-fetches tot **3** tegelijk per environment (`kvtmdlive_aad` en `kvtgermanylive_aad` hebben aparte tellers), met een FIFO-wachtlijst in SQLite (`web/data/bc_limit.sqlite`). Antwoorden die volledig uit de cache komen nemen geen slot. Wie moest wachten krijgt `meta.queue_wait_ms` (en optioneel `bc_slots_used` / `bc_slots_max`). Na **120** seconden wachten volgt HTTP **503** in plaats van oneindig hangen. Constanten: `MIMIR_BC_MAX_CONCURRENT`, `MIMIR_BC_QUEUE_WAIT_SECONDS` in `web/mimir_bc_limit.php`.
+Business Central laat ongeveer vijf gelijktijdige requests per environment toe. Mímir beperkt live BC-fetches tot **3** tegelijk per environment (`kvtmdlive_aad` en `kvtgermanylive_aad` hebben aparte tellers). Dat is een counting semaphore van exclusive `flock`s op `web/data/bc_slots/<environment>/slot-N`, niet een SQLite-wachtlijst. Elke wachtende worker pollt alleen die slotbestanden; er is geen `BEGIN IMMEDIATE` meer op een gedeelde limiet-database. Antwoorden die volledig uit de cache komen nemen geen slot. Wie moest wachten krijgt `meta.queue_wait_ms` (en optioneel `bc_slots_used` / `bc_slots_max`). Na **120** seconden wachten volgt HTTP **503** in plaats van oneindig hangen. Constanten: `MIMIR_BC_MAX_CONCURRENT`, `MIMIR_BC_QUEUE_WAIT_SECONDS` in `web/mimir_bc_limit.php`.
 
-Een worker die midden in een request sterft (PHP-timeout, OOM, deploy) laat anders een slot of een wacht-rij achter. Houders ouder dan **360** seconden (`MIMIR_BC_SLOT_STALE_SECONDS`, net boven `CURLOPT_TIMEOUT` 300 in `odata.php`) worden vrijgegeven. Wacht-rijen ouder dan max(wachtbudget, 30) + 30 seconden (`mimir_bc_limit_waiter_stale_seconds()`, standaard `MIMIR_BC_WAITER_STALE_SECONDS` = 150) gaan op elke poll weg, zodat een dode FIFO-kop de limiet niet blijvend blokkeert. Daarnaast geeft een shutdown-handler slots van dit proces vrij als `finally` niet liep. Staat de wachtrij al vast vóór deze versie live is, dan eenmalig in `web/data/bc_limit.sqlite`: `DELETE FROM bc_holders; DELETE FROM bc_waiters;`.
+Een worker die midden in een request sterft (PHP-timeout, OOM, deploy) laat geen slot achter: de kernel geeft `flock` vrij zodra het proces de filedescriptor sluit. Er is geen houder- of wachtrijtabel die een dode worker kan laten staan. Een shutdown-handler geeft slots van dit proces ook vrij als `finally` niet liep. Lukt het aanmaken van de slotbestanden niet, dan valt Mímir terug op één exclusive lock per environment. Lukt ook dat niet, dan antwoordt het verzoek met HTTP **503** — live BC gaat niet ongelimiteerd door. Het oude `web/data/bc_limit.sqlite` wordt niet meer gebruikt en mag weg.
 
 ## Als de database vastzit
 

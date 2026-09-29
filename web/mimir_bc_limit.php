@@ -6,61 +6,52 @@ require_once __DIR__ . '/mimir_reliability.php';
 
 /**
  * Cross-process limiet op gelijktijdige live Business Central-requests.
- * Per environment (bijv. kvtmdlive_aad) apart, FIFO-wachtlijst via SQLite.
+ * Per environment (bijv. kvtmdlive_aad) een counting semaphore van flock's.
  *
- * In-memory counters werken niet onder Apache mod_php (meerdere workers).
- * Sterft een worker midden in een request (PHP-timeout, OOM, deploy), dan
- * loopt `finally` soms niet. Ghost holders en vooral een dode FIFO-kop in
- * bc_waiters worden daarom op elke poll opgeruimd; een shutdown-handler
- * geeft slots van dit proces alsnog vrij.
+ * Het vorige limiet-SQLite (`bc_limit.sqlite`) liet elke wachtende
+ * Apache/PHP-FPM-worker elke ~50ms `BEGIN IMMEDIATE` doen. Die exclusieve
+ * lock op de coördinatiedatabase zelf werd onder belasting een lock-storm,
+ * en bij een storage-fout ging de aanroep ongelimiteerd live naar BC.
+ *
+ * Nu houdt elk slot een exclusive `flock` op een eigen bestand
+ * (`<datamap>/bc_slots/<environment>/slot-N`). Wachten is een korte
+ * non-blocking poll op die bestanden, niet op SQLite. Sterft een worker
+ * (timeout, OOM, deploy), dan laat de kernel de lock vallen zodra de
+ * filedescriptor dichtgaat — er is geen rij in een wachttabel die kan
+ * blijven hangen. Een shutdown-handler geeft slots van dit proces ook vrij
+ * als `finally` niet liep.
+ *
+ * Lukt het openen van de slotbestanden niet, dan valt dit proces terug op
+ * één exclusive flock (1 slot) voor dat environment. Lukt ook dat niet,
+ * dan stopt acquire met HTTP 503. Live BC gaat nooit ongelimiteerd door.
+ *
+ * Geen strikte FIFO-ticketlijst: de eerste waiter die een vrij slot ziet
+ * krijgt het. Een gecrashte waiter houdt geen lock en blokkeert niemand.
  */
 
 const MIMIR_BC_MAX_CONCURRENT = 3;
 const MIMIR_BC_QUEUE_WAIT_SECONDS = 120;
-/**
- * Ghost holders (gedode worker, rij blijft in bc_holders) vervallen na dit
- * aantal seconden. 360 ligt net boven CURLOPT_TIMEOUT 300 in odata.php:
- * één lopende BC-call wordt niet halverwege afgepakt, en een dode houder
- * houdt de capaciteit niet tien minuten (de oude 600s) bezet.
- */
-const MIMIR_BC_SLOT_STALE_SECONDS = 360;
-/**
- * Standaardleeftijd (seconden) waarna een bc_waiters-rij als dood geldt:
- * max(MIMIR_BC_QUEUE_WAIT_SECONDS, 30) + 30 = 150.
- * Een levende waiter stopt zelf bij het wachtbudget en wist zijn rij. Deze
- * grens is dat budget plus een kleine grace, zodat een worker die in de
- * wachtrij sterft niet voor altijd FIFO-kop blijft — anders ziet iedereen
- * "BC-concurrency limiet" terwijl er niets meer naar BC gaat.
- * Bij een afwijkend wachtbudget geldt dezelfde formule via
- * mimir_bc_limit_waiter_stale_seconds().
- */
-const MIMIR_BC_WAITER_STALE_SECONDS = 150;
 const MIMIR_BC_LIMIT_POLL_US = 50000;
 
 /**
- * Override voor tests: pad naar de limiet-database, of null voor default.
- *
- * @param ?string $path
+ * Override voor tests: map voor de slotbestanden, of null voor de default.
  */
-function mimir_bc_limit_set_db_path(?string $path): void
+function mimir_bc_limit_set_dir(?string $dir): void
 {
-    if ($path === null) {
-        unset($GLOBALS['mimir_bc_limit_db_path']);
+    if ($dir === null || $dir === '') {
+        unset($GLOBALS['mimir_bc_limit_dir']);
         return;
     }
-    $GLOBALS['mimir_bc_limit_db_path'] = $path;
+    $GLOBALS['mimir_bc_limit_dir'] = $dir;
 }
 
-function mimir_bc_limit_db_path(): string
+function mimir_bc_limit_dir(): string
 {
-    if (isset($GLOBALS['mimir_bc_limit_db_path']) && is_string($GLOBALS['mimir_bc_limit_db_path']) && $GLOBALS['mimir_bc_limit_db_path'] !== '') {
-        return $GLOBALS['mimir_bc_limit_db_path'];
-    }
-    if (function_exists('mimir_db_path')) {
-        return dirname(mimir_db_path()) . '/bc_limit.sqlite';
+    if (isset($GLOBALS['mimir_bc_limit_dir']) && is_string($GLOBALS['mimir_bc_limit_dir']) && $GLOBALS['mimir_bc_limit_dir'] !== '') {
+        return $GLOBALS['mimir_bc_limit_dir'];
     }
 
-    return __DIR__ . '/data/bc_limit.sqlite';
+    return mimir_runtime_dir() . '/bc_slots';
 }
 
 function mimir_bc_limit_max_concurrent(): int
@@ -81,17 +72,6 @@ function mimir_bc_limit_queue_wait_seconds(): int
     return MIMIR_BC_QUEUE_WAIT_SECONDS;
 }
 
-/**
- * Leeftijd in seconden waarna een waiter-rij op de poll-pad wordt verwijderd.
- * max(queue-wait, 30) + 30. De vloer van 30s voorkomt dat een heel kort
- * wachtbudget een waiter die nog aan het pollen is meteen wist.
- * Standaard (wachtbudget 120) is dit MIMIR_BC_WAITER_STALE_SECONDS (150).
- */
-function mimir_bc_limit_waiter_stale_seconds(): int
-{
-    return max(mimir_bc_limit_queue_wait_seconds(), 30) + 30;
-}
-
 function mimir_bc_limit_now(): float
 {
     if (isset($GLOBALS['mimir_bc_limit_now']) && is_callable($GLOBALS['mimir_bc_limit_now'])) {
@@ -110,117 +90,254 @@ function mimir_bc_limit_sleep(int $microseconds): void
     usleep($microseconds);
 }
 
-function mimir_bc_limit_new_id(): string
+/**
+ * Eén padcomponent. Geen slashes, geen `.` / `..`.
+ */
+function mimir_bc_limit_env_key(string $environment): string
 {
-    return bin2hex(random_bytes(8)) . '-' . getmypid();
+    $key = preg_replace('/[^A-Za-z0-9._-]+/', '_', $environment);
+    if (!is_string($key) || $key === '' || $key === '.' || $key === '..') {
+        $key = 'env';
+    }
+    if (strlen($key) > 80) {
+        $key = substr($key, 0, 48) . '-' . substr(hash('sha256', $environment), 0, 16);
+    }
+
+    return $key;
 }
 
-function mimir_bc_limit_db(): PDO
+function mimir_bc_limit_env_dir(string $environment): string
 {
-    $path = mimir_bc_limit_db_path();
-    $restoreUmask = false;
-    $previousUmask = 0;
-    if ($path !== ':memory:') {
-        $previousUmask = umask(0);
-        $restoreUmask = true;
-        $dir = dirname($path);
-        if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
-            umask($previousUmask);
-            throw new RuntimeException('BC-limit datamap kon niet worden aangemaakt: ' . $dir);
-        }
-        mimir_db_relax_perms($path);
-    }
-
-    if (!isset($GLOBALS['mimir_bc_limit_pdo_cache']) || !is_array($GLOBALS['mimir_bc_limit_pdo_cache'])) {
-        $GLOBALS['mimir_bc_limit_pdo_cache'] = [];
-    }
-    $cache = &$GLOBALS['mimir_bc_limit_pdo_cache'];
-    if (isset($cache[$path]) && $cache[$path] instanceof PDO) {
-        if ($restoreUmask) {
-            umask($previousUmask);
-        }
-
-        return $cache[$path];
-    }
-
-    try {
-        $pdo = new PDO('sqlite:' . $path, null, null, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        ]);
-        $pdo->exec('PRAGMA busy_timeout = ' . (int) MIMIR_SQLITE_BUSY_TIMEOUT_MS);
-        if ($path !== ':memory:') {
-            $pdo->exec('PRAGMA journal_mode = WAL');
-            mimir_db_relax_perms($path);
-            mimir_db_track_path($path);
-        }
-        mimir_bc_limit_migrate($pdo);
-        $cache[$path] = $pdo;
-
-        return $pdo;
-    } finally {
-        if ($restoreUmask) {
-            umask($previousUmask);
-        }
-    }
+    return rtrim(mimir_bc_limit_dir(), '/') . '/' . mimir_bc_limit_env_key($environment);
 }
 
 /**
- * Test helper: drop cached PDO so a new path/overrides take effect.
+ * Eén exclusive lock gedeeld door iedereen die de slotbestanden niet kan
+ * openen. Per environment, zodat NL en Germany elkaar niet afknijpen.
  */
-function mimir_bc_limit_reset_db_cache(): void
+function mimir_bc_limit_fallback_path(string $environment): string
 {
-    $GLOBALS['mimir_bc_limit_pdo_cache'] = [];
+    if (
+        isset($GLOBALS['mimir_bc_limit_fallback_path'])
+        && is_string($GLOBALS['mimir_bc_limit_fallback_path'])
+        && $GLOBALS['mimir_bc_limit_fallback_path'] !== ''
+    ) {
+        return $GLOBALS['mimir_bc_limit_fallback_path'];
+    }
+
+    return rtrim(sys_get_temp_dir(), '/') . '/mimir-bc-slot-' . mimir_bc_limit_env_key($environment) . '.lock';
 }
 
-function mimir_bc_limit_migrate(PDO $pdo): void
+function mimir_bc_limit_ensure_dir(string $dir): bool
 {
-    $pdo->exec(
-        'CREATE TABLE IF NOT EXISTS bc_holders (
-            environment TEXT NOT NULL,
-            holder_id TEXT NOT NULL,
-            acquired_at INTEGER NOT NULL,
-            PRIMARY KEY (environment, holder_id)
-        )'
-    );
-    $pdo->exec(
-        'CREATE TABLE IF NOT EXISTS bc_waiters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            environment TEXT NOT NULL,
-            waiter_id TEXT NOT NULL,
-            enqueued_at REAL NOT NULL
-        )'
-    );
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_bc_waiters_env ON bc_waiters(environment, id)');
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_bc_holders_env ON bc_holders(environment)');
+    if (is_dir($dir)) {
+        return true;
+    }
+    $previous = umask(0);
+    $created = @mkdir($dir, 0777, true);
+    umask($previous);
+
+    return $created || is_dir($dir);
 }
 
-function mimir_bc_limit_cleanup_stale(PDO $pdo, string $environment): void
+/**
+ * @return resource|null
+ */
+function mimir_bc_limit_open_lock_file(string $path)
 {
-    $holderCutoff = time() - MIMIR_BC_SLOT_STALE_SECONDS;
-    $pdo->prepare('DELETE FROM bc_holders WHERE environment = :e AND acquired_at < :c')
-        ->execute([':e' => $environment, ':c' => $holderCutoff]);
+    $previous = umask(0);
+    $handle = @fopen($path, 'c');
+    umask($previous);
+    if ($handle === false) {
+        return null;
+    }
+    // Apache (www-data) en CLI moeten dezelfde lockbestanden kunnen openen.
+    @chmod($path, 0666);
 
-    // Zelfde klok als enqueued_at (mimir_bc_limit_now). Een dode kop anders
-    // blokkeert elke latere acquire, ook als er geen holders meer zijn.
-    $waiterCutoff = sprintf('%.6F', mimir_bc_limit_now() - mimir_bc_limit_waiter_stale_seconds());
-    $pdo->prepare('DELETE FROM bc_waiters WHERE environment = :e AND enqueued_at < :c')
-        ->execute([':e' => $environment, ':c' => $waiterCutoff]);
+    return $handle;
 }
 
-function mimir_bc_limit_throw_timeout(string $environment, int $waitSeconds, int $max): never
+/**
+ * @param resource|null $handle
+ */
+function mimir_bc_limit_close_handle($handle): void
+{
+    if (!is_resource($handle)) {
+        return;
+    }
+    @flock($handle, LOCK_UN);
+    @fclose($handle);
+}
+
+function mimir_bc_limit_throw_timeout(string $environment, int $waitSeconds, int $max): void
 {
     $message = 'BC-concurrency limiet bereikt voor environment ' . $environment
         . ': wachttijd van ' . $waitSeconds . 's overschreden (max '
         . $max . ' gelijktijdige live-requests). Probeer het later opnieuw.';
-    if (class_exists('MimirUserException')) {
+    if (class_exists('MimirUserException', false)) {
         throw new MimirUserException($message, 503);
     }
     throw new RuntimeException($message, 503);
 }
 
+function mimir_bc_limit_throw_unavailable(string $environment): void
+{
+    $message = 'BC-slotcoördinatie niet beschikbaar voor environment ' . $environment
+        . '; live BC wordt niet ongelimiteerd doorgelaten.';
+    if (class_exists('MimirUserException', false)) {
+        throw new MimirUserException($message, 503);
+    }
+    throw new RuntimeException($message, 503);
+}
+
+function mimir_bc_limit_log_fallback(string $environment): void
+{
+    if (!isset($GLOBALS['mimir_bc_limit_fallback_logged']) || !is_array($GLOBALS['mimir_bc_limit_fallback_logged'])) {
+        $GLOBALS['mimir_bc_limit_fallback_logged'] = [];
+    }
+    if (isset($GLOBALS['mimir_bc_limit_fallback_logged'][$environment])) {
+        return;
+    }
+    $GLOBALS['mimir_bc_limit_fallback_logged'][$environment] = true;
+    if (!function_exists('mimir_event_log')) {
+        return;
+    }
+    mimir_event_log(
+        'bc-limit',
+        'BC-slotbestanden niet bruikbaar; exclusieve flock met 1 slot zodat live BC niet ongelimiteerd doorgaat.',
+        $environment,
+        '',
+        'fallback-one-slot'
+    );
+}
+
 /**
- * Neemt één BC-slot voor $environment (FIFO). Herhaaldelijk binnen dezelfde
- * request/process is reentrant (refcount); alleen de eerste acquire wacht.
+ * @return array{handles: list<resource>, fallback: bool}|null
+ */
+function mimir_bc_limit_open_slot_handles(string $environment, int $max): ?array
+{
+    $dir = mimir_bc_limit_env_dir($environment);
+    if (!mimir_bc_limit_ensure_dir($dir)) {
+        return null;
+    }
+    $handles = [];
+    for ($i = 0; $i < $max; $i++) {
+        $handle = mimir_bc_limit_open_lock_file($dir . '/slot-' . $i);
+        if ($handle === null) {
+            foreach ($handles as $opened) {
+                mimir_bc_limit_close_handle($opened);
+            }
+
+            return null;
+        }
+        $handles[] = $handle;
+    }
+
+    return ['handles' => $handles, 'fallback' => false];
+}
+
+/**
+ * @return array{handles: list<resource>, fallback: bool}
+ */
+function mimir_bc_limit_open_candidates(string $environment, int $max): array
+{
+    $forceFallback = !empty($GLOBALS['mimir_bc_limit_force_fallback']);
+    if (!$forceFallback) {
+        $slots = mimir_bc_limit_open_slot_handles($environment, $max);
+        if ($slots !== null) {
+            return $slots;
+        }
+    }
+
+    $handle = mimir_bc_limit_open_lock_file(mimir_bc_limit_fallback_path($environment));
+    if ($handle === null) {
+        mimir_bc_limit_throw_unavailable($environment);
+        throw new RuntimeException('BC-slotcoördinatie niet beschikbaar.');
+    }
+    mimir_bc_limit_log_fallback($environment);
+
+    return ['handles' => [$handle], 'fallback' => true];
+}
+
+/**
+ * Eerste vrije exclusive lock, of timeout. Niet-winnaars worden gesloten
+ * zodat dit proces niet per ongeluk extra slots vasthoudt.
+ *
+ * @param list<resource> $handles
+ * @return array{handle: resource, slot: int}
+ */
+function mimir_bc_limit_wait_lock(array $handles, float $deadline, string $environment, int $max, int $waitSeconds): array
+{
+    $count = count($handles);
+    if ($count < 1) {
+        mimir_bc_limit_throw_unavailable($environment);
+    }
+    try {
+        $start = random_int(0, $count - 1);
+    } catch (Throwable) {
+        $start = 0;
+    }
+    $winner = null;
+    try {
+        while ($winner === null) {
+            for ($step = 0; $step < $count; $step++) {
+                $index = ($start + $step) % $count;
+                $handle = $handles[$index];
+                if (is_resource($handle) && @flock($handle, LOCK_EX | LOCK_NB)) {
+                    $winner = ['handle' => $handle, 'slot' => $index];
+                    break;
+                }
+            }
+            if ($winner !== null) {
+                break;
+            }
+            if (mimir_bc_limit_now() >= $deadline) {
+                mimir_bc_limit_throw_timeout($environment, $waitSeconds, $max);
+            }
+            $start = ($start + 1) % $count;
+            mimir_bc_limit_sleep(MIMIR_BC_LIMIT_POLL_US);
+        }
+    } finally {
+        foreach ($handles as $handle) {
+            if ($winner !== null && $handle === $winner['handle']) {
+                continue;
+            }
+            if (is_resource($handle)) {
+                @fclose($handle);
+            }
+        }
+    }
+    if ($winner === null) {
+        mimir_bc_limit_throw_unavailable($environment);
+    }
+
+    return $winner;
+}
+
+function mimir_bc_limit_file_locked(string $path): bool
+{
+    if ($path === '' || !is_file($path)) {
+        return false;
+    }
+    $handle = @fopen($path, 'c');
+    if ($handle === false) {
+        return true;
+    }
+    $got = @flock($handle, LOCK_EX | LOCK_NB);
+    if ($got) {
+        @flock($handle, LOCK_UN);
+        @fclose($handle);
+
+        return false;
+    }
+    @fclose($handle);
+
+    return true;
+}
+
+/**
+ * Neemt één BC-slot voor $environment. Herhaaldelijk binnen hetzelfde
+ * proces is reentrant (refcount); alleen de eerste acquire wacht.
  *
  * @return int milliseconden gewacht vóór het slot (0 bij directe toekenning of nest)
  */
@@ -242,133 +359,37 @@ function mimir_bc_slot_acquire(string $environment): int
 
     $max = mimir_bc_limit_max_concurrent();
     $waitSeconds = mimir_bc_limit_queue_wait_seconds();
-    try {
-        $pdo = mimir_bc_limit_db();
-    } catch (Throwable $error) {
-        if (mimir_is_storage_failure($error)) {
-            mimir_event_log('sqlite', 'BC-limietdatabase niet bruikbaar; live-call zonder slot. ' . $error->getMessage(), $environment, '', 'bypassed-to-BC');
-            $GLOBALS['mimir_bc_held'][$environment] = [
-                'refs' => 1,
-                'holder_id' => '',
-                'wait_ms' => 0,
-                'untracked' => true,
-            ];
-
-            return 0;
-        }
-        throw $error;
-    }
-    $holderId = mimir_bc_limit_new_id();
-    $waiterId = mimir_bc_limit_new_id();
     $started = mimir_bc_limit_now();
     $deadline = $started + $waitSeconds;
+    $candidates = mimir_bc_limit_open_candidates($environment, $max);
+    $effectiveMax = $candidates['fallback'] ? 1 : $max;
+    $winner = mimir_bc_limit_wait_lock(
+        $candidates['handles'],
+        $deadline,
+        $environment,
+        $effectiveMax,
+        $waitSeconds
+    );
+    $waitMs = (int) max(0, (int) round((mimir_bc_limit_now() - $started) * 1000));
+    $GLOBALS['mimir_bc_held'][$environment] = [
+        'refs' => 1,
+        'handle' => $winner['handle'],
+        'slot' => $winner['slot'],
+        'wait_ms' => $waitMs,
+        'fallback' => $candidates['fallback'],
+    ];
+    mimir_bc_limit_register_shutdown_release();
 
-    $waiterRowId = 0;
-    $acquired = false;
-
-    try {
-        $ins = $pdo->prepare(
-            'INSERT INTO bc_waiters (environment, waiter_id, enqueued_at) VALUES (:e, :w, :t)'
-        );
-        $ins->execute([':e' => $environment, ':w' => $waiterId, ':t' => $started]);
-        $waiterRowId = (int) $pdo->lastInsertId();
-
-        while (true) {
-            mimir_bc_limit_cleanup_stale($pdo, $environment);
-
-            try {
-                $pdo->exec('BEGIN IMMEDIATE');
-            } catch (PDOException $error) {
-                if (mimir_sqlite_is_transient($error)) {
-                    mimir_bc_limit_sleep(MIMIR_BC_LIMIT_POLL_US);
-                    if (mimir_bc_limit_now() >= $deadline) {
-                        mimir_bc_limit_throw_timeout($environment, $waitSeconds, $max);
-                    }
-                    continue;
-                }
-                throw $error;
-            }
-            try {
-                $countStmt = $pdo->prepare('SELECT COUNT(*) FROM bc_holders WHERE environment = :e');
-                $countStmt->execute([':e' => $environment]);
-                $held = (int) $countStmt->fetchColumn();
-
-                $headStmt = $pdo->prepare(
-                    'SELECT id FROM bc_waiters WHERE environment = :e ORDER BY id ASC LIMIT 1'
-                );
-                $headStmt->execute([':e' => $environment]);
-                $headId = $headStmt->fetchColumn();
-
-                if ($held < $max && (int) $headId === $waiterRowId) {
-                    $pdo->prepare('DELETE FROM bc_waiters WHERE id = :id')->execute([':id' => $waiterRowId]);
-                    $pdo->prepare(
-                        'INSERT INTO bc_holders (environment, holder_id, acquired_at)
-                         VALUES (:e, :h, :t)'
-                    )->execute([
-                        ':e' => $environment,
-                        ':h' => $holderId,
-                        ':t' => time(),
-                    ]);
-                    $pdo->exec('COMMIT');
-                    $acquired = true;
-                    $waitMs = (int) max(0, (int) round((mimir_bc_limit_now() - $started) * 1000));
-                    $GLOBALS['mimir_bc_held'][$environment] = [
-                        'refs' => 1,
-                        'holder_id' => $holderId,
-                        'wait_ms' => $waitMs,
-                    ];
-                    mimir_bc_limit_register_shutdown_release();
-
-                    return $waitMs;
-                }
-                $pdo->exec('COMMIT');
-            } catch (Throwable $error) {
-                try {
-                    $pdo->exec('ROLLBACK');
-                } catch (Throwable) {
-                }
-                throw $error;
-            }
-
-            if (mimir_bc_limit_now() >= $deadline) {
-                $pdo->prepare('DELETE FROM bc_waiters WHERE id = :id')->execute([':id' => $waiterRowId]);
-                mimir_bc_limit_throw_timeout($environment, $waitSeconds, $max);
-            }
-
-            mimir_bc_limit_sleep(MIMIR_BC_LIMIT_POLL_US);
-        }
-    } catch (Throwable $error) {
-        if (!$acquired && $waiterRowId > 0) {
-            try {
-                $pdo->prepare('DELETE FROM bc_waiters WHERE id = :id')->execute([':id' => $waiterRowId]);
-            } catch (Throwable) {
-            }
-        }
-        try {
-            if ($pdo->inTransaction()) {
-                $pdo->exec('ROLLBACK');
-            }
-        } catch (Throwable) {
-        }
-        if (mimir_is_storage_failure($error)) {
-            mimir_event_log('sqlite', 'BC-limietdatabase niet bruikbaar; live-call zonder slot. ' . $error->getMessage(), $environment, '', 'bypassed-to-BC');
-            $GLOBALS['mimir_bc_held'][$environment] = [
-                'refs' => 1,
-                'holder_id' => '',
-                'wait_ms' => 0,
-                'untracked' => true,
-            ];
-
-            return 0;
-        }
-        throw $error;
-    }
+    return $waitMs;
 }
 
 function mimir_bc_slot_release(string $environment): void
 {
     $environment = trim($environment);
-    if ($environment === '' || !isset($GLOBALS['mimir_bc_held'][$environment])) {
+    if ($environment === '' || !isset($GLOBALS['mimir_bc_held']) || !is_array($GLOBALS['mimir_bc_held'])) {
+        return;
+    }
+    if (!isset($GLOBALS['mimir_bc_held'][$environment]) || !is_array($GLOBALS['mimir_bc_held'][$environment])) {
         return;
     }
 
@@ -377,26 +398,14 @@ function mimir_bc_slot_release(string $environment): void
         return;
     }
 
-    $untracked = !empty($GLOBALS['mimir_bc_held'][$environment]['untracked']);
-    $holderId = (string) $GLOBALS['mimir_bc_held'][$environment]['holder_id'];
+    $handle = $GLOBALS['mimir_bc_held'][$environment]['handle'] ?? null;
     unset($GLOBALS['mimir_bc_held'][$environment]);
-    if ($untracked || $holderId === '') {
-        return;
-    }
-
-    try {
-        $pdo = mimir_bc_limit_db();
-        $stmt = $pdo->prepare(
-            'DELETE FROM bc_holders WHERE environment = :e AND holder_id = :h'
-        );
-        $stmt->execute([':e' => $environment, ':h' => $holderId]);
-    } catch (Throwable) {
-        // Slot vrijgeven mag een response niet breken; stale cleanup ruimt op.
-    }
+    mimir_bc_limit_close_handle($handle);
 }
 
 /**
- * Aantal actieve houders voor een environment (andere workers inbegrepen).
+ * Aantal bezette slots voor een environment (andere workers inbegrepen).
+ * Telt locks, niet een tabel: een gestorven proces telt niet meer mee.
  */
 function mimir_bc_slots_used(string $environment): int
 {
@@ -404,16 +413,39 @@ function mimir_bc_slots_used(string $environment): int
     if ($environment === '') {
         return 0;
     }
-    try {
-        $pdo = mimir_bc_limit_db();
-        mimir_bc_limit_cleanup_stale($pdo, $environment);
-        $stmt = $pdo->prepare('SELECT COUNT(*) FROM bc_holders WHERE environment = :e');
-        $stmt->execute([':e' => $environment]);
 
-        return (int) $stmt->fetchColumn();
-    } catch (Throwable) {
-        return 0;
+    $fallback = !empty($GLOBALS['mimir_bc_limit_force_fallback']);
+    if (!$fallback && isset($GLOBALS['mimir_bc_held'][$environment]['fallback'])) {
+        $fallback = !empty($GLOBALS['mimir_bc_held'][$environment]['fallback']);
     }
+    if (!$fallback && isset($GLOBALS['mimir_bc_foreign']) && is_array($GLOBALS['mimir_bc_foreign'])) {
+        foreach ($GLOBALS['mimir_bc_foreign'] as $info) {
+            if (!is_array($info)) {
+                continue;
+            }
+            if (($info['environment'] ?? '') === $environment && !empty($info['fallback'])) {
+                $fallback = true;
+                break;
+            }
+        }
+    }
+    if (!$fallback && !is_dir(mimir_bc_limit_env_dir($environment))) {
+        $fallback = is_file(mimir_bc_limit_fallback_path($environment));
+    }
+    if ($fallback) {
+        return mimir_bc_limit_file_locked(mimir_bc_limit_fallback_path($environment)) ? 1 : 0;
+    }
+
+    $dir = mimir_bc_limit_env_dir($environment);
+    $max = mimir_bc_limit_max_concurrent();
+    $used = 0;
+    for ($i = 0; $i < $max; $i++) {
+        if (mimir_bc_limit_file_locked($dir . '/slot-' . $i)) {
+            $used++;
+        }
+    }
+
+    return $used;
 }
 
 /**
@@ -435,6 +467,7 @@ function mimir_bc_with_slot(string $environment, callable $fn): mixed
  * Eenmalig per proces: als finally niet liep (timeout/OOM/deploy), geef
  * wat dit proces nog vasthoudt alsnog vrij. Normale release blijft primair.
  * Idempotent en slikt fouten — een response mag hier niet op stuklopen.
+ * De kernel laat de flock ook vallen als dit proces sterft vóór shutdown.
  */
 function mimir_bc_limit_register_shutdown_release(): void
 {
@@ -478,55 +511,81 @@ function mimir_bc_limit_shutdown_release(): void
  * Test/sim: zet een "vreemde" houder zonder process-lokale refcount
  * (alsof een andere Apache-worker het slot heeft).
  */
-function mimir_bc_slot_force_hold(string $environment, string $holderId, ?int $acquiredAt = null): void
+function mimir_bc_slot_force_hold(string $environment, string $holderId): void
 {
-    $pdo = mimir_bc_limit_db();
-    $pdo->prepare(
-        'INSERT OR REPLACE INTO bc_holders (environment, holder_id, acquired_at)
-         VALUES (:e, :h, :t)'
-    )->execute([
-        ':e' => trim($environment),
-        ':h' => $holderId,
-        ':t' => $acquiredAt ?? time(),
-    ]);
-}
+    $environment = trim($environment);
+    $holderId = trim($holderId);
+    if ($environment === '' || $holderId === '') {
+        throw new InvalidArgumentException('environment en holderId zijn verplicht.');
+    }
+    if (!isset($GLOBALS['mimir_bc_foreign']) || !is_array($GLOBALS['mimir_bc_foreign'])) {
+        $GLOBALS['mimir_bc_foreign'] = [];
+    }
+    $key = $environment . "\0" . $holderId;
+    if (isset($GLOBALS['mimir_bc_foreign'][$key])) {
+        return;
+    }
 
-/**
- * Test/sim: zet een vreemde waiter (alsof een andere worker in de wachtrij staat).
- */
-function mimir_bc_slot_force_wait(string $environment, string $waiterId, ?float $enqueuedAt = null): void
-{
-    $pdo = mimir_bc_limit_db();
-    $pdo->prepare(
-        'INSERT INTO bc_waiters (environment, waiter_id, enqueued_at) VALUES (:e, :w, :t)'
-    )->execute([
-        ':e' => trim($environment),
-        ':w' => $waiterId,
-        ':t' => $enqueuedAt ?? mimir_bc_limit_now(),
-    ]);
+    $max = mimir_bc_limit_max_concurrent();
+    $candidates = mimir_bc_limit_open_candidates($environment, $max);
+    $winner = null;
+    foreach ($candidates['handles'] as $index => $handle) {
+        if (is_resource($handle) && @flock($handle, LOCK_EX | LOCK_NB)) {
+            $winner = ['handle' => $handle, 'slot' => $index];
+            break;
+        }
+    }
+    foreach ($candidates['handles'] as $handle) {
+        if ($winner !== null && $handle === $winner['handle']) {
+            continue;
+        }
+        if (is_resource($handle)) {
+            @fclose($handle);
+        }
+    }
+    if ($winner === null) {
+        throw new RuntimeException('Geen vrij BC-slot voor force_hold.');
+    }
+    $GLOBALS['mimir_bc_foreign'][$key] = [
+        'environment' => $environment,
+        'handle' => $winner['handle'],
+        'fallback' => $candidates['fallback'],
+    ];
 }
 
 function mimir_bc_slot_force_release(string $environment, string $holderId): void
 {
-    $pdo = mimir_bc_limit_db();
-    $pdo->prepare(
-        'DELETE FROM bc_holders WHERE environment = :e AND holder_id = :h'
-    )->execute([
-        ':e' => trim($environment),
-        ':h' => $holderId,
-    ]);
+    $key = trim($environment) . "\0" . trim($holderId);
+    if (!isset($GLOBALS['mimir_bc_foreign']) || !is_array($GLOBALS['mimir_bc_foreign'])) {
+        return;
+    }
+    if (!isset($GLOBALS['mimir_bc_foreign'][$key]) || !is_array($GLOBALS['mimir_bc_foreign'][$key])) {
+        return;
+    }
+    $handle = $GLOBALS['mimir_bc_foreign'][$key]['handle'] ?? null;
+    unset($GLOBALS['mimir_bc_foreign'][$key]);
+    mimir_bc_limit_close_handle($handle);
 }
 
 /**
- * Leegt limiet-tabellen en process-state (alleen voor tests).
+ * Sluit locks en wist process-state (alleen voor tests).
  */
 function mimir_bc_limit_test_reset(): void
 {
-    $GLOBALS['mimir_bc_held'] = [];
-    try {
-        $pdo = mimir_bc_limit_db();
-        $pdo->exec('DELETE FROM bc_holders');
-        $pdo->exec('DELETE FROM bc_waiters');
-    } catch (Throwable) {
+    if (isset($GLOBALS['mimir_bc_held']) && is_array($GLOBALS['mimir_bc_held'])) {
+        foreach ($GLOBALS['mimir_bc_held'] as $info) {
+            if (is_array($info)) {
+                mimir_bc_limit_close_handle($info['handle'] ?? null);
+            }
+        }
     }
+    $GLOBALS['mimir_bc_held'] = [];
+    if (isset($GLOBALS['mimir_bc_foreign']) && is_array($GLOBALS['mimir_bc_foreign'])) {
+        foreach ($GLOBALS['mimir_bc_foreign'] as $info) {
+            if (is_array($info)) {
+                mimir_bc_limit_close_handle($info['handle'] ?? null);
+            }
+        }
+    }
+    $GLOBALS['mimir_bc_foreign'] = [];
 }

@@ -6,6 +6,7 @@ web/cache/*
 web/data/*.sqlite
 web/data/*.sqlite-*
 web/data/*.db
+web/data/bc_slots/
 web/data/*.jsonl
 web/data/*.jsonl.*
 web/data/mimir-circuit.json

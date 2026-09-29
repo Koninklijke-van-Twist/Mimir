@@ -38,9 +38,6 @@ register_shutdown_function(static function () use (&$pdo): void {
         $pdo = null;
     }
     mimir_db_relax_perms(mimir_db_path());
-    if (function_exists('mimir_bc_limit_db_path')) {
-        mimir_db_relax_perms(mimir_bc_limit_db_path());
-    }
 });
 
 try {

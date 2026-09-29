@@ -343,7 +343,7 @@ components:
         filter_batches: { type: integer }
         queue_wait_ms:
           type: integer
-          description: Milliseconden gewacht op een BC-concurrency-slot (0 als geen wachtrij of volledig uit cache)
+          description: Milliseconden gewacht op een BC-concurrency-slot (0 als het slot direct vrij was of het antwoord volledig uit cache komt)
         bc_slots_used:
           type: integer
           description: Actieve BC-slots voor dit environment op het moment van de response (0 bij pure cache)
