@@ -282,6 +282,69 @@ function mimir_bool_value(mixed $value): ?bool
 }
 
 /**
+ * Eenvoudige vergelijking: Field eq true|false of Field eq 'literal'.
+ * Haakjes om het geheel mogen. Alles met and/or/functies blijft null.
+ *
+ * @return array{field: string, op: string, value: bool|string, type: string}|null
+ */
+function mimir_filter_parse_simple_eq(string $filter): ?array
+{
+    $text = trim($filter);
+    for ($depth = 0; $depth < 4; $depth++) {
+        $parsed = mimir_filter_parse_simple_eq_leaf($text);
+        if ($parsed !== null) {
+            return $parsed;
+        }
+        if (preg_match('/^\(\s*(.+)\s*\)$/s', $text, $wrapped) !== 1) {
+            return null;
+        }
+        $inner = trim($wrapped[1]);
+        if ($inner === '' || $inner === $text) {
+            return null;
+        }
+        $text = $inner;
+    }
+
+    return mimir_filter_parse_simple_eq_leaf($text);
+}
+
+/**
+ * @return array{field: string, op: string, value: bool|string, type: string}|null
+ */
+function mimir_filter_parse_simple_eq_leaf(string $text): ?array
+{
+    if (preg_match('/^([A-Za-z_][A-Za-z0-9_.]*)\s+eq\s+true$/i', $text, $match) === 1) {
+        return ['field' => $match[1], 'op' => 'eq', 'value' => true, 'type' => 'Edm.Boolean'];
+    }
+    if (preg_match('/^([A-Za-z_][A-Za-z0-9_.]*)\s+eq\s+false$/i', $text, $match) === 1) {
+        return ['field' => $match[1], 'op' => 'eq', 'value' => false, 'type' => 'Edm.Boolean'];
+    }
+    if (preg_match("/^([A-Za-z_][A-Za-z0-9_.]*)\\s+eq\\s+'((?:[^']|'')*)'$/i", $text, $match) === 1) {
+        return [
+            'field' => $match[1],
+            'op' => 'eq',
+            'value' => str_replace("''", "'", $match[2]),
+            'type' => 'Edm.String',
+        ];
+    }
+
+    return null;
+}
+
+/**
+ * Coverage-serve is alleen veilig als we het filter lokaal kunnen toepassen.
+ * Een ongeparseerde $filter-string moet live naar BC (die heeft al gefilterd).
+ */
+function mimir_filter_coverage_servable(mixed $filter): bool
+{
+    if (!is_string($filter)) {
+        return true;
+    }
+
+    return mimir_filter_parse_simple_eq($filter) !== null;
+}
+
+/**
  * @param array<string, mixed> $row
  * @param array<string, string> $types
  */
@@ -290,9 +353,19 @@ function mimir_filter_match(array $row, mixed $filter, array $types = []): bool
     if ($filter === null) {
         return true;
     }
-    // Opaque OData $filter-string: BC heeft al gefilterd.
     if (is_string($filter)) {
-        return true;
+        $parsed = mimir_filter_parse_simple_eq($filter);
+        if ($parsed === null) {
+            // Complexe string: BC heeft gefilterd. Niet gebruiken op een gedeelde cache.
+            return true;
+        }
+        $type = (string) ($types[$parsed['field']] ?? $parsed['type']);
+        if ($parsed['type'] === 'Edm.Boolean' && !str_contains(strtolower($type), 'boolean')) {
+            $type = 'Edm.Boolean';
+        }
+        $actual = array_key_exists($parsed['field'], $row) ? $row[$parsed['field']] : null;
+
+        return mimir_filter_compare($actual, 'eq', $parsed['value'], $type);
     }
     if (!is_array($filter)) {
         return false;
@@ -531,7 +604,9 @@ function mimir_filter_note(string $mode): ?string
 }
 
 /**
- * Opaque OData $filter strings cannot be applied locally.
+ * Lege-filterdekking (hele tabel) alleen als het filter lokaal volledig toepasbaar is.
+ * $filter-strings blijven daar buiten: ook een eenvoudige eq mag die brede dekking
+ * niet stilletjes overnemen. Exacte filter_sig-dekking gaat via mimir_filter_coverage_servable.
  */
 function mimir_filter_allows_local(mixed $filter): bool
 {

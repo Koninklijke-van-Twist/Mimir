@@ -9,7 +9,6 @@ require_once __DIR__ . '/mimir_heatmap.php';
 require_once __DIR__ . '/mimir_bc_limit.php';
 
 const MIMIR_UI_MAX_AGE = 600;
-const MIMIR_ODATA_PAGE_SIZE = 2000;
 const MIMIR_DEFAULT_MAX_AGE = 3600;
 const MIMIR_MAX_MAX_AGE = 31536000;
 const MIMIR_DEFAULT_TOP = 100;
@@ -562,28 +561,78 @@ function mimir_meta_put(PDO $pdo, string $key, array $payload, int $now): void
 }
 
 /**
+ * Unie van oude en nieuwe payload.
+ * Sleutels in de nieuwe payload overschrijven, ook als de waarde null is
+ * (BC heeft het veld dan echt leeg gemaakt). Sleutels die alleen in de oude
+ * payload staan blijven staan: een smallere $select laat ze weg, die wist ze niet.
+ *
+ * @param array<string, mixed> $old
+ * @param array<string, mixed> $new
+ * @return array<string, mixed>
+ */
+function mimir_cache_merge_payload(array $old, array $new): array
+{
+    $merged = $old;
+    foreach ($new as $key => $value) {
+        if (!is_string($key)) {
+            continue;
+        }
+        $merged[$key] = $value;
+    }
+
+    return $merged;
+}
+
+/**
  * @param array<string, mixed> $payload
  */
 function mimir_cache_upsert(PDO $pdo, string $environment, string $company, string $entity, string $rowKey, array $payload, int $fetchedAt): void
 {
-    $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    if ($json === false) {
-        throw new RuntimeException('Rij kon niet worden gecachet.');
-    }
-    mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $rowKey, $json, $fetchedAt): void {
-        $stmt = $pdo->prepare(
-            'INSERT INTO cache_rows (environment, company, entity, row_key, payload, fetched_at)
-             VALUES (:environment, :company, :entity, :row_key, :payload, :at)
-             ON CONFLICT(environment, company, entity, row_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
-        );
-        $stmt->execute([
-            ':environment' => $environment,
-            ':company' => $company,
-            ':entity' => $entity,
-            ':row_key' => $rowKey,
-            ':payload' => $json,
-            ':at' => $fetchedAt,
-        ]);
+    mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $rowKey, $payload, $fetchedAt): void {
+        $pdo->beginTransaction();
+        try {
+            $select = $pdo->prepare(
+                'SELECT payload FROM cache_rows
+                 WHERE environment = :environment AND company = :company AND entity = :entity AND row_key = :row_key'
+            );
+            $select->execute([
+                ':environment' => $environment,
+                ':company' => $company,
+                ':entity' => $entity,
+                ':row_key' => $rowKey,
+            ]);
+            $existing = $select->fetchColumn();
+            $merged = $payload;
+            if (is_string($existing) && $existing !== '') {
+                $old = json_decode($existing, true);
+                if (is_array($old)) {
+                    $merged = mimir_cache_merge_payload($old, $payload);
+                }
+            }
+            $json = json_encode($merged, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            if ($json === false) {
+                throw new RuntimeException('Rij kon niet worden gecachet.');
+            }
+            $stmt = $pdo->prepare(
+                'INSERT INTO cache_rows (environment, company, entity, row_key, payload, fetched_at)
+                 VALUES (:environment, :company, :entity, :row_key, :payload, :at)
+                 ON CONFLICT(environment, company, entity, row_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
+            );
+            $stmt->execute([
+                ':environment' => $environment,
+                ':company' => $company,
+                ':entity' => $entity,
+                ':row_key' => $rowKey,
+                ':payload' => $json,
+                ':at' => $fetchedAt,
+            ]);
+            $pdo->commit();
+        } catch (Throwable $error) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $error;
+        }
     });
 }
 
@@ -992,7 +1041,14 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $emptyFilterFetch = ($pushed === null);
     // Full-entity warms omit $select toward BC; filtered cold may still pass select.
     // Age-refresh non-shrink is preserved by omitting (or by mimir_select_for_bc_refresh when used).
+    $simpleEq = is_string($filter) ? mimir_filter_parse_simple_eq($filter) : null;
     $fetchSelect = mimir_select_for_bc($select, $onFile, $emptyFilterFetch);
+    // Cold $select moet het eenvoudige string-veld meenemen, anders kan de lokale
+    // hercontrole (Open eq true e.d.) het veld niet zien.
+    if ($simpleEq !== null && $fetchSelect !== []) {
+        $fetchSelect[] = $simpleEq['field'];
+        $fetchSelect = array_values(array_unique($fetchSelect));
+    }
     $fetchSelectSig = mimir_select_sig($fetchSelect);
     $keyId = array_key_exists('key_id', $job) && $job['key_id'] !== null && $job['key_id'] !== ''
         ? (int) $job['key_id']
@@ -1031,7 +1087,9 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $gapFilled = false;
     $gapSharedKeyId = null;
 
-    if ($coverage !== null) {
+    // Ongeparseerde $filter-strings niet uit de gedeelde rijcache serveren:
+    // mimir_filter_match kan die niet bewijzen, en latere upserts lekken dan mee.
+    if ($coverage !== null && mimir_filter_coverage_servable($filter)) {
         $served = mimir_serve_from_coverage(
             $pdo,
             $environment,
@@ -1112,7 +1170,8 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                     $fetch,
                     $now,
                     false,
-                    $keyId
+                    $keyId,
+                    $top
                 );
                 if ($live['mode'] === 'local') {
                     $mode = 'local';
@@ -1159,7 +1218,8 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                 $fetch,
                 $now,
                 true,
-                $keyId
+                $keyId,
+                $top
             );
             $mode = $live['mode'];
             $pushed = $live['pushed'];
@@ -1429,7 +1489,8 @@ function mimir_try_range_gap_fill(
             $fetch,
             $now,
             true,
-            $keyId
+            $keyId,
+            0
         );
         $liveMode = $live['mode'];
         $lastPushed = $live['pushed'];
@@ -1609,6 +1670,10 @@ function mimir_refresh_whole_row(
         throw new RuntimeException('Sleutel-verzoek gaf een lijst terug in plaats van één rij.');
     }
     $fresh = mimir_strip_odata_noise($decoded);
+    // Eerst mergen, daarna alleen ontbrekende verplichte kolommen op null zetten.
+    // Null vóór de merge zou een weggelaten veld (smallere response) als expliciete
+    // null de cache in duwen en de oude waarde wissen.
+    $fresh = mimir_cache_merge_payload($payload, $fresh);
     foreach ($required as $column) {
         if (!array_key_exists($column, $fresh)) {
             $fresh[$column] = null;
@@ -1653,10 +1718,23 @@ function mimir_fetch_collection(
     callable $fetch,
     int $now,
     bool $writeCoverage = true,
-    ?int $keyId = null
+    ?int $keyId = null,
+    int $clientTop = 0
 ): array {
-    $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch): array {
-        $query = ['$top' => MIMIR_ODATA_PAGE_SIZE];
+    // $top alleen bij een eindig plafond van de aanroeper. top=0 (Mercurius: ongelimiteerd)
+    // krijgt geen $top: BC laat nextLink dan vaak weg, waardoor de set op één pagina blijft
+    // steken (productie: ledger op exact 2000). Pagina-grootte zit in Prefer: odata.maxpagesize
+    // op de HTTP-client. Negeert BC die header, dan pagineert de service alsnog via nextLink
+    // op de eigen Max Page Size — zonder $top is dat de volledige set. Geen $skip-fallback:
+    // BC ondersteunt client-paging daarmee niet betrouwbaar.
+    if ($clientTop < 0) {
+        $clientTop = 0;
+    }
+    $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch, $clientTop): array {
+        $query = [];
+        if ($clientTop > 0) {
+            $query['$top'] = $clientTop;
+        }
         if ($filterString !== null && $filterString !== '') {
             $query['$filter'] = $filterString;
         }
@@ -1666,7 +1744,7 @@ function mimir_fetch_collection(
             $query['$select'] = implode(',', $columns);
         }
         $url = mimir_collection_url($prefix, $company, $entity, $query);
-        return mimir_follow_pages($url, $prefix, $fetch);
+        return mimir_follow_pages($url, $prefix, $fetch, $clientTop);
     };
 
     try {
@@ -1736,7 +1814,7 @@ function mimir_fetch_collection(
  * @param callable(string): array $fetch
  * @return array{rows: list<array<string, mixed>>, truncated: bool}
  */
-function mimir_follow_pages(string $url, string $prefix, callable $fetch): array
+function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $clientTop = 0): array
 {
     $rows = [];
     $next = $url;
@@ -1759,6 +1837,12 @@ function mimir_follow_pages(string $url, string $prefix, callable $fetch): array
         $next = is_string($link) ? $link : '';
         $guard++;
         if ($next !== '' && $guard >= MIMIR_ODATA_PAGE_GUARD) {
+            $truncated = true;
+            break;
+        }
+        // Een gevuld $top-plafond is geen bewijs dat de set op is: BC laat nextLink
+        // vaak weg zodra $top gehaald is. Dekking schrijven we dan niet.
+        if ($clientTop > 0 && count($rows) >= $clientTop) {
             $truncated = true;
             break;
         }

@@ -499,7 +499,7 @@
           },
           {
             "type": "string",
-            "description": "Opaque OData $filter (gaat ongewijzigd naar BC; geen lokale match)",
+            "description": "OData $filter-string naar BC. Eenvoudige Field eq true/false of Field eq 'literal' wordt ook lokaal toegepast; complexere strings niet uit coverage.",
             "minLength": 1,
             "maxLength": 32768
           }
@@ -543,7 +543,7 @@
             "minimum": 0,
             "maximum": 10000,
             "default": 100,
-            "description": "0 = ongelimiteerd"
+            "description": "0 = ongelimiteerd (geen $top naar BC; nextLink + Prefer maxpagesize). Positief = $top-plafond."
           }
         }
       },

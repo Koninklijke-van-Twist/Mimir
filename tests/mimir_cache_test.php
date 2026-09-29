@@ -70,6 +70,7 @@ $pdo = mimir_db(':memory:');
 mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
     'No' => 'A',
     'Description' => 'Pomp',
+    'Name' => 'Acme',
 ], $now - 20);
 mimir_coverage_put($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', '', '*', $now - 20, 1);
 $calls = [];
@@ -88,6 +89,8 @@ if (!str_contains($calls[0], "ItemList(No='A')")) {
 }
 mimir_cache_same($refreshed['meta']['from_live'], 1, 'refreshed row counts as live');
 mimir_cache_same($refreshed['value'][0]['Inventory'], 9, 'inventory came from BC');
+$refreshedRows = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
+mimir_cache_same($refreshedRows[0]['payload']['Name'] ?? null, 'Acme', 'whole-row refresh keeps a field BC omitted');
 
 $pdo = mimir_db(':memory:');
 mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
@@ -270,5 +273,92 @@ if (!preg_match('/(\$select|%24select)=([^&]+)/', $calls[0], $m)) {
 $selectCols = explode(',', rawurldecode($m[2]));
 sort($selectCols);
 mimir_cache_same($selectCols, ['Description', 'No'], 'filtered cold $select matches request');
+
+// top=0 must not send $top (BC drops nextLink when $top is set). Finite top is a cap.
+$pdo = mimir_db(':memory:');
+$calls = [];
+$unlimited = mimir_query_entity($pdo, mimir_job([
+    'top' => 0,
+    'filter' => null,
+    'select' => ['No', 'Description'],
+]), function (string $url) use (&$calls): array {
+    $calls[] = $url;
+    if (str_contains($url, 'skiptoken')) {
+        return ['value' => [['No' => 'B', 'Description' => 'twee']]];
+    }
+    return [
+        'value' => [['No' => 'A', 'Description' => 'een']],
+        '@odata.nextLink' => 'https://bc.test/env/ODataV4/Company(\'KVT\')/ItemList?skiptoken=2',
+    ];
+}, $now);
+$decodedUnlimited = rawurldecode($calls[0]);
+if (str_contains($decodedUnlimited, '$top')) {
+    mimir_cache_fail('unlimited fetch must not send $top: ' . $calls[0]);
+}
+mimir_cache_same(count($calls), 2, 'unlimited still follows nextLink');
+mimir_cache_same(count($unlimited['value']), 2, 'unlimited keeps every page');
+
+$pdo = mimir_db(':memory:');
+$calls = [];
+mimir_query_entity($pdo, mimir_job([
+    'top' => 1,
+    'filter' => null,
+]), function (string $url) use (&$calls): array {
+    $calls[] = $url;
+    return ['value' => [['No' => 'A', 'Description' => 'een']]];
+}, $now);
+if (!str_contains(rawurldecode($calls[0]), '$top=1')) {
+    mimir_cache_fail('finite top must be sent as $top: ' . $calls[0]);
+}
+$capped = mimir_coverage_find($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', null, '*', 600, $now);
+mimir_cache_same($capped, null, 'a filled $top cap is not complete coverage');
+
+// Narrower later payload must not wipe Name.
+$pdo = mimir_db(':memory:');
+$key = mimir_row_key(['No' => 'A'], ['No']);
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', $key, [
+    'No' => 'A',
+    'Name' => 'Acme',
+    'Description' => 'Pomp',
+], $now - 10);
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', $key, [
+    'No' => 'A',
+    'Inventory' => 4,
+], $now - 5);
+$kept = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
+mimir_cache_same($kept[0]['payload']['Name'], 'Acme', 'omitted Name keeps the previous value');
+mimir_cache_same($kept[0]['payload']['Description'], 'Pomp', 'absent key stays');
+mimir_cache_same($kept[0]['payload']['Inventory'], 4, 'new key is merged');
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', $key, [
+    'No' => 'A',
+    'Name' => null,
+], $now);
+$merged = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
+mimir_cache_same(array_key_exists('Name', $merged[0]['payload']), true, 'explicit null keeps the Name key');
+mimir_cache_same($merged[0]['payload']['Name'], null, 'explicit null clears Name');
+mimir_cache_same($merged[0]['payload']['Description'], 'Pomp', 'clearing Name leaves Description');
+mimir_cache_same($merged[0]['payload']['Inventory'], 4, 'clearing Name leaves Inventory');
+mimir_cache_same($merged[0]['fetched_at'], $now, 'fetched_at moves to the latest upsert');
+
+$pdo = mimir_db(':memory:');
+mimir_query_entity($pdo, mimir_job([
+    'top' => 0,
+    'select' => ['No', 'Description'],
+    'max_age' => 600,
+]), function (string $url): array {
+    unset($url);
+    return ['value' => [['No' => 'A', 'Description' => 'Pomp', 'Name' => 'Acme']]];
+}, $now);
+mimir_query_entity($pdo, mimir_job([
+    'top' => 0,
+    'select' => ['No', 'Description'],
+    'max_age' => 600,
+]), function (string $url): array {
+    unset($url);
+    return ['value' => [['No' => 'A', 'Description' => 'Nieuw']]];
+}, $now + 1000);
+$afterNarrow = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
+mimir_cache_same($afterNarrow[0]['payload']['Name'] ?? null, 'Acme', 'refetch without Name keeps it');
+mimir_cache_same($afterNarrow[0]['payload']['Description'] ?? null, 'Nieuw', 'refetch overwrites Description');
 
 fwrite(STDOUT, "ok\n");

@@ -131,7 +131,7 @@ Komt er toch een 501 terug, dan haalt Mímir dezelfde set opnieuw op zonder `$fi
 
 Grote same-field OR-lijsten (JSON of eenvoudige `$filter`-string) batcht Mímir automatisch (40 per keer, korter bij te lange URL), zodat clients één query kunnen sturen.
 
-Paginering volgt `@odata.nextLink` tot de set klaar is (plafond 100 pagina's van 2000). Alleen een afgeronde set wordt als dekking bewaard.
+Paginering volgt `@odata.nextLink` tot de set klaar is (plafond 100 pagina's). Een ongelimiteerde fetch (`top: 0`) stuurt **geen** `$top` naar BC: `$top` is daar een totaalplafond en onderdrukt `nextLink`, waardoor grote sets (debiteuren, crediteuren) op 2000 rijen bleven steken. De pagina-grootte is `Prefer: odata.maxpagesize=2000` op de HTTP-client. Wijst BC die header af, dan dezelfde URL zonder Prefer; zonder `$top` pagineert BC alsnog via `nextLink` op de eigen Max Page Size. `$skip` gebruiken we niet. Een eindige `top` gaat wél als `$top` mee en telt niet als volledige dekking wanneer dat plafond vol is. Alleen een afgeronde set wordt als dekking bewaard.
 
 ## API-sleutels
 
@@ -183,8 +183,8 @@ Antwoord: `{ "value": [ … ], "meta": { "environment", "from_cache", "from_live
 
 ### Query-opties
 
-- **`filter`**: JSON-boom (`and` / `or` / `xor` + bladeren) zoals voorheen, **of** een niet-lege OData `$filter`-string. Een string gaat ongewijzigd naar BC (`filter_mode=bc`); lokaal matchen wordt overgeslagen. Maximale lengte 32 768 tekens.
-- **`top`**: default **100**. Positief tot **10 000**. **`0` = ongelimiteerd** (geen `array_slice`; wel bestaande `@odata.nextLink`-paginering van 2000).
+- **`filter`**: JSON-boom (`and` / `or` / `xor` + bladeren) zoals voorheen, **of** een niet-lege OData `$filter`-string. Een string gaat ongewijzigd naar BC (`filter_mode=bc`). Eenvoudige vormen `Field eq true|false` en `Field eq 'literal'` worden daarnaast lokaal toegepast, zodat een gedeelde cache geen gesloten rijen in `Open eq true` lekt. Complexere strings zijn niet lokaal te bewijzen en komen niet uit coverage; die gaan live naar BC. Maximale lengte 32 768 tekens.
+- **`top`**: default **100**. Positief tot **10 000**. **`0` = ongelimiteerd** (geen `array_slice` en geen `$top` naar BC; paginering via `Prefer: odata.maxpagesize` en `@odata.nextLink`).
 - **Automatische OR-batching**: een grote same-field `or` van `eq`-bladeren (JSON-boom of eenvoudige string `(Field eq 'a') or (Field eq 'b') or …`) wordt intern in chunks van **40** (of kleiner bij lange URL) naar BC gestuurd. Resultaten worden op rijsleutel samengevoegd. Clients hoeven zelf niet meer te chunken. Bij meer dan één batch staat `meta.filter_batches` op het aantal. Complexe strings die niet veilig te splitsen zijn, gaan als één `$filter` (nextLink blijft gelden).
 
 ```sh
