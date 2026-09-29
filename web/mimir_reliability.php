@@ -802,9 +802,6 @@ function mimir_db_self_repair(string $path): array
     if (mimir_db_remove_stale_journal($path)) {
         $actions[] = 'removed-empty-journal';
     }
-    if (isset($GLOBALS['mimir_bc_limit_pdo_cache']) && is_array($GLOBALS['mimir_bc_limit_pdo_cache'])) {
-        $GLOBALS['mimir_bc_limit_pdo_cache'] = [];
-    }
 
     return $actions;
 }
