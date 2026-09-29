@@ -70,6 +70,7 @@ $pdo = mimir_db(':memory:');
 mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
     'No' => 'A',
     'Description' => 'Pomp',
+    'Name' => 'Acme',
 ], $now - 20);
 mimir_coverage_put($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', '', '*', $now - 20, 1);
 $calls = [];
@@ -88,6 +89,8 @@ if (!str_contains($calls[0], "ItemList(No='A')")) {
 }
 mimir_cache_same($refreshed['meta']['from_live'], 1, 'refreshed row counts as live');
 mimir_cache_same($refreshed['value'][0]['Inventory'], 9, 'inventory came from BC');
+$refreshedRows = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
+mimir_cache_same($refreshedRows[0]['payload']['Name'] ?? null, 'Acme', 'whole-row refresh keeps a field BC omitted');
 
 $pdo = mimir_db(':memory:');
 mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', mimir_row_key(['No' => 'A'], ['No']), [
@@ -321,12 +324,20 @@ mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', $key, [
 mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', $key, [
     'No' => 'A',
     'Inventory' => 4,
+], $now - 5);
+$kept = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
+mimir_cache_same($kept[0]['payload']['Name'], 'Acme', 'omitted Name keeps the previous value');
+mimir_cache_same($kept[0]['payload']['Description'], 'Pomp', 'absent key stays');
+mimir_cache_same($kept[0]['payload']['Inventory'], 4, 'new key is merged');
+mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList', $key, [
+    'No' => 'A',
     'Name' => null,
 ], $now);
 $merged = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
-mimir_cache_same($merged[0]['payload']['Name'], 'Acme', 'null does not wipe Name');
-mimir_cache_same($merged[0]['payload']['Description'], 'Pomp', 'absent key stays');
-mimir_cache_same($merged[0]['payload']['Inventory'], 4, 'new key is merged');
+mimir_cache_same(array_key_exists('Name', $merged[0]['payload']), true, 'explicit null keeps the Name key');
+mimir_cache_same($merged[0]['payload']['Name'], null, 'explicit null clears Name');
+mimir_cache_same($merged[0]['payload']['Description'], 'Pomp', 'clearing Name leaves Description');
+mimir_cache_same($merged[0]['payload']['Inventory'], 4, 'clearing Name leaves Inventory');
 mimir_cache_same($merged[0]['fetched_at'], $now, 'fetched_at moves to the latest upsert');
 
 $pdo = mimir_db(':memory:');

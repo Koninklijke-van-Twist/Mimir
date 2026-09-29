@@ -562,8 +562,9 @@ function mimir_meta_put(PDO $pdo, string $key, array $payload, int $now): void
 
 /**
  * Unie van oude en nieuwe payload.
- * Nieuwe niet-null waarden overschrijven; een null wist een bestaande waarde niet.
- * Sleutels die alleen in de oude payload staan blijven staan (smallere $select).
+ * Sleutels in de nieuwe payload overschrijven, ook als de waarde null is
+ * (BC heeft het veld dan echt leeg gemaakt). Sleutels die alleen in de oude
+ * payload staan blijven staan: een smallere $select laat ze weg, die wist ze niet.
  *
  * @param array<string, mixed> $old
  * @param array<string, mixed> $new
@@ -574,9 +575,6 @@ function mimir_cache_merge_payload(array $old, array $new): array
     $merged = $old;
     foreach ($new as $key => $value) {
         if (!is_string($key)) {
-            continue;
-        }
-        if ($value === null && array_key_exists($key, $old) && $old[$key] !== null) {
             continue;
         }
         $merged[$key] = $value;
@@ -1672,6 +1670,10 @@ function mimir_refresh_whole_row(
         throw new RuntimeException('Sleutel-verzoek gaf een lijst terug in plaats van één rij.');
     }
     $fresh = mimir_strip_odata_noise($decoded);
+    // Eerst mergen, daarna alleen ontbrekende verplichte kolommen op null zetten.
+    // Null vóór de merge zou een weggelaten veld (smallere response) als expliciete
+    // null de cache in duwen en de oude waarde wissen.
+    $fresh = mimir_cache_merge_payload($payload, $fresh);
     foreach ($required as $column) {
         if (!array_key_exists($column, $fresh)) {
             $fresh[$column] = null;
