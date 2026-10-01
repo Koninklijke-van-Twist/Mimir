@@ -1282,11 +1282,6 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         'filter_mode' => $mode,
         'filter_note' => mimir_filter_note($mode),
     ];
-    $requestedEntity = trim((string) ($job['entity_requested'] ?? ''));
-    if ($requestedEntity !== '' && strcasecmp($requestedEntity, $entity) !== 0) {
-        $meta['entity'] = $entity;
-        $meta['entity_requested'] = $requestedEntity;
-    }
     if ($gapFilled) {
         $meta['gap_fill'] = 1;
     }
