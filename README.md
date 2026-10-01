@@ -116,8 +116,6 @@ De UI gebruikt altijd `max_age` 600. De API laat de aanroeper dat bepalen (defau
 
 Metadata blijft een uur staan, apart per environment. De bedrijvenlijst een dag, en alleen als elk actief environment antwoordde. `company` is verplicht bij tabellen, schema en query.
 
-`Projectbasislijnregel` en `LVS_JobChngeOrderBudgetLne` (plus dichte spellingvarianten van die AL-naam) zijn geen entity sets. Dat zijn de UI-caption en de objectnaam van tabel 11332917. Staat `JobBaselineLines` wel in `$metadata` — de webservice die FinRap leest — dan beantwoordt een query op die aliassen die set. Een filterveld `JobNo` (RapidStart-XML) wordt dan `Job_No`, behalve binnen quotes. Bestaat de gevraagde naam zelf als set, dan blijft die gelden. Ontbreekt ook `JobBaselineLines`, dan blijft het HTTP 404 `Onbekende tabel` met de gevraagde naam.
-
 ## Filtergrens naar Business Central
 
 BC antwoordt vaak met **HTTP 501** op een OR over verschillende velden. XOR bestaat in OData niet.

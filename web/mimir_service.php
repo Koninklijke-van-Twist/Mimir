@@ -294,7 +294,7 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
     $prefix = mimir_odata_prefix_for_environment($environment);
     $metadata = mimir_metadata_for_environment($pdo, $environment, $now);
     try {
-        $schema = mimir_resolve_entity_schema($metadata, $table);
+        $schema = mimir_schema_for_set($metadata, $table);
     } catch (RuntimeException $error) {
         throw new MimirUserException($error->getMessage(), 404);
     }
@@ -302,20 +302,14 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
         return odata_get_json($url, $auth);
     };
     $maxAge = $forceMaxAge ?? ($spec['max_age'] ?? MIMIR_DEFAULT_MAX_AGE);
-    $filter = $spec['filter'] ?? null;
-    if (strcasecmp($schema['name'], 'JobBaselineLines') === 0) {
-        $filter = mimir_baseline_jobno_filter($filter, $schema['properties']);
-    }
-    $requestedName = (string) ($schema['requested_name'] ?? $schema['name']);
 
     return mimir_query_entity($pdo, [
         'environment' => $environment,
         'company' => $company,
         'entity' => $schema['name'],
-        'entity_requested' => $requestedName,
         'service_prefix' => $prefix,
         'select' => is_array($spec['select'] ?? null) ? $spec['select'] : [],
-        'filter' => $filter,
+        'filter' => $spec['filter'] ?? null,
         'max_age' => $maxAge,
         'top' => $spec['top'] ?? MIMIR_DEFAULT_TOP,
         'key_id' => $keyId,
@@ -475,7 +469,7 @@ function mimir_table_schema(PDO $pdo, string $company, string $table, int $now):
     $environment = mimir_environment_for_company($pdo, $company, $now);
     $metadata = mimir_metadata_for_environment($pdo, $environment, $now);
     try {
-        $schema = mimir_resolve_entity_schema($metadata, $table);
+        $schema = mimir_schema_for_set($metadata, $table);
     } catch (RuntimeException $error) {
         throw new MimirUserException($error->getMessage(), 404);
     }
