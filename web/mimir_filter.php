@@ -15,6 +15,111 @@ function mimir_filter_field_ok(string $field): bool
 }
 
 /**
+ * RapidStart-XML noemt het projectnummer JobNo. De OData-page (FinRap) heet Job_No.
+ * Alleen herschrijven als Job_No wel op het schema staat en JobNo niet.
+ * Tekst tussen OData-quotes blijft staan.
+ *
+ * @param array<string, string> $properties
+ */
+function mimir_baseline_jobno_filter(mixed $filter, array $properties): mixed
+{
+    $hasJobNo = false;
+    $hasJobUnderscoreNo = false;
+    foreach ($properties as $name => $type) {
+        if (!is_string($name)) {
+            continue;
+        }
+        if (strcasecmp($name, 'JobNo') === 0) {
+            $hasJobNo = true;
+        }
+        if (strcasecmp($name, 'Job_No') === 0) {
+            $hasJobUnderscoreNo = true;
+        }
+    }
+    if ($hasJobNo || !$hasJobUnderscoreNo) {
+        return $filter;
+    }
+
+    return mimir_rename_filter_field($filter, 'JobNo', 'Job_No');
+}
+
+function mimir_rename_filter_field(mixed $filter, string $from, string $to): mixed
+{
+    if (is_string($filter)) {
+        return mimir_rename_odata_identifier($filter, $from, $to);
+    }
+    if (!is_array($filter)) {
+        return $filter;
+    }
+    if (isset($filter['field']) && is_string($filter['field']) && strcasecmp($filter['field'], $from) === 0) {
+        $filter['field'] = $to;
+    }
+    foreach (['and', 'or', 'xor'] as $group) {
+        if (!isset($filter[$group]) || !is_array($filter[$group])) {
+            continue;
+        }
+        foreach ($filter[$group] as $index => $child) {
+            $filter[$group][$index] = mimir_rename_filter_field($child, $from, $to);
+        }
+    }
+
+    return $filter;
+}
+
+function mimir_rename_odata_identifier(string $filter, string $from, string $to): string
+{
+    $out = '';
+    $length = strlen($filter);
+    $fromLength = strlen($from);
+    $i = 0;
+    while ($i < $length) {
+        if ($filter[$i] === "'") {
+            $out .= "'";
+            $i++;
+            while ($i < $length) {
+                $out .= $filter[$i];
+                if ($filter[$i] === "'") {
+                    if ($i + 1 < $length && $filter[$i + 1] === "'") {
+                        $out .= "'";
+                        $i += 2;
+                        continue;
+                    }
+                    $i++;
+                    break;
+                }
+                $i++;
+            }
+            continue;
+        }
+        if (
+            $fromLength > 0
+            && substr($filter, $i, $fromLength) === $from
+            && mimir_odata_identifier_boundary($filter, $i, $fromLength)
+        ) {
+            $out .= $to;
+            $i += $fromLength;
+            continue;
+        }
+        $out .= $filter[$i];
+        $i++;
+    }
+
+    return $out;
+}
+
+function mimir_odata_identifier_boundary(string $filter, int $start, int $length): bool
+{
+    $before = $start === 0 ? '' : $filter[$start - 1];
+    $afterAt = $start + $length;
+    $after = $afterAt >= strlen($filter) ? '' : $filter[$afterAt];
+    $word = static function (string $char): bool {
+        return $char !== '' && preg_match('/[A-Za-z0-9_]/', $char) === 1;
+    };
+
+    return !$word($before) && !$word($after);
+}
+
+/**
  * @return string|null fouttekst, of null als het filter geldig is
  */
 function mimir_filter_validate(mixed $filter, int $depth = 0): ?string
