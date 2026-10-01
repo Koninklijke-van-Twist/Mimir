@@ -153,12 +153,13 @@ function mimir_h(string $value): string
                             <th>Omgeving</th>
                             <th>Entity</th>
                             <th>Actie</th>
+                            <th>Aanroeper</th>
                             <th>Bericht</th>
                         </tr>
                     </thead>
                     <tbody>
                         <?php if ($mimirEvents === []): ?>
-                            <tr><td colspan="6" class="empty">Nog geen gebeurtenissen.</td></tr>
+                            <tr><td colspan="7" class="empty">Nog geen gebeurtenissen.</td></tr>
                         <?php else: ?>
                             <?php foreach (array_reverse($mimirEvents) as $event): ?>
                                 <tr>
@@ -167,6 +168,7 @@ function mimir_h(string $value): string
                                     <td><?= mimir_event_escape((string) $event['environment']) ?></td>
                                     <td><?= mimir_event_escape((string) $event['entity']) ?></td>
                                     <td><?= mimir_event_escape((string) $event['action']) ?></td>
+                                    <td><?= mimir_event_escape((string) ($event['caller'] ?? '')) ?></td>
                                     <td><?= mimir_event_escape((string) $event['message']) ?></td>
                                 </tr>
                             <?php endforeach; ?>

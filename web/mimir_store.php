@@ -250,7 +250,7 @@ function mimir_key_create(PDO $pdo, string $ownerEmail, string $label, int $now)
     ]);
 
     $createdId = (int) $pdo->lastInsertId();
-    mimir_key_mirror_remember($createdId, $plain);
+    mimir_key_mirror_remember($createdId, $plain, $label, $ownerEmail);
 
     return [
         'id' => $createdId,
@@ -290,7 +290,7 @@ function mimir_key_lookup(PDO $pdo, string $plain): ?array
         'label' => (string) $row['label'],
         'key_plain' => (string) $row['key_plain'],
     ];
-    mimir_key_mirror_remember($record['id'], $plain);
+    mimir_key_mirror_remember($record['id'], $plain, $record['label'], $record['owner_email']);
 
     return $record;
 }

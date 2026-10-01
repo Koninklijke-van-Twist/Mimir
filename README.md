@@ -107,6 +107,8 @@ Blijft de database locked, onleesbaar, readonly of corrupt, of zijn de retries o
 
 Het gebeurtenislog (`web/data/mimir-events.jsonl`, tijdzone Europe/Amsterdam) staat buiten SQLite en is zichtbaar op de Mímir-pagina, samen met de circuit-staat (normal of bypass-to-BC) en sinds wanneer. Er komen geen secrets in dat log.
 
+Bij `bc-failed`, `bypassed-to-BC`, `failed` en `fallback-one-slot` staat ook het veld `caller`, zodat zichtbaar is welke app of sessie het verzoek deed. Voor een API-sleutel is dat `key_id` (het id uit `api_keys`), `label` (de naam uit de sleutelpagina), `owner` (e-mail van de eigenaar), `prefix` (de eerste 8 tekens ná `mimir_`, alleen als de rest van de sleutel lang genoeg is om niet mee te loggen) en `hash` (de eerste 12 hex-tekens van SHA-256, hetzelfde `key_hash` waarmee een sleutel wordt opgezocht). De volledige sleutel staat er niet in. De UI logt `ui` plus het sessie-e-mailadres; `nightly.php` logt `nightly` (plus e-mail als de nachtrun via de browser liep). Het label en de eigenaar zitten ook in de sleutelspiegel (`mimir-key-mirror.json`), zodat ze bij een open circuit nog bekend zijn zonder de plaintext.
+
 `nightly.php` probeert de database opnieuw te openen, draait een open transactie bij afbreken terug (shutdown, want `exit` slaat `finally` over) en laat geen lock achter. Een leeg `-journal` wordt alleen verwijderd als de database in WAL staat, het bestand 0 bytes is en er een exclusieve lock op zit. `-wal`, `-shm` en het databasebestand zelf worden niet gewist.
 
 
