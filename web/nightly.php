@@ -29,6 +29,13 @@ require_once __DIR__ . '/mimir_store.php';
 require_once __DIR__ . '/mimir_filter.php';
 require_once __DIR__ . '/mimir_service.php';
 
+$nightlyOwner = '';
+if (PHP_SAPI !== 'cli' && session_status() === PHP_SESSION_ACTIVE) {
+    $nightlyOwner = strtolower(trim((string) ($_SESSION['user']['email'] ?? '')));
+}
+mimir_caller_reset();
+mimir_caller_bind_named('nightly', $nightlyOwner);
+
 $startedAt = hrtime(true);
 $now = time();
 $pdo = null;

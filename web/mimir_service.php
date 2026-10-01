@@ -655,6 +655,8 @@ function mimir_api_main(?string $forcedRoute = null): void
     if ($apiKey === '') {
         mimir_json(['error' => 'API-sleutel ontbreekt. Gebruik Authorization: Bearer of de header X-API-Key.'], 401);
     }
+    mimir_caller_reset();
+    mimir_caller_bind_api_key(null, $apiKey);
 
     mimir_load_auth(true);
 
@@ -685,6 +687,14 @@ function mimir_api_main(?string $forcedRoute = null): void
         $pdo = null;
         $record = mimir_authenticate_api_key($apiKey, $pdo);
     } catch (Throwable $error) {
+        try {
+            $mirrored = mimir_key_mirror_lookup($apiKey);
+        } catch (Throwable) {
+            $mirrored = null;
+        }
+        if (is_array($mirrored)) {
+            mimir_caller_bind_api_key($mirrored, $apiKey);
+        }
         mimir_event_log('request', $error->getMessage(), '', (string) ($parsed['table'] ?? ''), 'bc-failed');
         mimir_json(['error' => 'Database niet beschikbaar.'], 500);
     }
@@ -694,6 +704,7 @@ function mimir_api_main(?string $forcedRoute = null): void
         }
         mimir_json(['error' => 'API-sleutel is ongeldig of ingetrokken.'], 401);
     }
+    mimir_caller_bind_api_key($record, $apiKey);
 
     $entity = '';
     if (is_array($body)) {
@@ -862,6 +873,8 @@ function mimir_ui_main(): void
     } catch (MimirUserException $error) {
         mimir_json(['error' => $error->getMessage()], $error->status);
     }
+    mimir_caller_reset();
+    mimir_caller_bind_named('ui', $email);
 
     if (!isset($keyActions[$action]) && !isset($dataActions[$action])) {
         mimir_json(['error' => 'Onbekende actie.'], 404);

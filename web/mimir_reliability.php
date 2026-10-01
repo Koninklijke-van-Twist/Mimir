@@ -8,6 +8,9 @@ declare(strict_types=1);
  *
  * Het log en de circuit-staat staan in JSON-bestanden in de datamap, niet in
  * mimir.sqlite, zodat ze leesbaar blijven als de database vastzit of corrupt is.
+ * Foutacties (bc-failed, bypassed-to-BC, failed, fallback-one-slot) krijgen
+ * een caller-veld: sleutel-id, label, eigenaar, prefix en hash-prefix — nooit
+ * de volledige API-sleutel.
  */
 
 const MIMIR_SQLITE_BUSY_TIMEOUT_MS = 3000;
@@ -115,6 +118,136 @@ function mimir_event_log_path(): string
     return mimir_runtime_dir() . '/mimir-events.jsonl';
 }
 
+function mimir_caller_reset(): void
+{
+    unset($GLOBALS['mimir_caller']);
+}
+
+/**
+ * Zet de aanroeper voor dit verzoek. De volledige sleutel wordt niet bewaard.
+ *
+ * @param array{id?: int, label?: string, owner_email?: string}|null $record
+ */
+function mimir_caller_bind_api_key(?array $record, string $presentedKey = ''): void
+{
+    $presentedKey = trim($presentedKey);
+    $id = 0;
+    $label = '';
+    $owner = '';
+    if (is_array($record)) {
+        $id = (int) ($record['id'] ?? 0);
+        $label = trim((string) ($record['label'] ?? ''));
+        $owner = trim((string) ($record['owner_email'] ?? ''));
+    }
+    $GLOBALS['mimir_caller'] = [
+        'kind' => 'api-key',
+        'key_id' => $id,
+        'label' => $label,
+        'owner' => $owner,
+        'prefix' => mimir_key_public_prefix($presentedKey),
+        'key_hash_prefix' => mimir_key_hash_prefix($presentedKey),
+    ];
+}
+
+function mimir_caller_bind_named(string $kind, string $owner = ''): void
+{
+    $kind = trim($kind);
+    if ($kind === '') {
+        mimir_caller_reset();
+
+        return;
+    }
+    $GLOBALS['mimir_caller'] = [
+        'kind' => $kind,
+        'key_id' => 0,
+        'label' => '',
+        'owner' => trim($owner),
+        'prefix' => '',
+        'key_hash_prefix' => '',
+    ];
+}
+
+/**
+ * Eerste 8 tekens na `mimir_`, alleen als de rest van het geheim niet meegaat.
+ */
+function mimir_key_public_prefix(string $plain): string
+{
+    $plain = trim($plain);
+    if ($plain === '') {
+        return '';
+    }
+    if (str_starts_with($plain, 'mimir_')) {
+        $plain = substr($plain, 6);
+    }
+    $plain = preg_replace('/[^A-Za-z0-9]/', '', $plain);
+    if (!is_string($plain) || strlen($plain) < 24) {
+        return '';
+    }
+
+    return substr($plain, 0, 8);
+}
+
+/**
+ * Eerste 12 hex-tekens van SHA-256, dezelfde hash als `api_keys.key_hash`.
+ */
+function mimir_key_hash_prefix(string $plain): string
+{
+    $plain = trim($plain);
+    if ($plain === '') {
+        return '';
+    }
+
+    return substr(hash('sha256', $plain), 0, 12);
+}
+
+function mimir_event_logs_caller(string $action): bool
+{
+    return in_array($action, ['bc-failed', 'bypassed-to-BC', 'failed', 'fallback-one-slot'], true);
+}
+
+function mimir_caller_log_value(): string
+{
+    $caller = $GLOBALS['mimir_caller'] ?? null;
+    if (!is_array($caller)) {
+        return '';
+    }
+    $kind = (string) ($caller['kind'] ?? '');
+    if ($kind === 'api-key') {
+        $parts = [];
+        $id = (int) ($caller['key_id'] ?? 0);
+        $parts[] = 'key_id=' . ($id > 0 ? (string) $id : '?');
+        $label = trim((string) ($caller['label'] ?? ''));
+        if ($label !== '') {
+            $label = str_replace(['"', "\r", "\n"], ["'", ' ', ' '], $label);
+            $parts[] = 'label="' . $label . '"';
+        }
+        $owner = trim((string) ($caller['owner'] ?? ''));
+        if ($owner !== '') {
+            $parts[] = 'owner=' . str_replace(["\r", "\n", ' '], '', $owner);
+        }
+        $prefix = trim((string) ($caller['prefix'] ?? ''));
+        if ($prefix !== '') {
+            $parts[] = 'prefix=' . $prefix;
+        }
+        $hashPrefix = trim((string) ($caller['key_hash_prefix'] ?? ''));
+        if ($hashPrefix !== '') {
+            $parts[] = 'hash=' . $hashPrefix;
+        }
+
+        return implode(' ', $parts);
+    }
+    $parts = [];
+    if ($kind !== '') {
+        $parts[] = $kind;
+    }
+    $owner = trim((string) ($caller['owner'] ?? ''));
+    if ($owner !== '') {
+        $parts[] = 'owner=' . str_replace(["\r", "\n", ' '], '', $owner);
+    }
+
+    return implode(' ', $parts);
+}
+
 function mimir_event_log(string $category, string $message, string $environment = '', string $entity = '', string $action = ''): void
 {
     $dir = mimir_runtime_dir();
@@ -131,6 +264,12 @@ function mimir_event_log(string $category, string $message, string $environment 
         'entity' => mimir_event_redact($entity),
         'action' => mimir_event_redact($action),
     ];
+    if (mimir_event_logs_caller($action)) {
+        $caller = mimir_event_redact(mimir_caller_log_value());
+        if ($caller !== '') {
+            $entry['caller'] = $caller;
+        }
+    }
     $line = json_encode($entry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     if ($line === false) {
         return;
@@ -191,7 +330,7 @@ function mimir_event_log_rotate(string $path): void
 }
 
 /**
- * @return list<array{ts: string, category: string, message: string, environment: string, entity: string, action: string}>
+ * @return list<array{ts: string, category: string, message: string, environment: string, entity: string, action: string, caller: string}>
  */
 function mimir_event_log_recent(int $limit = 40): array
 {
@@ -217,6 +356,7 @@ function mimir_event_log_recent(int $limit = 40): array
             'environment' => (string) ($decoded['environment'] ?? ''),
             'entity' => (string) ($decoded['entity'] ?? ''),
             'action' => (string) ($decoded['action'] ?? ''),
+            'caller' => (string) ($decoded['caller'] ?? ''),
         ];
     }
 
@@ -995,7 +1135,7 @@ function mimir_key_mirror_path(): string
 function mimir_key_mirror_sync(PDO $pdo): void
 {
     try {
-        $stmt = $pdo->query('SELECT id, key_hash, revoked_at FROM api_keys');
+        $stmt = $pdo->query('SELECT id, key_hash, revoked_at, label, owner_email FROM api_keys');
         if ($stmt === false) {
             return;
         }
@@ -1012,6 +1152,8 @@ function mimir_key_mirror_sync(PDO $pdo): void
             $keys[$hash] = [
                 'id' => (int) ($row['id'] ?? 0),
                 'revoked' => $revokedAt !== null && $revokedAt !== '',
+                'label' => (string) ($row['label'] ?? ''),
+                'owner_email' => (string) ($row['owner_email'] ?? ''),
             ];
         }
         mimir_json_file_write(mimir_key_mirror_path(), ['keys' => $keys]);
@@ -1019,7 +1161,7 @@ function mimir_key_mirror_sync(PDO $pdo): void
     }
 }
 
-function mimir_key_mirror_remember(int $id, string $plain): void
+function mimir_key_mirror_remember(int $id, string $plain, string $label = '', string $ownerEmail = ''): void
 {
     $plain = trim($plain);
     if ($id < 1 || $plain === '') {
@@ -1031,9 +1173,20 @@ function mimir_key_mirror_remember(int $id, string $plain): void
     if (!is_array($keys)) {
         $keys = [];
     }
+    $existing = isset($keys[$hash]) && is_array($keys[$hash]) ? $keys[$hash] : [];
+    $label = trim($label);
+    $ownerEmail = trim($ownerEmail);
+    if ($label === '') {
+        $label = trim((string) ($existing['label'] ?? ''));
+    }
+    if ($ownerEmail === '') {
+        $ownerEmail = trim((string) ($existing['owner_email'] ?? ''));
+    }
     $keys[$hash] = [
         'id' => $id,
         'revoked' => false,
+        'label' => $label,
+        'owner_email' => $ownerEmail,
     ];
     mimir_json_file_write(mimir_key_mirror_path(), ['keys' => $keys]);
 }
@@ -1088,8 +1241,8 @@ function mimir_key_mirror_lookup(string $plain): ?array
 
     return [
         'id' => $id,
-        'owner_email' => '',
-        'label' => '',
+        'owner_email' => trim((string) ($keys[$hash]['owner_email'] ?? '')),
+        'label' => trim((string) ($keys[$hash]['label'] ?? '')),
         'key_plain' => '',
     ];
 }

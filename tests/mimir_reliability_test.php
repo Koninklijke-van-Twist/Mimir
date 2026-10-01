@@ -147,13 +147,18 @@ mimir_rel_same(mimir_db_remove_stale_journal($path), false, 'non-empty journal i
 mimir_rel_same(is_file($journal), true, 'non-empty journal file still exists');
 @unlink($journal);
 
-mimir_key_mirror_remember(7, 'mimir_plaintextkey123456');
+mimir_key_mirror_remember(7, 'mimir_plaintextkey123456', 'Consus', 'tim@kvt.nl');
 $mirrorRaw = (string) file_get_contents(mimir_key_mirror_path());
 mimir_rel_same(str_contains($mirrorRaw, 'mimir_plaintextkey123456'), false, 'key mirror does not store the plaintext key');
+mimir_rel_same(str_contains($mirrorRaw, 'Consus'), true, 'key mirror stores the label');
+mimir_rel_same(str_contains($mirrorRaw, 'tim@kvt.nl'), true, 'key mirror stores the owner');
 $mirrored = mimir_key_mirror_lookup('mimir_plaintextkey123456');
 if (!is_array($mirrored) || (int) $mirrored['id'] !== 7) {
     mimir_rel_fail('key mirror lookup failed');
 }
+mimir_rel_same($mirrored['label'], 'Consus', 'mirror lookup returns the label');
+mimir_rel_same($mirrored['owner_email'], 'tim@kvt.nl', 'mirror lookup returns the owner');
+mimir_rel_same($mirrored['key_plain'], '', 'mirror lookup does not return the plaintext key');
 mimir_key_mirror_revoke(7);
 mimir_rel_same(mimir_key_mirror_lookup('mimir_plaintextkey123456'), null, 'revoked key is not served from the mirror');
 
@@ -177,6 +182,66 @@ mimir_rel_same(str_contains($escaped, '<script>'), false, 'log output is escaped
 mimir_rel_same(str_contains($escaped, '&lt;script&gt;'), true, 'escaped log keeps the text');
 mimir_rel_same($last['action'], 'retried', 'log keeps the action');
 mimir_rel_same($last['environment'], 'kvtmdlive_aad', 'log keeps the environment');
+mimir_rel_same($last['caller'] ?? '', '', 'a recovered retry does not invent a caller');
+
+$callerKey = 'mimir_' . str_repeat('ab', 24);
+$callerHash = substr(hash('sha256', $callerKey), 0, 12);
+mimir_caller_bind_api_key([
+    'id' => 12,
+    'label' => 'Consus',
+    'owner_email' => 'tim@kvt.nl',
+], $callerKey);
+mimir_event_log('bc', 'HTTP 500 from OData for ' . $callerKey, 'kvtmdlive_aad', 'ItemList', 'bc-failed');
+mimir_event_log('sqlite', 'database is locked', 'kvtmdlive_aad', 'ItemList', 'bypassed-to-BC');
+mimir_event_log('bc', 'Tijdelijke Business Central-fout hersteld na opnieuw proberen.', 'kvtmdlive_aad', 'ItemList', 'retried');
+$callerRaw = (string) file_get_contents(mimir_event_log_path());
+mimir_rel_same(str_contains($callerRaw, $callerKey), false, 'failure log does not contain the full API key');
+mimir_rel_same(str_contains($callerRaw, 'mimir_' . substr($callerKey, 6, 8)), false, 'failure log does not contain the mimir_ prefix of the key');
+$failedCaller = '';
+$bypassCaller = '';
+$retryCaller = '';
+foreach (mimir_event_log_recent(20) as $row) {
+    if (($row['action'] ?? '') === 'bc-failed' && ($row['entity'] ?? '') === 'ItemList') {
+        $failedCaller = (string) ($row['caller'] ?? '');
+    }
+    if (($row['action'] ?? '') === 'bypassed-to-BC' && str_contains((string) ($row['message'] ?? ''), 'database is locked')) {
+        $bypassCaller = (string) ($row['caller'] ?? '');
+    }
+    if (($row['action'] ?? '') === 'retried' && ($row['entity'] ?? '') === 'ItemList' && str_contains((string) ($row['message'] ?? ''), 'Tijdelijke')) {
+        $retryCaller = (string) ($row['caller'] ?? '');
+    }
+}
+$expectedCaller = 'key_id=12 label="Consus" owner=tim@kvt.nl prefix=' . substr($callerKey, 6, 8) . ' hash=' . $callerHash;
+mimir_rel_same($failedCaller, $expectedCaller, 'bc-failed names the API key without the secret');
+mimir_rel_same($bypassCaller, $expectedCaller, 'bypassed-to-BC names the same caller');
+mimir_rel_same($retryCaller, '', 'retried does not add a caller field');
+mimir_caller_bind_named('ui', 'tim@kvt.nl');
+mimir_event_log('request', 'slot files unusable', 'kvtmdlive_aad', '', 'fallback-one-slot');
+mimir_caller_bind_named('nightly', '');
+mimir_event_log('nightly', 'metadata timeout', 'kvtmdlive_aad', '', 'failed');
+$named = ['fallback-one-slot' => '', 'failed' => ''];
+foreach (mimir_event_log_recent(10) as $row) {
+    $action = (string) ($row['action'] ?? '');
+    if (array_key_exists($action, $named) && $named[$action] === '') {
+        $named[$action] = (string) ($row['caller'] ?? '');
+    }
+}
+mimir_rel_same($named['fallback-one-slot'], 'ui owner=tim@kvt.nl', 'UI session is the caller on a slot fallback');
+mimir_rel_same($named['failed'], 'nightly', 'nightly is the caller when the night run fails');
+mimir_caller_reset();
+mimir_event_log('bc', 'no caller bound', '', 'ItemList', 'bc-failed');
+$unbound = '';
+foreach (mimir_event_log_recent(5) as $row) {
+    if (($row['message'] ?? '') === 'no caller bound') {
+        $unbound = (string) ($row['caller'] ?? '');
+    }
+}
+mimir_rel_same($unbound, '', 'bc-failed without a bound caller omits the field');
+
+$index = (string) file_get_contents(dirname(__DIR__) . '/web/index.php');
+if (!str_contains($index, "\$event['caller']")) {
+    mimir_rel_fail('status page does not render the caller column');
+}
 
 $index = (string) file_get_contents(dirname(__DIR__) . '/web/index.php');
 if (!str_contains($index, 'mimir_event_log_recent') || !str_contains($index, 'mimir_event_escape') || !str_contains($index, 'mimir_circuit_public_state')) {
