@@ -567,6 +567,8 @@
     if (!views.metadata || !listEl) return;
 
     const state = { loaded: false, environment: '', sets: [], matched: [], page: 1, needle: '' };
+    // Verhoogd bij elke environment-keuze; late antwoorden van een eerdere keuze worden genegeerd.
+    let selection = 0;
     const numberFormat = new Intl.NumberFormat('nl-NL');
 
     function esc(value) {
@@ -706,13 +708,16 @@
     }
 
     async function load(environment) {
+        const version = selection;
         setStatus('Metadata laden…');
         try {
             const data = await api('ui_api.php?action=metadata' + (environment ? '&environment=' + encodeURIComponent(environment) : ''));
+            if (version !== selection) return;
             state.loaded = true;
             state.page = 1;
             apply(data);
         } catch (error) {
+            if (version !== selection) return;
             countEl.textContent = '';
             setStatus(error.message, true);
         }
@@ -748,7 +753,10 @@
         clearTimeout(timer);
         timer = setTimeout(applySearch, 120);
     });
-    envEl.addEventListener('change', function () { load(envEl.value); });
+    envEl.addEventListener('change', function () {
+        selection += 1;
+        load(envEl.value);
+    });
     pagers.forEach(function (pager) {
         pager.addEventListener('click', function (event) {
             const button = event.target.closest('[data-page]');
@@ -759,21 +767,23 @@
         });
     });
     refreshEl.addEventListener('click', async function () {
+        const version = selection;
         refreshEl.disabled = true;
         setStatus('Metadata ophalen uit Business Central… (kan even duren)');
         try {
             const data = await api('ui_api.php?action=metadata_refresh', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify({ environment: state.environment }),
+                body: JSON.stringify({ environment: envEl.value || state.environment }),
             });
+            if (version !== selection) return;
             const page = state.page;
             apply(data);
             state.page = page;
             render();
             if (data.refreshed) setStatus('Vernieuwd.');
         } catch (error) {
-            setStatus(error.message, true);
+            if (version === selection) setStatus(error.message, true);
         } finally {
             refreshEl.disabled = false;
         }
