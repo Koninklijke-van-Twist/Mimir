@@ -69,16 +69,21 @@ try {
     $companies = mimir_refresh_companies($pdo, $now);
 
     $metadata = [];
+    $catalogEnvironments = mimir_catalog_environments();
     foreach (auth_get_active_environments() as $environment) {
         $envStarted = hrtime(true);
         try {
-            $parsed = mimir_metadata_for_environment($pdo, $environment, $now);
-            // Force rewrite even if TTL still valid: bump by calling meta put path via refresh.
-            // mimir_metadata_for_environment already caches; count entity sets.
+            // De metadata-catalogus (tabblad Metadata) wordt live ververst als
+            // hij ontbreekt of ouder is dan MIMIR_CATALOG_REFRESH_AGE; anders
+            // mag de gewone SQLite-cache van een uur antwoorden.
+            $refreshCatalog = in_array($environment, $catalogEnvironments, true)
+                && mimir_catalog_is_stale($environment, $now);
+            $parsed = mimir_metadata_for_environment($pdo, $environment, $now, $refreshCatalog);
             $metadata[] = [
                 'environment' => $environment,
                 'ok' => true,
                 'entity_sets' => count($parsed['entity_sets'] ?? []),
+                'catalog' => $refreshCatalog ? 'refreshed' : 'fresh',
                 'duration_ms' => (int) round((hrtime(true) - $envStarted) / 1_000_000),
             ];
         } catch (Throwable $error) {
@@ -118,6 +123,7 @@ try {
         foreach ($payload['metadata'] as $row) {
             if (!empty($row['ok'])) {
                 echo '  meta ' . $row['environment'] . ': sets=' . $row['entity_sets']
+                    . ' catalog=' . $row['catalog']
                     . ' (' . $row['duration_ms'] . "ms)\n";
             } else {
                 echo '  meta FAIL ' . $row['environment'] . ': ' . ($row['error'] ?? '') . "\n";

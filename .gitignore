@@ -14,6 +14,7 @@ web/data/mimir-circuit.json.tmp.*
 web/data/mimir-key-mirror.json
 web/data/mimir-company-map.json
 web/data/mimir-metadata-*.json
+web/data/mimir-catalog-*.json
 
 web/analytics/*.sqlite
 web/analytics/*.sqlite-*

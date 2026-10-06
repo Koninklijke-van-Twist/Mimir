@@ -7,6 +7,7 @@ require_once __DIR__ . '/odata.php';
 require_once __DIR__ . '/mimir_store.php';
 require_once __DIR__ . '/mimir_bc_limit.php';
 require_once __DIR__ . '/auth_helper.php';
+require_once __DIR__ . '/mimir_metadata.php';
 
 function mimir_json(array $payload, int $status = 200): never
 {
@@ -242,17 +243,21 @@ function mimir_environment_for_company(PDO $pdo, string $company, int $now): str
 }
 
 /**
+ * $force slaat de SQLite-cache en de snapshot over (nightly bij een oude
+ * catalogus, of de knop Vernieuwen). Elke live fetch schrijft ook de
+ * metadata-catalogus voor het tabblad Metadata.
+ *
  * @return array{entity_sets: list<array{name: string, entity_type: string}>, types: array<string, array{keys: list<string>, properties: array<string, string>}>}
  */
-function mimir_metadata_for_environment(PDO $pdo, string $environment, int $now): array
+function mimir_metadata_for_environment(PDO $pdo, string $environment, int $now, bool $force = false): array
 {
     $prefix = mimir_odata_prefix_for_environment($environment);
     $cacheKey = 'metadata:' . $prefix;
-    $cached = mimir_meta_get($pdo, $cacheKey, MIMIR_METADATA_TTL, $now);
+    $cached = $force ? null : mimir_meta_get($pdo, $cacheKey, MIMIR_METADATA_TTL, $now);
     if (is_array($cached) && isset($cached['entity_sets'], $cached['types']) && is_array($cached['entity_sets']) && is_array($cached['types'])) {
         return $cached;
     }
-    if (!empty($GLOBALS['mimir_live_bypass'])) {
+    if (!$force && !empty($GLOBALS['mimir_live_bypass'])) {
         $snapshot = mimir_metadata_snapshot_read($environment, MIMIR_METADATA_SNAPSHOT_TTL);
         if (is_array($snapshot)) {
             return $snapshot;
@@ -264,6 +269,7 @@ function mimir_metadata_for_environment(PDO $pdo, string $environment, int $now)
         $xml = odata_get_text(rtrim($prefix, '/') . '/$metadata', $auth);
         $parsed = odata_parse_metadata($xml);
         mimir_metadata_snapshot_write($environment, $parsed, $now);
+        mimir_catalog_write($environment, $parsed, $now);
         try {
             mimir_meta_put($pdo, $cacheKey, $parsed, $now);
         } catch (Throwable $error) {
@@ -737,6 +743,89 @@ function mimir_api_main(?string $forcedRoute = null): void
     }
 }
 
+/**
+ * Vernieuwen-knop: haalt $metadata van één environment live op en schrijft
+ * de catalogus. Binnen een minuut na de vorige fetch blijft het bij de
+ * bestaande catalogus.
+ *
+ * @return array<string, mixed>
+ */
+function mimir_metadata_refresh(?PDO $pdo, string $environment, int $now): array
+{
+    $environment = mimir_catalog_resolve_environment($environment);
+    $current = mimir_catalog_read($environment);
+    $skipped = $current !== null && ($now - $current['fetched_at']) < MIMIR_CATALOG_REFRESH_MIN_INTERVAL;
+    if (!$skipped) {
+        if (!$pdo instanceof PDO) {
+            $pdo = mimir_db(':memory:');
+        }
+        $parsed = mimir_metadata_for_environment($pdo, $environment, $now, true);
+        // Het bestand schrijven is best-effort (mimir_json_file_write); zonder
+        // schrijfrechten bleef de pagina anders stil op de oude stand staan.
+        if ((mimir_catalog_read($environment)['fetched_at'] ?? 0) < $now) {
+            throw new RuntimeException('Metadata opgehaald (' . count($parsed['entity_sets']) . ' tabellen), maar de catalogus kon niet in web/data worden geschreven.');
+        }
+    }
+    $payload = mimir_metadata_payload($environment);
+    $payload['refreshed'] = !$skipped;
+    if ($skipped) {
+        $payload['note'] = 'Net al vernieuwd; probeer het over een minuut opnieuw.';
+    }
+
+    return $payload;
+}
+
+/**
+ * api/metadata.php: API-sleutel (zelfde headers als query.php) of de
+ * ingelogde sessie. Alleen GET; leest de catalogus, belt BC niet.
+ */
+function mimir_metadata_api_main(): void
+{
+    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    $apiKey = mimir_request_api_key();
+    mimir_caller_reset();
+    mimir_load_auth(true);
+    $record = null;
+    $pdo = null;
+    if ($apiKey !== '') {
+        mimir_caller_bind_api_key(null, $apiKey);
+        try {
+            $record = mimir_authenticate_api_key($apiKey, $pdo);
+        } catch (Throwable $error) {
+            mimir_event_log('request', $error->getMessage(), '', 'metadata', 'failed');
+            mimir_json(['error' => 'Database niet beschikbaar.'], 500);
+        }
+        if ($record === null) {
+            if (!$pdo instanceof PDO) {
+                mimir_json(['error' => 'Database niet beschikbaar en de API-sleutel kan niet worden gecontroleerd.'], 503);
+            }
+            mimir_json(['error' => 'API-sleutel is ongeldig of ingetrokken.'], 401);
+        }
+        mimir_caller_bind_api_key($record, $apiKey);
+    } else {
+        try {
+            mimir_caller_bind_named('ui', mimir_session_email());
+        } catch (MimirUserException $error) {
+            mimir_json(['error' => 'API-sleutel ontbreekt. Gebruik Authorization: Bearer of de header X-API-Key, of log in.'], 401);
+        }
+    }
+    if ($method !== 'GET') {
+        mimir_json(['error' => 'GET verwacht.'], 405);
+    }
+    mimir_metadata_compress_output();
+    try {
+        $payload = mimir_metadata_payload_from_get();
+        if ($pdo instanceof PDO && is_array($record)) {
+            mimir_usage_log_best_effort($pdo, (int) ($record['id'] ?? 0), 'metadata', time());
+        }
+        mimir_json($payload);
+    } catch (MimirUserException $error) {
+        mimir_json(['error' => $error->getMessage()], $error->status);
+    } catch (Throwable $error) {
+        mimir_json(['error' => mimir_public_error($error)], 500);
+    }
+}
+
 function mimir_session_email(): string
 {
     if (session_status() !== PHP_SESSION_ACTIVE) {
@@ -867,6 +956,7 @@ function mimir_ui_main(): void
     $now = time();
     $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST'];
     $dataActions = ['companies' => 'GET', 'tables' => 'GET', 'schema' => 'GET', 'query' => 'POST'];
+    $metadataActions = ['metadata' => 'GET', 'metadata_refresh' => 'POST'];
 
     try {
         $email = mimir_session_email();
@@ -876,10 +966,10 @@ function mimir_ui_main(): void
     mimir_caller_reset();
     mimir_caller_bind_named('ui', $email);
 
-    if (!isset($keyActions[$action]) && !isset($dataActions[$action])) {
+    if (!isset($keyActions[$action]) && !isset($dataActions[$action]) && !isset($metadataActions[$action])) {
         mimir_json(['error' => 'Onbekende actie.'], 404);
     }
-    $expected = $keyActions[$action] ?? $dataActions[$action];
+    $expected = $keyActions[$action] ?? $dataActions[$action] ?? $metadataActions[$action];
     if ($method !== $expected) {
         mimir_json(['error' => $expected . ' verwacht.'], 405);
     }
@@ -893,8 +983,23 @@ function mimir_ui_main(): void
         }
     }
 
-    if (isset($dataActions[$action])) {
+    if (isset($dataActions[$action]) || isset($metadataActions[$action])) {
         mimir_load_auth(true);
+    }
+
+    if (isset($metadataActions[$action])) {
+        mimir_metadata_compress_output();
+        try {
+            if ($action === 'metadata') {
+                mimir_json(mimir_metadata_payload_from_get());
+            }
+            mimir_json(mimir_metadata_refresh(mimir_ui_open_db(), (string) ($body['environment'] ?? ''), $now));
+        } catch (MimirUserException $error) {
+            mimir_json(['error' => $error->getMessage()], $error->status);
+        } catch (Throwable $error) {
+            mimir_event_log('metadata', $error->getMessage(), (string) ($body['environment'] ?? ''), '', 'failed');
+            mimir_json(['error' => mimir_public_error($error)], 502);
+        }
     }
 
     try {
