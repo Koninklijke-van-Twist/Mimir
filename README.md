@@ -6,9 +6,10 @@ De pagina staat in `web/` en gaat via FTP naar `/var/www/html/mimir/`.
 
 ## Structuur
 
-- `web/index.php` — verkenner (SSO). Tabel kiezen, filters, kolommen, resultaat, API-sleutels.
+- `web/index.php` — verkenner (SSO), twee tabbladen: **OData-verkenner** (tabel kiezen, filters, kolommen, resultaat, API-sleutels) en **Webservice-metadata** (alle tabellen met sleutels en velden).
 - `web/ui_api.php` — JSON voor die pagina. Zelfde login als de pagina. `max_age` staat hier vast op **600 seconden**.
-- `web/api/` — API met sleutel (`tables.php`, `schema.php`, `query.php`, `companies.php`, of `index.php` met `PATH_INFO` / `?route=`).
+- `web/api/` — API met sleutel (`tables.php`, `schema.php`, `query.php`, `companies.php`, of `index.php` met `PATH_INFO` / `?route=`). `metadata.php` werkt met sleutel of met de ingelogde sessie.
+- `web/mimir_metadata.php` — metadata-catalogus per environment (`web/data/mimir-catalog-<environment>.json`), zoekfilter en paginering.
 - `web/openapi.yaml` / `web/openapi.json` — OpenAPI 3-specificatie (publiek, geen sleutel).
 - `web/odata.php` — BC-client (basic of NTLM, paginering via `@odata.nextLink`, `$metadata`).
 - `web/mimir_store.php` — SQLite: rijcache, dekking van een fetch, API-sleutels, usage.
@@ -63,8 +64,20 @@ Bijvoorbeeld `https://kvtmd365.kvt.nl:7148/kvtgermanylive_aad/ODataV4/Company('K
 
 `web/nightly.php` ontdekt alle bedrijven over de actieve environments (Penates-stijl) en schrijft die kaart in SQLite. De UI-dropdown **Bedrijf** leest alleen die cache — geen live Company-discovery bij page load. Metadata (`$metadata`) per environment wordt tegelijk ververst.
 
+De metadata-catalogus voor het tabblad **Webservice-metadata** ververst nightly live als hij ontbreekt of ouder is dan 20 uur (`MIMIR_CATALOG_REFRESH_AGE`; net onder een dag zodat een dagelijkse run nooit een dag overslaat).
+
 Lokaal: `php web/nightly.php`  
 Productie: `GET /mimir/nightly.php` (zelfde auth/logincheck als andere apps).
+
+## Webservice-metadata
+
+Tweede tabblad op de pagina: een overzicht van alle OData-tabellen (entity sets) per environment, met sleutels en velden (type, verplicht, maximale lengte) en navigatie. Een soort API-spec-aanvulling: welke tabellen er zijn en wat voor data eruit kan komen.
+
+- Bron: `$metadata` van `{baseUrl}/{environment}/ODataV4/`, geparsed door `odata_parse_metadata` (dezelfde parser als de verkenner). Environments komen alleen uit `$environment` in `auth.php` (met credentials in `$auth_list`); de volgorde van `$auth_list` telt niet.
+- Opslag: `web/data/mimir-catalog-<environment>.json` (`{environment, fetched_at, entity_sets:[{name, entity_type, keys, properties:[{name, type, nullable, max_length?}], navigation}]}`), achter `web/data/.htaccess` en buiten de FTP-mirror. Ontbreekt het bestand nog, dan bouwt Mímir het uit de bestaande metadata-snapshot zonder BC te bellen.
+- Verversen: `nightly.php` (zie boven), elke live `$metadata`-fetch van de verkenner, en de knop **Vernieuwen** (ingelogd; hooguit één BC-call per minuut per environment). De pagina en de API lezen alleen het bestand: nooit `$metadata` per page-load.
+- Pagina: tabellen standaard ingevouwen, 50 per pagina, zoekbalk die hoofdletterongevoelig filtert op tabelnaam én veldnamen (treffers gemarkeerd; bij een veldmatch staat in de regel welke velden), environment-keuze, telling «X tabellen, Y gevonden» en «Laatst bijgewerkt» in Europe/Amsterdam. Deeplink: `index.php#metadata`.
+- Machine-readable: `GET /mimir/api/metadata.php` (zie [API](#api)).
 
 ## Cache
 
@@ -155,6 +168,7 @@ Authenticatie voor de data-API: `Authorization: Bearer <sleutel>` of `X-API-Key:
 | GET | `/mimir/api/schema.php?table=ItemList&company=…` | velden, types, sleutels van dat environment |
 | GET | `/mimir/api/companies.php` | bedrijven uit de nightly-cache (`name` + `environment`). Geen live discovery per call |
 | POST | `/mimir/api/query.php` | één tabel, of meerdere via `queries` |
+| GET | `/mimir/api/metadata.php` | webservice-metadata: alle tabellen met sleutels en velden. Optioneel `environment`, `q` (zoekfilter op tabel- en veldnamen), `table` (één tabel), `page`/`per_page` (max 50). Ook met de ingelogde sessie, zonder sleutel. Belt BC niet |
 
 Zonder `PATH_INFO` werken ook:
 
@@ -162,6 +176,18 @@ Zonder `PATH_INFO` werken ook:
 - `GET /mimir/api/index.php?route=companies`
 - `GET /mimir/api/index.php/tables/ItemList/schema`
 - `POST /mimir/api/index.php/query`
+
+Metadata:
+
+```sh
+curl -sS -H "Authorization: Bearer mimir_…" \
+  "https://sleutels.kvt.nl/mimir/api/metadata.php?environment=kvtmdlive_aad&q=vendor_no"
+
+curl -sS -H "X-API-Key: mimir_…" \
+  "https://sleutels.kvt.nl/mimir/api/metadata.php?table=AppItems"
+```
+
+Antwoord: `{ "environment", "environments", "fetched_at", "fetched_at_label", "total", "matched", "q", "entity_sets": [ { "name", "entity_type", "keys", "properties": [ { "name", "type", "nullable", "max_length?" } ], "navigation", "match?" } ] }`. Met `q` krijgt elke tabel `match: { "name": bool, "fields": [ … ] }`; tabellen met een naammatch staan vooraan.
 
 Eén tabel:
 
@@ -244,4 +270,5 @@ php tests/mimir_heatmap_test.php
 php tests/mimir_auth_env_test.php
 php tests/mimir_sqlite_test.php
 php tests/mimir_reliability_test.php
+php tests/mimir_metadata_test.php
 ```

@@ -53,6 +53,12 @@ function mimir_h(string $value): string
             </div>
         </header>
 
+        <nav class="tabs" role="tablist" aria-label="Weergave">
+            <button type="button" role="tab" id="tab-explorer" aria-controls="view-explorer" aria-selected="true" data-tab="explorer">OData-verkenner</button>
+            <button type="button" role="tab" id="tab-metadata" aria-controls="view-metadata" aria-selected="false" data-tab="metadata" tabindex="-1">Webservice-metadata</button>
+        </nav>
+
+        <div id="view-explorer" role="tabpanel" aria-labelledby="tab-explorer">
         <section class="panel">
             <div class="panel-head">
                 <h2>Tabel</h2>
@@ -177,9 +183,38 @@ function mimir_h(string $value): string
                 </table>
             </div>
         </section>
+        </div>
+
+        <div id="view-metadata" role="tabpanel" aria-labelledby="tab-metadata" hidden>
+            <section class="panel">
+                <div class="panel-head">
+                    <h2>Webservice-metadata</h2>
+                    <p>Alle OData-tabellen (entity sets) van Business Central met sleutels, velden en types, uit <code>$metadata</code>. De lijst komt uit de cache in Mímir: nightly.php ververst hem dagelijks, of gebruik Vernieuwen. Machine-readable: <a href="api/metadata.php">api/metadata.php</a> (zie <a href="openapi.yaml">OpenAPI</a>).</p>
+                </div>
+                <div class="toolbar metadata-toolbar">
+                    <label class="field" id="md-environment-field" hidden>
+                        <span>Environment</span>
+                        <select id="md-environment"></select>
+                    </label>
+                    <label class="field grow">
+                        <span>Zoek op tabel of veld</span>
+                        <input id="md-search" type="search" placeholder="Bijvoorbeeld ItemList of Vendor_No" autocomplete="off">
+                    </label>
+                    <button type="button" id="md-refresh">Vernieuwen</button>
+                </div>
+                <div class="metadata-summary">
+                    <p id="md-count" class="md-count" role="status">Metadata laden…</p>
+                    <p id="md-updated" class="md-updated"></p>
+                </div>
+                <p id="md-status" class="status" role="status"></p>
+                <div class="pager" id="md-pager-top"></div>
+                <div id="md-list" class="md-list"></div>
+                <div class="pager" id="md-pager-bottom"></div>
+            </section>
+        </div>
     </div>
     <footer class="site-footer">
-        <p>API-documentatie: <a href="openapi.yaml">OpenAPI (YAML)</a> · <a href="openapi.json">JSON</a></p>
+        <p>API-documentatie: <a href="openapi.yaml">OpenAPI (YAML)</a> · <a href="openapi.json">JSON</a> · Metadata: <a href="api/metadata.php">api/metadata.php</a></p>
     </footer>
     <script src="mimir.js"></script>
 </body>

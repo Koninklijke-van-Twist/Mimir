@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="NAV" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Media">
+        <Key><PropertyRef Name="ID" /></Key>
+        <Property Name="ID" Type="Edm.Guid" Nullable="false"><Annotation Term="NAV.LabelId" String="ID" /></Property>
+        <Property Name="Content" Type="Edm.Stream" />
+      </EntityType>
+      <EntityType Name="Company">
+        <Key><PropertyRef Name="Name" /></Key>
+        <Property Name="Name" Type="Edm.String" Nullable="false" MaxLength="30"><Annotation Term="NAV.LabelId" String="Name" /></Property>
+        <Property Name="Display_Name" Type="Edm.String" MaxLength="250" />
+        <NavigationProperty Name="AppItems" Type="Collection(NAV.AppItems)" ContainsTarget="true" />
+        <NavigationProperty Name="PageItemLedgerEntries" Type="Collection(NAV.PageItemLedgerEntries)" ContainsTarget="true" />
+      </EntityType>
+      <EntityType Name="AppItems">
+        <Key><PropertyRef Name="No" /></Key>
+        <Property Name="No" Type="Edm.String" Nullable="false" MaxLength="20">
+          <Annotation Term="NAV.LabelId" String="No" />
+          <Annotation Term="NAV.NavType"><EnumMember>NAV.NavType/Code</EnumMember></Annotation>
+        </Property>
+        <Property Name="Description" Type="Edm.String" MaxLength="100" />
+        <Property Name="Vendor_No" Type="Edm.String" MaxLength="20" />
+        <Property Name="Inventory" Type="Edm.Decimal" Scale="Variable" />
+        <Property Name="Blocked" Type="Edm.Boolean" />
+        <Property Name="Last_Date_Modified" Type="Edm.Date" />
+      </EntityType>
+      <EntityType Name="PageItemLedgerEntries">
+        <Key><PropertyRef Name="Entry_No" /></Key>
+        <Property Name="Entry_No" Type="Edm.Int32" Nullable="false" />
+        <Property Name="Item_No" Type="Edm.String" MaxLength="20" />
+        <Property Name="Posting_Date" Type="Edm.Date" />
+        <Property Name="Quantity" Type="Edm.Decimal" Scale="Variable" />
+      </EntityType>
+      <EntityType Name="SalesLinesType">
+        <Key>
+          <PropertyRef Name="Document_Type" />
+          <PropertyRef Name="Document_No" />
+          <PropertyRef Name="Line_No" />
+        </Key>
+        <Property Name="Document_Type" Type="Edm.String" Nullable="false" />
+        <Property Name="Document_No" Type="Edm.String" Nullable="false" MaxLength="20" />
+        <Property Name="Line_No" Type="Edm.Int32" Nullable="false" />
+        <Property Name="No" Type="Edm.String" MaxLength="20" />
+        <Property Name="Unit_Price" Type="Edm.Decimal" Scale="Variable" />
+        <NavigationProperty Name="Item" Type="NAV.AppItems" />
+      </EntityType>
+      <EntityType Name="VendorList">
+        <Key><PropertyRef Name="No" /></Key>
+        <Property Name="No" Type="Edm.String" Nullable="false" MaxLength="20" />
+        <Property Name="Name" Type="Edm.String" MaxLength="100" />
+        <Property Name="Country_Region_Code" Type="Edm.String" MaxLength="10" />
+      </EntityType>
+      <EntityContainer Name="NAV">
+        <ActionImport Name="AppPostScanningEntry_PostScanningEntry" Action="NAV.AppPostScanningEntry_PostScanningEntry" />
+        <EntitySet Name="Company" EntityType="NAV.Company">
+          <NavigationPropertyBinding Path="AppItems" Target="AppItems" />
+        </EntitySet>
+        <EntitySet Name="VendorList" EntityType="NAV.VendorList" />
+        <EntitySet Name="AppItems" EntityType="NAV.AppItems" />
+        <EntitySet Name="SalesLines" EntityType="NAV.SalesLinesType" />
+        <EntitySet Name="PageItemLedgerEntries" EntityType="NAV.PageItemLedgerEntries" />
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

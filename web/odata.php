@@ -295,7 +295,11 @@ function mimir_same_odata_origin(string $url, string $prefix): bool
 }
 
 /**
- * @return array{entity_sets: list<array{name: string, entity_type: string}>, types: array<string, array{keys: list<string>, properties: array<string, string>}>}
+ * Naast keys en properties (naam => type) bewaart de parser per type ook
+ * facets (alleen Nullable="false" en MaxLength, als ze er staan) en
+ * navigation properties. Bestaande aanroepers gebruiken alleen keys/properties.
+ *
+ * @return array{entity_sets: list<array{name: string, entity_type: string}>, types: array<string, array{keys: list<string>, properties: array<string, string>, facets?: array<string, array{nullable?: bool, max_length?: int}>, navigation?: list<array{name: string, type: string}>}>}
  */
 function odata_parse_metadata(string $xml): array
 {
@@ -321,6 +325,8 @@ function odata_parse_metadata(string $xml): array
             }
             $keys = [];
             $properties = [];
+            $facets = [];
+            $navigation = [];
             foreach ($element->childNodes as $child) {
                 if (!$child instanceof DOMElement) {
                     continue;
@@ -341,9 +347,26 @@ function odata_parse_metadata(string $xml): array
                         continue;
                     }
                     $properties[$propName] = $child->getAttribute('Type') ?: 'Edm.String';
+                    $facet = [];
+                    if (strtolower($child->getAttribute('Nullable')) === 'false') {
+                        $facet['nullable'] = false;
+                    }
+                    $maxLength = $child->getAttribute('MaxLength');
+                    if ($maxLength !== '' && ctype_digit($maxLength)) {
+                        $facet['max_length'] = (int) $maxLength;
+                    }
+                    if ($facet !== []) {
+                        $facets[$propName] = $facet;
+                    }
+                }
+                if ($child->localName === 'NavigationProperty') {
+                    $navName = $child->getAttribute('Name');
+                    if ($navName !== '') {
+                        $navigation[] = ['name' => $navName, 'type' => $child->getAttribute('Type')];
+                    }
                 }
             }
-            $types[$name] = ['keys' => $keys, 'properties' => $properties];
+            $types[$name] = ['keys' => $keys, 'properties' => $properties, 'facets' => $facets, 'navigation' => $navigation];
         }
         if ($element->localName === 'EntitySet' && $element->parentNode instanceof DOMElement && $element->parentNode->localName === 'EntityContainer') {
             $setName = $element->getAttribute('Name');
