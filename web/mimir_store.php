@@ -15,6 +15,8 @@ const MIMIR_DEFAULT_TOP = 100;
 const MIMIR_MAX_TOP = 10000;
 const MIMIR_METADATA_TTL = 3600;
 const MIMIR_COMPANY_TTL = 86400;
+const MIMIR_USAGE_KIND_READ = 'read';
+const MIMIR_USAGE_KIND_WRITE = 'write';
 
 class MimirUserException extends RuntimeException
 {
@@ -81,6 +83,7 @@ function mimir_db(string $path, ?int $busyTimeoutMs = null): PDO
             mimir_db_track_path($path);
             if ($path === mimir_reliability_db_path()) {
                 mimir_key_mirror_sync($pdo);
+                mimir_cache_invalidation_apply_pending($pdo);
             }
         }
 
@@ -186,9 +189,15 @@ function mimir_migrate(PDO $pdo): void
             key_plain TEXT NOT NULL,
             key_hash TEXT NOT NULL UNIQUE,
             created_at INTEGER NOT NULL,
-            revoked_at INTEGER
+            revoked_at INTEGER,
+            can_write INTEGER NOT NULL DEFAULT 0
         )'
     );
+    // Schrijfrecht naar BC per sleutel; bestaande sleutels blijven alleen-lezen.
+    $keyColumns = mimir_sqlite_columns($pdo, 'api_keys');
+    if ($keyColumns !== [] && !in_array('can_write', $keyColumns, true)) {
+        $pdo->exec('ALTER TABLE api_keys ADD COLUMN can_write INTEGER NOT NULL DEFAULT 0');
+    }
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS api_usage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,7 +207,8 @@ function mimir_migrate(PDO $pdo): void
             shared INTEGER NOT NULL DEFAULT 0,
             bc_hit INTEGER NOT NULL DEFAULT 0,
             from_cache INTEGER NOT NULL DEFAULT 0,
-            from_live INTEGER NOT NULL DEFAULT 0
+            from_live INTEGER NOT NULL DEFAULT 0,
+            kind TEXT NOT NULL DEFAULT \'read\'
         )'
     );
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_api_usage_key_time ON api_usage(key_id, called_at)');
@@ -216,7 +226,12 @@ function mimir_migrate(PDO $pdo): void
         if (!in_array('from_live', $usageColumns, true)) {
             $pdo->exec('ALTER TABLE api_usage ADD COLUMN from_live INTEGER NOT NULL DEFAULT 0');
         }
+        // Heatmap: leesacties en schrijfacties in dezelfde tabel; bestaande rijen zijn reads.
+        if (!in_array('kind', $usageColumns, true)) {
+            $pdo->exec("ALTER TABLE api_usage ADD COLUMN kind TEXT NOT NULL DEFAULT 'read'");
+        }
     }
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_api_usage_key_kind_time ON api_usage(key_id, kind, called_at)');
 }
 
 function mimir_key_hash(string $key): string
@@ -225,9 +240,9 @@ function mimir_key_hash(string $key): string
 }
 
 /**
- * @return array{id: int, label: string, key: string, created_at: int}
+ * @return array{id: int, label: string, key: string, created_at: int, can_write: bool}
  */
-function mimir_key_create(PDO $pdo, string $ownerEmail, string $label, int $now): array
+function mimir_key_create(PDO $pdo, string $ownerEmail, string $label, int $now, bool $canWrite = false): array
 {
     $ownerEmail = strtolower(trim($ownerEmail));
     $label = trim($label);
@@ -239,7 +254,7 @@ function mimir_key_create(PDO $pdo, string $ownerEmail, string $label, int $now)
     }
     $plain = 'mimir_' . bin2hex(random_bytes(24));
     $stmt = $pdo->prepare(
-        'INSERT INTO api_keys (owner_email, label, key_plain, key_hash, created_at) VALUES (:owner, :label, :plain, :hash, :created)'
+        'INSERT INTO api_keys (owner_email, label, key_plain, key_hash, created_at, can_write) VALUES (:owner, :label, :plain, :hash, :created, :can_write)'
     );
     $stmt->execute([
         ':owner' => $ownerEmail,
@@ -247,16 +262,18 @@ function mimir_key_create(PDO $pdo, string $ownerEmail, string $label, int $now)
         ':plain' => $plain,
         ':hash' => mimir_key_hash($plain),
         ':created' => $now,
+        ':can_write' => $canWrite ? 1 : 0,
     ]);
 
     $createdId = (int) $pdo->lastInsertId();
-    mimir_key_mirror_remember($createdId, $plain, $label, $ownerEmail);
+    mimir_key_mirror_remember($createdId, $plain, $label, $ownerEmail, $canWrite);
 
     return [
         'id' => $createdId,
         'label' => $label,
         'key' => $plain,
         'created_at' => $now,
+        'can_write' => $canWrite,
     ];
 }
 
@@ -264,7 +281,7 @@ function mimir_key_create(PDO $pdo, string $ownerEmail, string $label, int $now)
  * Actieve sleutel opzoeken via SHA-256. De plaintext blijft in de tabel zodat
  * de eigenaar hem in de UI altijd terugziet.
  *
- * @return array{id: int, owner_email: string, label: string, key_plain: string}|null
+ * @return array{id: int, owner_email: string, label: string, key_plain: string, can_write: bool}|null
  */
 function mimir_key_lookup(PDO $pdo, string $plain): ?array
 {
@@ -273,7 +290,7 @@ function mimir_key_lookup(PDO $pdo, string $plain): ?array
         return null;
     }
     $stmt = $pdo->prepare(
-        'SELECT id, owner_email, label, key_plain FROM api_keys WHERE key_hash = :hash AND revoked_at IS NULL'
+        'SELECT id, owner_email, label, key_plain, can_write FROM api_keys WHERE key_hash = :hash AND revoked_at IS NULL'
     );
     $stmt->execute([':hash' => mimir_key_hash($plain)]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -289,8 +306,9 @@ function mimir_key_lookup(PDO $pdo, string $plain): ?array
         'owner_email' => (string) $row['owner_email'],
         'label' => (string) $row['label'],
         'key_plain' => (string) $row['key_plain'],
+        'can_write' => (int) ($row['can_write'] ?? 0) === 1,
     ];
-    mimir_key_mirror_remember($record['id'], $plain, $record['label'], $record['owner_email']);
+    mimir_key_mirror_remember($record['id'], $plain, $record['label'], $record['owner_email'], $record['can_write']);
 
     return $record;
 }
@@ -314,17 +332,42 @@ function mimir_key_revoke(PDO $pdo, int $id, string $ownerEmail, int $now): bool
 }
 
 /**
- * @return list<array{id: int, label: string, key: string, created_at: int, revoked_at: ?int, avg_per_day: float, shared_pct: ?int, days: list<array{date: string, count: int, future: bool}>}>
+ * Schrijfrecht naar BC aan- of uitzetten. Zelfde regel als intrekken: alleen
+ * de eigenaar, en alleen een actieve sleutel.
+ */
+function mimir_key_set_write(PDO $pdo, int $id, string $ownerEmail, bool $canWrite): bool
+{
+    $stmt = $pdo->prepare(
+        'UPDATE api_keys SET can_write = :can_write WHERE id = :id AND owner_email = :owner AND revoked_at IS NULL'
+    );
+    $stmt->execute([
+        ':can_write' => $canWrite ? 1 : 0,
+        ':id' => $id,
+        ':owner' => strtolower(trim($ownerEmail)),
+    ]);
+    $exists = $pdo->prepare('SELECT COUNT(*) FROM api_keys WHERE id = :id AND owner_email = :owner AND revoked_at IS NULL');
+    $exists->execute([':id' => $id, ':owner' => strtolower(trim($ownerEmail))]);
+    $found = (int) $exists->fetchColumn() > 0;
+    if ($found) {
+        mimir_key_mirror_set_write($id, $canWrite);
+    }
+
+    return $found;
+}
+
+/**
+ * @return list<array{id: int, label: string, key: string, created_at: int, revoked_at: ?int, can_write: bool, avg_per_day: float, shared_pct: ?int, days: list<array{date: string, count: int, future: bool}>, write_days: list<array{date: string, count: int, future: bool}>, write_note: ?string}>
  */
 function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
 {
     $stmt = $pdo->prepare(
-        'SELECT id, label, key_plain, created_at, revoked_at FROM api_keys WHERE owner_email = :owner ORDER BY id DESC'
+        'SELECT id, label, key_plain, created_at, revoked_at, can_write FROM api_keys WHERE owner_email = :owner ORDER BY id DESC'
     );
     $stmt->execute([':owner' => strtolower(trim($ownerEmail))]);
     $rows = [];
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $id = (int) $row['id'];
+        $canWrite = (int) ($row['can_write'] ?? 0) === 1;
         $rows[] = [
             'id' => $id,
             'label' => (string) $row['label'],
@@ -333,7 +376,10 @@ function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
             'revoked_at' => $row['revoked_at'] === null ? null : (int) $row['revoked_at'],
             'avg_per_day' => mimir_key_avg_per_day($pdo, $id, $now),
             'shared_pct' => mimir_key_shared_pct($pdo, $id, $now),
-            'days' => mimir_key_usage_days($pdo, $id, $now),
+            'can_write' => $canWrite,
+            'days' => mimir_key_usage_days($pdo, $id, $now, MIMIR_USAGE_KIND_READ),
+            'write_days' => $canWrite ? mimir_key_usage_days($pdo, $id, $now, MIMIR_USAGE_KIND_WRITE) : [],
+            'write_note' => $canWrite ? null : MIMIR_HEATMAP_WRITE_DISABLED_TEXT,
         ];
     }
     return $rows;
@@ -344,7 +390,7 @@ function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
  *
  * @return list<array{date: string, count: int, future: bool}>
  */
-function mimir_key_usage_days(PDO $pdo, int $keyId, int $now): array
+function mimir_key_usage_days(PDO $pdo, int $keyId, int $now, string $kind = MIMIR_USAGE_KIND_READ): array
 {
     $today = mimir_heatmap_today($now);
     $dates = mimir_heatmap_grid_dates($today);
@@ -354,19 +400,20 @@ function mimir_key_usage_days(PDO $pdo, int $keyId, int $now): array
     $zone = mimir_heatmap_timezone();
     $from = (new DateTimeImmutable($dates[0] . ' 00:00:00', $zone))->getTimestamp();
     $to = (new DateTimeImmutable($today . ' 23:59:59', $zone))->getTimestamp();
-    return mimir_heatmap_build_grid_days(mimir_usage_counts_by_date($pdo, $keyId, $from, $to), $today);
+    return mimir_heatmap_build_grid_days(mimir_usage_counts_by_date($pdo, $keyId, $from, $to, $kind), $today);
 }
 
 /**
  * @return array<string, int>
  */
-function mimir_usage_counts_by_date(PDO $pdo, int $keyId, int $fromUnix, int $toUnix): array
+function mimir_usage_counts_by_date(PDO $pdo, int $keyId, int $fromUnix, int $toUnix, string $kind = MIMIR_USAGE_KIND_READ): array
 {
     $stmt = $pdo->prepare(
-        'SELECT called_at FROM api_usage WHERE key_id = :id AND called_at >= :from_at AND called_at <= :to_at'
+        'SELECT called_at FROM api_usage WHERE key_id = :id AND kind = :kind AND called_at >= :from_at AND called_at <= :to_at'
     );
     $stmt->execute([
         ':id' => $keyId,
+        ':kind' => $kind === MIMIR_USAGE_KIND_WRITE ? MIMIR_USAGE_KIND_WRITE : MIMIR_USAGE_KIND_READ,
         ':from_at' => $fromUnix,
         ':to_at' => $toUnix,
     ]);
@@ -444,12 +491,14 @@ function mimir_usage_log(
     int $shared = 0,
     int $bcHit = 0,
     int $fromCache = 0,
-    int $fromLive = 0
+    int $fromLive = 0,
+    string $kind = MIMIR_USAGE_KIND_READ
 ): void {
-    mimir_db_retry(static function () use ($pdo, $keyId, $endpoint, $now, $shared, $bcHit, $fromCache, $fromLive): void {
+    $kind = $kind === MIMIR_USAGE_KIND_WRITE ? MIMIR_USAGE_KIND_WRITE : MIMIR_USAGE_KIND_READ;
+    mimir_db_retry(static function () use ($pdo, $keyId, $endpoint, $now, $shared, $bcHit, $fromCache, $fromLive, $kind): void {
         $stmt = $pdo->prepare(
-            'INSERT INTO api_usage (key_id, endpoint, called_at, shared, bc_hit, from_cache, from_live)
-             VALUES (:id, :endpoint, :at, :shared, :bc_hit, :from_cache, :from_live)'
+            'INSERT INTO api_usage (key_id, endpoint, called_at, shared, bc_hit, from_cache, from_live, kind)
+             VALUES (:id, :endpoint, :at, :shared, :bc_hit, :from_cache, :from_live, :kind)'
         );
         $stmt->execute([
             ':id' => $keyId,
@@ -459,6 +508,7 @@ function mimir_usage_log(
             ':bc_hit' => $bcHit ? 1 : 0,
             ':from_cache' => max(0, $fromCache),
             ':from_live' => max(0, $fromLive),
+            ':kind' => $kind,
         ]);
     });
 }
@@ -648,6 +698,25 @@ function mimir_cache_delete(PDO $pdo, string $environment, string $company, stri
             ':entity' => $entity,
             ':row_key' => $rowKey,
         ]);
+    });
+}
+
+/**
+ * Na een geslaagde write: alle rijen en alle dekking van die tabel in dat
+ * bedrijf (en environment) weg, zodat de volgende read live naar BC gaat.
+ *
+ * @return array{rows: int, coverage: int}
+ */
+function mimir_cache_invalidate_entity(PDO $pdo, string $environment, string $company, string $entity): array
+{
+    return mimir_db_retry(static function () use ($pdo, $environment, $company, $entity): array {
+        $params = [':environment' => $environment, ':company' => $company, ':entity' => $entity];
+        $rows = $pdo->prepare('DELETE FROM cache_rows WHERE environment = :environment AND company = :company COLLATE NOCASE AND entity = :entity COLLATE NOCASE');
+        $rows->execute($params);
+        $coverage = $pdo->prepare('DELETE FROM cache_coverage WHERE environment = :environment AND company = :company COLLATE NOCASE AND entity = :entity COLLATE NOCASE');
+        $coverage->execute($params);
+
+        return ['rows' => $rows->rowCount(), 'coverage' => $coverage->rowCount()];
     });
 }
 

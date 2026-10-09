@@ -195,6 +195,13 @@ th { color: #00529b; font-size: .75rem; }
 code.key { font-size: .78rem; word-break: break-all; }
 tr.revoked { color: var(--kvt-muted); }
 .heatmap-svg { display: block; }
+.heatmap-split { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; }
+.heatmap-part { min-width: 120px; }
+.heatmap-title { margin: 0 0 4px; font-size: .72rem; font-weight: 600; color: var(--kvt-muted); }
+.heatmap-disabled { margin: 0; font-size: .75rem; color: var(--kvt-muted); font-style: italic; max-width: 130px; }
+.key-badge { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 9px; font-size: .68rem; background: #eef2f5; color: var(--kvt-muted); white-space: nowrap; }
+.key-badge-write { background: #fff1dc; color: #9a5b00; font-weight: 600; }
+.field-check { display: inline-flex; align-items: center; gap: 6px; font-size: .85rem; white-space: nowrap; }
 .heatmap-caption { margin: 4px 0 0; color: var(--kvt-muted); font-size: .68rem; font-weight: 500; }
 .empty { color: var(--kvt-muted); padding: 8px 0; }
 

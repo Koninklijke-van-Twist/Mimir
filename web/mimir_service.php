@@ -629,7 +629,7 @@ function mimir_usage_log_best_effort(
 }
 
 /**
- * @return array{id: int, owner_email: string, label: string, key_plain: string}|null
+ * @return array{id: int, owner_email: string, label: string, key_plain: string, can_write: bool}|null
  */
 function mimir_authenticate_api_key(string $apiKey, ?PDO &$pdo): ?array
 {
@@ -838,6 +838,24 @@ function mimir_session_email(): string
     return $email;
 }
 
+function mimir_request_csrf_token(): string
+{
+    return trim((string) ($_SERVER['HTTP_X_MIMIR_CSRF'] ?? ''));
+}
+
+/**
+ * Sleutelbeheer dat iets verandert vraagt een geldig CSRF-token.
+ */
+function mimir_ui_require_csrf(string $action): void
+{
+    if (!in_array($action, ['keys_create', 'keys_revoke', 'keys_set_write'], true)) {
+        return;
+    }
+    if (!mimir_csrf_valid(mimir_request_csrf_token())) {
+        throw new MimirUserException('Ongeldig of ontbrekend CSRF-token. Herlaad de pagina.', 403);
+    }
+}
+
 function mimir_ui_open_db(): ?PDO
 {
     if (mimir_circuit_should_bypass()) {
@@ -869,12 +887,24 @@ function mimir_ui_cached_payload(PDO $pdo, string $action, string $email, int $n
             'shared_pct_global' => mimir_usage_shared_pct_global($pdo, $now),
         ];
     }
+    mimir_ui_require_csrf($action);
     if ($action === 'keys_create') {
         if (!is_array($body)) {
             throw new MimirUserException('JSON-body ontbreekt.');
         }
 
-        return mimir_key_create($pdo, $email, (string) ($body['label'] ?? ''), $now);
+        return mimir_key_create($pdo, $email, (string) ($body['label'] ?? ''), $now, ($body['can_write'] ?? false) === true);
+    }
+    if ($action === 'keys_set_write') {
+        if (!is_array($body) || !is_bool($body['can_write'] ?? null)) {
+            throw new MimirUserException('can_write (true/false) is verplicht.');
+        }
+        $ok = mimir_key_set_write($pdo, (int) ($body['id'] ?? 0), $email, $body['can_write']);
+        if (!$ok) {
+            throw new MimirUserException('Sleutel niet gevonden.', 404);
+        }
+
+        return ['ok' => true, 'id' => (int) $body['id'], 'can_write' => $body['can_write']];
     }
     if ($action === 'keys_revoke') {
         if (!is_array($body)) {
@@ -954,7 +984,7 @@ function mimir_ui_main(): void
     $action = trim((string) ($_GET['action'] ?? ''));
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     $now = time();
-    $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST'];
+    $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST', 'keys_set_write' => 'POST'];
     $dataActions = ['companies' => 'GET', 'tables' => 'GET', 'schema' => 'GET', 'query' => 'POST'];
     $metadataActions = ['metadata' => 'GET', 'metadata_refresh' => 'POST'];
 

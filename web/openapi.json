@@ -23,6 +23,9 @@
     },
     {
       "name": "query"
+    },
+    {
+      "name": "write"
     }
   ],
   "paths": {
@@ -481,6 +484,404 @@
           },
           "502": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/write.php": {
+      "post": {
+        "tags": [
+          "write"
+        ],
+        "summary": "Rij invoegen (insert) in BC",
+        "description": "Schrijft live naar Business Central via OData. Alleen voor API-sleutels met \"Mag schrijven naar BC\" (`can_write`). Het environment volgt uit het bedrijf (zoals bij lezen). Nooit uit de cache, altijd binnen een BC-slot, en zonder automatische retry. Na een geslaagde write is de cache van die tabel in dat bedrijf ongeldig.",
+        "operationId": "writeInsert",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Gelukt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Sleutel ontbreekt, is ongeldig of ingetrokken (code unauthorized). Een ingelogde sessie telt niet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Sleutel heeft geen schrijfrecht (code write_not_allowed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Ongeldig verzoek (invalid_request, invalid_table, invalid_key, invalid_field, invalid_body) of een 4xx van BC (bc_error, met bc_status en bc_error)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Onbekend bedrijf (unknown_company) of tabel niet gepubliceerd in dat environment (unknown_table)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON-body groter dan 256 KB (body_too_large)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "BC gaf een 5xx (bc_error) of was onbereikbaar (bc_unreachable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Alle BC-slots bezet na 120 s wachten (bc_busy), of database en sleutelspiegel niet beschikbaar (unavailable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "BC antwoordde niet op tijd (bc_timeout). NIET automatisch opnieuw geprobeerd: controleer in BC of de write toch is uitgevoerd.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "write"
+        ],
+        "summary": "Rij bijwerken (update) in BC",
+        "description": "Schrijft live naar Business Central via OData. Alleen voor API-sleutels met \"Mag schrijven naar BC\" (`can_write`). Het environment volgt uit het bedrijf (zoals bij lezen). Nooit uit de cache, altijd binnen een BC-slot, en zonder automatische retry. Na een geslaagde write is de cache van die tabel in dat bedrijf ongeldig. Vereist `key` en een etag.",
+        "operationId": "writeUpdate",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "ETag van de rij (@odata.etag). Verplicht bij PATCH en DELETE, tenzij `etag` of `data.@odata.etag` in de body staat."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Gelukt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteResult"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "Etag ontbreekt (etag_required)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Sleutel ontbreekt, is ongeldig of ingetrokken (code unauthorized). Een ingelogde sessie telt niet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Sleutel heeft geen schrijfrecht (code write_not_allowed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Ongeldig verzoek (invalid_request, invalid_table, invalid_key, invalid_field, invalid_body) of een 4xx van BC (bc_error, met bc_status en bc_error)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Onbekend bedrijf (unknown_company) of tabel niet gepubliceerd in dat environment (unknown_table)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON-body groter dan 256 KB (body_too_large)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "BC gaf een 5xx (bc_error) of was onbereikbaar (bc_unreachable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Alle BC-slots bezet na 120 s wachten (bc_busy), of database en sleutelspiegel niet beschikbaar (unavailable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "BC antwoordde niet op tijd (bc_timeout). NIET automatisch opnieuw geprobeerd: controleer in BC of de write toch is uitgevoerd.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "write"
+        ],
+        "summary": "Rij verwijderen in BC",
+        "description": "Schrijft live naar Business Central via OData. Alleen voor API-sleutels met \"Mag schrijven naar BC\" (`can_write`). Het environment volgt uit het bedrijf (zoals bij lezen). Nooit uit de cache, altijd binnen een BC-slot, en zonder automatische retry. Na een geslaagde write is de cache van die tabel in dat bedrijf ongeldig. Vereist `key` en een etag.",
+        "operationId": "writeDelete",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "ETag van de rij (@odata.etag). Verplicht bij PATCH en DELETE, tenzij `etag` of `data.@odata.etag` in de body staat."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Gelukt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteResult"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "Etag ontbreekt (etag_required)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Sleutel ontbreekt, is ongeldig of ingetrokken (code unauthorized). Een ingelogde sessie telt niet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Sleutel heeft geen schrijfrecht (code write_not_allowed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Ongeldig verzoek (invalid_request, invalid_table, invalid_key, invalid_field, invalid_body) of een 4xx van BC (bc_error, met bc_status en bc_error)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Onbekend bedrijf (unknown_company) of tabel niet gepubliceerd in dat environment (unknown_table)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON-body groter dan 256 KB (body_too_large)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "BC gaf een 5xx (bc_error) of was onbereikbaar (bc_unreachable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Alle BC-slots bezet na 120 s wachten (bc_busy), of database en sleutelspiegel niet beschikbaar (unavailable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "BC antwoordde niet op tijd (bc_timeout). NIET automatisch opnieuw geprobeerd: controleer in BC of de write toch is uitgevoerd.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteError"
+                }
+              }
+            }
           }
         }
       }
@@ -955,6 +1356,153 @@
           },
           "meta": {
             "$ref": "#/components/schemas/QueryMeta"
+          }
+        }
+      },
+      "WriteRequest": {
+        "type": "object",
+        "required": [
+          "company",
+          "table"
+        ],
+        "properties": {
+          "company": {
+            "type": "string",
+            "description": "Bedrijfsnaam; bepaalt het environment"
+          },
+          "table": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "description": "Entity set die in de metadata van dat environment staat"
+          },
+          "key": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Alle sleutelvelden uit de metadata, bv. {\"No\": \"1000\"}. Verplicht bij PATCH en DELETE"
+          },
+          "etag": {
+            "type": "string",
+            "description": "Alternatief voor de header If-Match"
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Velden voor BC (alleen bekende velden). Verplicht bij POST en PATCH"
+          }
+        }
+      },
+      "WriteResult": {
+        "type": "object",
+        "required": [
+          "ok",
+          "method",
+          "company",
+          "table",
+          "environment",
+          "bc_status"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "POST",
+              "PATCH",
+              "DELETE"
+            ]
+          },
+          "company": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "bc_status": {
+            "type": "integer"
+          },
+          "etag": {
+            "type": "string",
+            "nullable": true
+          },
+          "value": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": true,
+            "description": "De rij zoals BC hem teruggaf (null bij DELETE)"
+          },
+          "meta": {
+            "type": "object",
+            "properties": {
+              "source": {
+                "type": "string",
+                "enum": [
+                  "bc-live"
+                ]
+              },
+              "cache_invalidated": {
+                "type": "boolean"
+              },
+              "queue_wait_ms": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "WriteError": {
+        "type": "object",
+        "required": [
+          "error",
+          "code"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "unauthorized",
+              "write_not_allowed",
+              "method_not_allowed",
+              "invalid_request",
+              "invalid_table",
+              "invalid_key",
+              "invalid_field",
+              "invalid_body",
+              "body_too_large",
+              "etag_required",
+              "unknown_company",
+              "unknown_table",
+              "bc_error",
+              "bc_timeout",
+              "bc_unreachable",
+              "bc_busy",
+              "unavailable",
+              "internal_error"
+            ]
+          },
+          "bc_status": {
+            "type": "integer"
+          },
+          "bc_error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "environment": {
+            "type": "string"
           }
         }
       }

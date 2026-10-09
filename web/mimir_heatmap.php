@@ -14,6 +14,8 @@ const MIMIR_HEATMAP_CELL_GAP = 2;
 const MIMIR_HEATMAP_INTENSITY_MAX = 3500;
 const MIMIR_HEATMAP_OVER_LIMIT_MULTIPLIER = 5;
 const MIMIR_HEATMAP_TZ = 'Europe/Amsterdam';
+/** Staat in plaats van de schrijf-heatmap bij een sleutel zonder schrijfrecht. */
+const MIMIR_HEATMAP_WRITE_DISABLED_TEXT = 'Schrijven niet toegestaan';
 
 function mimir_heatmap_timezone(): DateTimeZone
 {
@@ -131,7 +133,7 @@ function mimir_heatmap_activity_level(int $count, int $intensityMax = MIMIR_HEAT
 }
 
 /**
- * @return array{rows: int, cols: int, cell_px: int, gap_px: int, intensity_max: int, over_limit_multiplier: int}
+ * @return array{rows: int, cols: int, cell_px: int, gap_px: int, intensity_max: int, over_limit_multiplier: int, write_disabled_text: string}
  */
 function mimir_heatmap_options(): array
 {
@@ -142,5 +144,6 @@ function mimir_heatmap_options(): array
         'gap_px' => MIMIR_HEATMAP_CELL_GAP,
         'intensity_max' => MIMIR_HEATMAP_INTENSITY_MAX,
         'over_limit_multiplier' => MIMIR_HEATMAP_OVER_LIMIT_MULTIPLIER,
+        'write_disabled_text' => MIMIR_HEATMAP_WRITE_DISABLED_TEXT,
     ];
 }
