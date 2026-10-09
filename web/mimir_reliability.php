@@ -1135,7 +1135,9 @@ function mimir_key_mirror_path(): string
 function mimir_key_mirror_sync(PDO $pdo): void
 {
     try {
-        $stmt = $pdo->query('SELECT id, key_hash, revoked_at, label, owner_email FROM api_keys');
+        $columns = mimir_sqlite_columns($pdo, 'api_keys');
+        $writeColumn = in_array('can_write', $columns, true) ? 'can_write' : '0 AS can_write';
+        $stmt = $pdo->query('SELECT id, key_hash, revoked_at, label, owner_email, ' . $writeColumn . ' FROM api_keys');
         if ($stmt === false) {
             return;
         }
@@ -1154,6 +1156,7 @@ function mimir_key_mirror_sync(PDO $pdo): void
                 'revoked' => $revokedAt !== null && $revokedAt !== '',
                 'label' => (string) ($row['label'] ?? ''),
                 'owner_email' => (string) ($row['owner_email'] ?? ''),
+                'can_write' => (int) ($row['can_write'] ?? 0) === 1,
             ];
         }
         mimir_json_file_write(mimir_key_mirror_path(), ['keys' => $keys]);
@@ -1161,7 +1164,11 @@ function mimir_key_mirror_sync(PDO $pdo): void
     }
 }
 
-function mimir_key_mirror_remember(int $id, string $plain, string $label = '', string $ownerEmail = ''): void
+/**
+ * Bij een open circuit bepaalt de spiegel wie er binnenkomt; `can_write`
+ * gaat daarom mee (default false, dus een oude spiegel geeft geen schrijfrecht).
+ */
+function mimir_key_mirror_remember(int $id, string $plain, string $label = '', string $ownerEmail = '', bool $canWrite = false): void
 {
     $plain = trim($plain);
     if ($id < 1 || $plain === '') {
@@ -1187,8 +1194,95 @@ function mimir_key_mirror_remember(int $id, string $plain, string $label = '', s
         'revoked' => false,
         'label' => $label,
         'owner_email' => $ownerEmail,
+        'can_write' => $canWrite,
     ];
     mimir_json_file_write(mimir_key_mirror_path(), ['keys' => $keys]);
+}
+
+function mimir_key_mirror_set_write(int $id, bool $canWrite): void
+{
+    if ($id < 1) {
+        return;
+    }
+    $data = mimir_json_file_read(mimir_key_mirror_path());
+    $keys = $data['keys'] ?? [];
+    if (!is_array($keys)) {
+        return;
+    }
+    $changed = false;
+    foreach ($keys as $hash => $row) {
+        if (is_array($row) && (int) ($row['id'] ?? 0) === $id) {
+            $keys[$hash]['can_write'] = $canWrite;
+            $changed = true;
+        }
+    }
+    if ($changed) {
+        mimir_json_file_write(mimir_key_mirror_path(), ['keys' => $keys]);
+    }
+}
+
+function mimir_pending_path(): string
+{
+    return mimir_runtime_dir() . '/mimir-pending.jsonl';
+}
+
+/**
+ * Bijtaak van een write die nu niet lukte (SQLite weg, circuit open):
+ * `invalidate` (cache legen), `usage` (heatmap) of `log` (schrijflog in
+ * SQLite). Append-only JSONL met LOCK_EX, zodat gelijktijdige writes niets
+ * kwijtraken. Faalt zelf nooit hard.
+ *
+ * @param array<string, mixed> $data
+ */
+function mimir_pending_add(string $type, array $data): bool
+{
+    try {
+        $path = mimir_pending_path();
+        $dir = dirname($path);
+        if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+            return false;
+        }
+        $json = json_encode(['type' => $type, 'data' => $data], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($json === false) {
+            return false;
+        }
+        $ok = @file_put_contents($path, $json . "\n", FILE_APPEND | LOCK_EX) !== false;
+        @chmod($path, 0666);
+
+        return $ok;
+    } catch (Throwable) {
+        return false;
+    }
+}
+
+/**
+ * Pakt de wachtrij atomair op (rename), zodat twee processen hem niet dubbel
+ * toepassen. Wat de aanroeper niet kan toepassen, zet hij terug met
+ * mimir_pending_add.
+ *
+ * @return list<array{type: string, data: array<string, mixed>}>
+ */
+function mimir_pending_take(): array
+{
+    $path = mimir_pending_path();
+    if (!is_file($path)) {
+        return [];
+    }
+    $claimed = $path . '.processing.' . getmypid() . '.' . bin2hex(random_bytes(3));
+    if (!@rename($path, $claimed)) {
+        return [];
+    }
+    $items = [];
+    $raw = @file_get_contents($claimed);
+    @unlink($claimed);
+    foreach (explode("\n", is_string($raw) ? $raw : '') as $line) {
+        $decoded = json_decode(trim($line), true);
+        if (is_array($decoded) && is_string($decoded['type'] ?? null) && is_array($decoded['data'] ?? null)) {
+            $items[] = ['type' => $decoded['type'], 'data' => $decoded['data']];
+        }
+    }
+
+    return $items;
 }
 
 function mimir_key_mirror_revoke(int $id): void
@@ -1244,6 +1338,7 @@ function mimir_key_mirror_lookup(string $plain): ?array
         'owner_email' => trim((string) ($keys[$hash]['owner_email'] ?? '')),
         'label' => trim((string) ($keys[$hash]['label'] ?? '')),
         'key_plain' => '',
+        'can_write' => ($keys[$hash]['can_write'] ?? false) === true,
     ];
 }
 
@@ -1337,4 +1432,33 @@ function mimir_metadata_snapshot_read(string $environment, int $ttl): ?array
     }
 
     return $parsed;
+}
+
+/**
+ * CSRF-token voor sleutelbeheer (aanmaken, intrekken, schrijfrecht). Staat in
+ * de sessie en als <meta name="mimir-csrf"> op de pagina; mimir.js stuurt hem
+ * mee als header X-Mimir-CSRF.
+ */
+function mimir_csrf_token(): string
+{
+    if (session_status() !== PHP_SESSION_ACTIVE && !headers_sent() && PHP_SAPI !== 'cli') {
+        session_start();
+    }
+    $token = $_SESSION['mimir_csrf'] ?? '';
+    if (!is_string($token) || strlen($token) < 32) {
+        $token = bin2hex(random_bytes(32));
+        $_SESSION['mimir_csrf'] = $token;
+    }
+
+    return $token;
+}
+
+function mimir_csrf_valid(string $presented): bool
+{
+    $expected = $_SESSION['mimir_csrf'] ?? '';
+    if (!is_string($expected) || strlen($expected) < 32 || $presented === '') {
+        return false;
+    }
+
+    return hash_equals($expected, $presented);
 }

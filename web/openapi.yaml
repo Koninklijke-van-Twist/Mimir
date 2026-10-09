@@ -24,6 +24,7 @@ tags:
   - name: catalog
   - name: metadata
   - name: query
+  - name: write
 paths:
   /companies.php:
     get:
@@ -260,6 +261,315 @@ paths:
           $ref: "#/components/responses/Error"
         "502":
           $ref: "#/components/responses/Error"
+  "/write.php":
+    post:
+      tags:
+        - "write"
+      summary: "Rij invoegen (insert) in BC"
+      description: "Schrijft live naar Business Central via OData. Alleen voor API-sleutels met \"Mag schrijven naar BC\" (`can_write`). Het environment volgt uit het bedrijf (zoals bij lezen). Nooit uit de cache, altijd binnen een BC-slot, en zonder automatische retry. Na een geslaagde write is de cache van die tabel in dat bedrijf ongeldig. Etag: zonder etag geeft PATCH/DELETE 428 `etag_required`. Overschrijven zonder versiecheck alleen expliciet met `etag: \"*\"`, `If-Match: *` of `force: true`; dat staat als `forced` in het antwoord en het schrijflog. Bijtaken (heatmap, cache-invalidatie, log) zijn best-effort: de write gaat altijd door, ook bij een open circuit; wat niet lukt komt in een pending-wachtrij."
+      operationId: "writeInsert"
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/WriteRequest"
+      responses:
+        "201":
+          description: "Gelukt"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteResult"
+        "401":
+          description: "Sleutel ontbreekt, is ongeldig of ingetrokken (code unauthorized). Een ingelogde sessie telt niet."
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "403":
+          description: "Sleutel heeft geen schrijfrecht (code write_not_allowed)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "400":
+          description: "Ongeldig verzoek (invalid_request, invalid_table, invalid_key, invalid_field, invalid_body) of een 4xx van BC (bc_error, met bc_status en bc_error)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "404":
+          description: "Onbekend bedrijf (unknown_company) of tabel niet gepubliceerd in dat environment (unknown_table)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "413":
+          description: "JSON-body groter dan 256 KB (body_too_large)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "502":
+          description: "BC gaf een 5xx (bc_error) of was onbereikbaar (bc_unreachable)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "503":
+          description: "Alle BC-slots bezet na 120 s wachten (bc_busy), of database en sleutelspiegel niet beschikbaar (unavailable)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "504":
+          description: "BC antwoordde niet op tijd (bc_timeout). NIET automatisch opnieuw geprobeerd: controleer in BC of de write toch is uitgevoerd."
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+    patch:
+      tags:
+        - "write"
+      summary: "Rij bijwerken (update) in BC"
+      description: "Schrijft live naar Business Central via OData. Alleen voor API-sleutels met \"Mag schrijven naar BC\" (`can_write`). Het environment volgt uit het bedrijf (zoals bij lezen). Nooit uit de cache, altijd binnen een BC-slot, en zonder automatische retry. Na een geslaagde write is de cache van die tabel in dat bedrijf ongeldig. Vereist `key` en een etag. Etag: zonder etag geeft PATCH/DELETE 428 `etag_required`. Overschrijven zonder versiecheck alleen expliciet met `etag: \"*\"`, `If-Match: *` of `force: true`; dat staat als `forced` in het antwoord en het schrijflog. Bijtaken (heatmap, cache-invalidatie, log) zijn best-effort: de write gaat altijd door, ook bij een open circuit; wat niet lukt komt in een pending-wachtrij."
+      operationId: "writeUpdate"
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: "If-Match"
+          in: "header"
+          required: false
+          schema:
+            type: "string"
+          description: "ETag van de rij (@odata.etag). Verplicht bij PATCH en DELETE, tenzij `etag`, `data.@odata.etag` of `force: true` in de body staat. `*` = bewust zonder versiecheck (forced)."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/WriteRequest"
+      responses:
+        "200":
+          description: "Gelukt"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteResult"
+        "428":
+          description: "Etag ontbreekt (etag_required). Stuur de etag, of forceer expliciet met `*` / `force: true`."
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "401":
+          description: "Sleutel ontbreekt, is ongeldig of ingetrokken (code unauthorized). Een ingelogde sessie telt niet."
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "403":
+          description: "Sleutel heeft geen schrijfrecht (code write_not_allowed)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "400":
+          description: "Ongeldig verzoek (invalid_request, invalid_table, invalid_key, invalid_field, invalid_body) of een 4xx van BC (bc_error, met bc_status en bc_error)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "404":
+          description: "Onbekend bedrijf (unknown_company) of tabel niet gepubliceerd in dat environment (unknown_table)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "413":
+          description: "JSON-body groter dan 256 KB (body_too_large)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "502":
+          description: "BC gaf een 5xx (bc_error) of was onbereikbaar (bc_unreachable)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "503":
+          description: "Alle BC-slots bezet na 120 s wachten (bc_busy), of database en sleutelspiegel niet beschikbaar (unavailable)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "504":
+          description: "BC antwoordde niet op tijd (bc_timeout). NIET automatisch opnieuw geprobeerd: controleer in BC of de write toch is uitgevoerd."
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+    delete:
+      tags:
+        - "write"
+      summary: "Rij verwijderen in BC"
+      description: "Schrijft live naar Business Central via OData. Alleen voor API-sleutels met \"Mag schrijven naar BC\" (`can_write`). Het environment volgt uit het bedrijf (zoals bij lezen). Nooit uit de cache, altijd binnen een BC-slot, en zonder automatische retry. Na een geslaagde write is de cache van die tabel in dat bedrijf ongeldig. Vereist `key` en een etag. Etag: zonder etag geeft PATCH/DELETE 428 `etag_required`. Overschrijven zonder versiecheck alleen expliciet met `etag: \"*\"`, `If-Match: *` of `force: true`; dat staat als `forced` in het antwoord en het schrijflog. Bijtaken (heatmap, cache-invalidatie, log) zijn best-effort: de write gaat altijd door, ook bij een open circuit; wat niet lukt komt in een pending-wachtrij."
+      operationId: "writeDelete"
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: "If-Match"
+          in: "header"
+          required: false
+          schema:
+            type: "string"
+          description: "ETag van de rij (@odata.etag). Verplicht bij PATCH en DELETE, tenzij `etag`, `data.@odata.etag` of `force: true` in de body staat. `*` = bewust zonder versiecheck (forced)."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/WriteRequest"
+      responses:
+        "200":
+          description: "Gelukt"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteResult"
+        "428":
+          description: "Etag ontbreekt (etag_required). Stuur de etag, of forceer expliciet met `*` / `force: true`."
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "401":
+          description: "Sleutel ontbreekt, is ongeldig of ingetrokken (code unauthorized). Een ingelogde sessie telt niet."
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "403":
+          description: "Sleutel heeft geen schrijfrecht (code write_not_allowed)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "400":
+          description: "Ongeldig verzoek (invalid_request, invalid_table, invalid_key, invalid_field, invalid_body) of een 4xx van BC (bc_error, met bc_status en bc_error)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "404":
+          description: "Onbekend bedrijf (unknown_company) of tabel niet gepubliceerd in dat environment (unknown_table)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "413":
+          description: "JSON-body groter dan 256 KB (body_too_large)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "502":
+          description: "BC gaf een 5xx (bc_error) of was onbereikbaar (bc_unreachable)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "503":
+          description: "Alle BC-slots bezet na 120 s wachten (bc_busy), of database en sleutelspiegel niet beschikbaar (unavailable)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "504":
+          description: "BC antwoordde niet op tijd (bc_timeout). NIET automatisch opnieuw geprobeerd: controleer in BC of de write toch is uitgevoerd."
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+  "/write_log.php":
+    get:
+      tags:
+        - "write"
+      summary: "Schrijflog van de eigen API-sleutel"
+      operationId: "writeLog"
+      description: "Alleen de writes van de sleutel waarmee je aanroept, nieuwste eerst. Bij een open circuit uit het jsonl-bestand (source=file, zonder paginering)."
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: "limit"
+          in: "query"
+          schema:
+            type: "integer"
+            default: 50
+            minimum: 1
+            maximum: 200
+        - name: "since"
+          in: "query"
+          schema:
+            type: "string"
+          description: "Unix-tijd of ISO-datum/tijd (Europe/Amsterdam)"
+        - name: "before_id"
+          in: "query"
+          schema:
+            type: "integer"
+          description: "Paginering: next_before_id uit het vorige antwoord"
+        - name: "table"
+          in: "query"
+          schema:
+            type: "string"
+        - name: "company"
+          in: "query"
+          schema:
+            type: "string"
+      responses:
+        "200":
+          description: "Logregels"
+          content:
+            application/json:
+              schema:
+                type: "object"
+                properties:
+                  value:
+                    type: "array"
+                    items:
+                      "$ref": "#/components/schemas/WriteLogEntry"
+                  next_before_id:
+                    type: "integer"
+                    nullable: true
+                  source:
+                    type: "string"
+                    enum:
+                      - "sqlite"
+                      - "file"
+                  key_id:
+                    type: "integer"
+                  limit:
+                    type: "integer"
+        "400":
+          description: "Ongeldige parameter (invalid_request, invalid_table)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
+        "401":
+          description: "Sleutel ontbreekt of is ongeldig (unauthorized)"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/WriteError"
 components:
   securitySchemes:
     bearerAuth:
@@ -496,3 +806,159 @@ components:
             additionalProperties: true
         meta:
           $ref: "#/components/schemas/QueryMeta"
+    WriteRequest:
+      type: "object"
+      required:
+        - "company"
+        - "table"
+      properties:
+        company:
+          type: "string"
+          description: "Bedrijfsnaam; bepaalt het environment"
+        table:
+          type: "string"
+          pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
+          description: "Entity set die in de metadata van dat environment staat"
+        key:
+          type: "object"
+          additionalProperties: true
+          description: "Alle sleutelvelden uit de metadata, bv. {\"No\": \"1000\"}. Verplicht bij PATCH en DELETE"
+        etag:
+          type: "string"
+          description: "Alternatief voor de header If-Match. `*` = overschrijven zonder versiecheck (forced)"
+        data:
+          type: "object"
+          additionalProperties: true
+          description: "Velden voor BC (alleen bekende velden). Verplicht bij POST en PATCH"
+        force:
+          type: "boolean"
+          default: false
+          description: "Alias voor etag `*`: bewust overschrijven zonder versiecheck. Niet samen met een echte etag (400)"
+    WriteResult:
+      type: "object"
+      required:
+        - "ok"
+        - "method"
+        - "company"
+        - "table"
+        - "environment"
+        - "bc_status"
+      properties:
+        ok:
+          type: "boolean"
+        method:
+          type: "string"
+          enum:
+            - "POST"
+            - "PATCH"
+            - "DELETE"
+        company:
+          type: "string"
+        table:
+          type: "string"
+        environment:
+          type: "string"
+        bc_status:
+          type: "integer"
+        etag:
+          type: "string"
+          nullable: true
+        value:
+          type: "object"
+          nullable: true
+          additionalProperties: true
+          description: "De rij zoals BC hem teruggaf (null bij DELETE)"
+        meta:
+          type: "object"
+          properties:
+            source:
+              type: "string"
+              enum:
+                - "bc-live"
+            cache_invalidated:
+              type: "boolean"
+            queue_wait_ms:
+              type: "integer"
+        forced:
+          type: "boolean"
+          description: "true als er zonder versiecheck (etag *) is geschreven"
+    WriteError:
+      type: "object"
+      required:
+        - "error"
+        - "code"
+      properties:
+        error:
+          type: "string"
+        code:
+          type: "string"
+          enum:
+            - "unauthorized"
+            - "write_not_allowed"
+            - "method_not_allowed"
+            - "invalid_request"
+            - "invalid_table"
+            - "invalid_key"
+            - "invalid_field"
+            - "invalid_body"
+            - "body_too_large"
+            - "etag_required"
+            - "unknown_company"
+            - "unknown_table"
+            - "bc_error"
+            - "bc_timeout"
+            - "bc_unreachable"
+            - "bc_busy"
+            - "unavailable"
+            - "internal_error"
+        bc_status:
+          type: "integer"
+        bc_error:
+          type: "object"
+          properties:
+            code:
+              type: "string"
+            message:
+              type: "string"
+        environment:
+          type: "string"
+    WriteLogEntry:
+      type: "object"
+      properties:
+        id:
+          type: "integer"
+        logged_at:
+          type: "integer"
+          description: "Unix-tijd"
+        logged_at_label:
+          type: "string"
+          description: "Europe/Amsterdam, Y-m-d H:i:s"
+        method:
+          type: "string"
+          enum:
+            - "POST"
+            - "PATCH"
+            - "DELETE"
+        company:
+          type: "string"
+        environment:
+          type: "string"
+        table:
+          type: "string"
+        status:
+          type: "integer"
+          description: "HTTP-status van de write (BC-status, of de Mímir-fout)"
+        duration_ms:
+          type: "integer"
+        fields:
+          type: "array"
+          items:
+            type: "string"
+          description: "Alleen veldnamen, geen waarden"
+        forced:
+          type: "boolean"
+        bc_called:
+          type: "boolean"
+        error:
+          type: "string"
+          nullable: true

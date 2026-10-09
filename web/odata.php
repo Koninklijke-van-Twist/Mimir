@@ -414,3 +414,56 @@ function mimir_schema_for_set(array $metadata, string $setName): array
 
     throw new RuntimeException('Onbekende tabel: ' . $setName);
 }
+
+class MimirWriteTimeoutException extends RuntimeException
+{
+}
+
+const MIMIR_WRITE_TIMEOUT_SECONDS = 120;
+
+/**
+ * Eén schrijfverzoek naar BC (POST/PATCH/DELETE). Bewust zonder retry: na een
+ * time-out weten we niet of BC de insert al deed. Elk HTTP-antwoord komt terug
+ * (ook 4xx/5xx) zodat de aanroeper de BC-fout kan doorgeven.
+ *
+ * @param list<string> $headers
+ * @return array{code: int, raw: string, headers: array<string, string>}
+ */
+function odata_write_request(string $method, string $url, array $auth, ?string $jsonBody, array $headers = []): array
+{
+    $extra = array_merge(['Content-Type: application/json; charset=utf-8'], $headers);
+    $ch = odata_init_curl($auth, 'application/json', $extra);
+    $responseHeaders = [];
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($curl, string $header) use (&$responseHeaders): int {
+        unset($curl);
+        $pieces = explode(':', $header, 2);
+        if (count($pieces) === 2) {
+            $responseHeaders[strtolower(trim($pieces[0]))] = trim($pieces[1]);
+        }
+
+        return strlen($header);
+    });
+    try {
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_TIMEOUT => MIMIR_WRITE_TIMEOUT_SECONDS,
+        ]);
+        if ($jsonBody !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonBody);
+        }
+        $raw = curl_exec($ch);
+        if ($raw === false) {
+            $errno = curl_errno($ch);
+            $message = 'cURL error: ' . curl_error($ch);
+            if ($errno === CURLE_OPERATION_TIMEDOUT) {
+                throw new MimirWriteTimeoutException($message);
+            }
+            throw new RuntimeException($message);
+        }
+
+        return ['code' => (int) curl_getinfo($ch, CURLINFO_HTTP_CODE), 'raw' => (string) $raw, 'headers' => $responseHeaders];
+    } finally {
+        curl_close($ch);
+    }
+}

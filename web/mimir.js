@@ -11,6 +11,10 @@
     const resultsEl = document.getElementById('results');
     const keyForm = document.getElementById('key-form');
     const keyLabel = document.getElementById('key-label');
+    const keyCanWrite = document.getElementById('key-can-write');
+    const csrfMeta = document.querySelector('meta[name="mimir-csrf"]');
+    const csrfToken = csrfMeta ? csrfMeta.getAttribute('content') || '' : '';
+    const writeDisabledText = 'Schrijven niet toegestaan';
     const keyStatus = document.getElementById('key-status');
     const keysBody = document.querySelector('#keys tbody');
     const sharedGlobalEl = document.getElementById('shared-global');
@@ -499,10 +503,23 @@
                 const avg = new Intl.NumberFormat('nl-NL', { maximumFractionDigits: 2 }).format(row.avg_per_day || 0);
                 const shared = formatSharedPct(row.shared_pct);
                 const revoked = row.revoked_at ? ' class="revoked"' : '';
-                const button = row.revoked_at ? 'Ingetrokken' : '<button type="button" data-revoke="' + row.id + '">Intrekken</button>';
-                const grid = renderHeatmapSvg(row.days || [], heatmap);
-                return '<tr' + revoked + '><td>' + esc(row.label) + '</td><td><code class="key">' + esc(row.key) + '</code></td><td>' + avg + '</td><td>' + esc(shared) + '</td><td>' + grid + '<p class="heatmap-caption">ma–zo</p></td><td>' + esc(formatWhen(row.created_at)) + '</td><td>' + button + '</td></tr>';
-            }).join('') : '<tr><td class="empty" colspan="7">Nog geen sleutels.</td></tr>';
+                const logButton = row.has_write_log ? '<br><button type="button" class="write-log-button" data-write-log="' + row.id + '" data-label="' + esc(row.label) + '">Schrijflogboek</button>' : '';
+                const button = (row.revoked_at ? 'Ingetrokken' : '<button type="button" data-revoke="' + row.id + '">Intrekken</button>') + logButton;
+                const canWrite = row.can_write === true;
+                const badge = canWrite
+                    ? '<span class="key-badge key-badge-write">lezen + schrijven</span>'
+                    : '<span class="key-badge">alleen lezen</span>';
+                const readGrid = renderHeatmapSvg(row.days || [], heatmap);
+                const writeBlock = canWrite
+                    ? renderHeatmapSvg(row.write_days || [], heatmap) + '<p class="heatmap-caption">ma–zo</p>'
+                    : '<p class="heatmap-disabled">' + esc(row.write_note || heatmap.write_disabled_text || writeDisabledText) + '</p>';
+                const grid = '<div class="heatmap-split">'
+                    + '<div class="heatmap-part"><p class="heatmap-title">Leesacties</p>' + readGrid + '<p class="heatmap-caption">ma–zo</p></div>'
+                    + '<div class="heatmap-part"><p class="heatmap-title">Schrijfacties</p>' + writeBlock + '</div>'
+                    + '</div>';
+                const toggle = '<label class="field-check"><input type="checkbox" data-can-write="' + row.id + '"' + (canWrite ? ' checked' : '') + (row.revoked_at ? ' disabled' : '') + '> <span>Mag schrijven naar BC</span></label>';
+                return '<tr' + revoked + '><td>' + esc(row.label) + ' ' + badge + '</td><td><code class="key">' + esc(row.key) + '</code></td><td>' + avg + '</td><td>' + esc(shared) + '</td><td>' + grid + '</td><td>' + toggle + '</td><td>' + esc(formatWhen(row.created_at)) + '</td><td>' + button + '</td></tr>';
+            }).join('') : '<tr><td class="empty" colspan="8">Nog geen sleutels.</td></tr>';
         } catch (error) {
             keyStatus.textContent = error.message;
             keyStatus.classList.add('error');
@@ -516,10 +533,11 @@
         try {
             await api('ui_api.php?action=keys_create', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify({ label: keyLabel.value }),
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Mimir-CSRF': csrfToken },
+                body: JSON.stringify({ label: keyLabel.value, can_write: !!(keyCanWrite && keyCanWrite.checked) }),
             });
             keyLabel.value = '';
+            if (keyCanWrite) keyCanWrite.checked = false;
             keyStatus.textContent = 'Sleutel aangemaakt. Hij blijft hieronder volledig zichtbaar.';
             await loadKeys();
         } catch (error) {
@@ -527,18 +545,86 @@
             keyStatus.classList.add('error');
         }
     });
+    const writeLogDialog = document.getElementById('write-log-dialog');
+    const writeLogBody = document.querySelector('#write-log-table tbody');
+    const writeLogTitle = document.getElementById('write-log-title');
+    const writeLogMore = document.getElementById('write-log-more');
+    const writeLogState = { id: 0, before: null };
+
+    function writeLogRow(entry) {
+        const ok = entry.status >= 200 && entry.status < 300;
+        return '<tr><td>' + esc(entry.logged_at_label) + '</td><td>' + esc(entry.method) + '</td><td>' + esc(entry.company) + '</td><td>' + esc(entry.environment)
+            + '</td><td>' + esc(entry.table) + '</td><td class="' + (ok ? '' : 'error') + '">' + esc(entry.status) + '</td><td>' + esc(entry.duration_ms) + ' ms</td><td>'
+            + esc((entry.fields || []).join(', ')) + '</td><td>' + (entry.forced ? 'ja' : 'nee') + '</td></tr>';
+    }
+
+    async function loadWriteLog(reset) {
+        if (reset) {
+            writeLogState.before = null;
+            writeLogBody.innerHTML = '';
+        }
+        const url = 'ui_api.php?action=keys_write_log&id=' + writeLogState.id + '&limit=50' + (writeLogState.before ? '&before_id=' + writeLogState.before : '');
+        try {
+            const data = await api(url);
+            const rows = data.value || [];
+            writeLogBody.insertAdjacentHTML('beforeend', rows.map(writeLogRow).join(''));
+            if (!writeLogBody.children.length) writeLogBody.innerHTML = '<tr><td class="empty" colspan="9">Geen schrijfacties.</td></tr>';
+            writeLogState.before = data.next_before_id || null;
+            writeLogMore.hidden = !writeLogState.before;
+        } catch (error) {
+            writeLogBody.innerHTML = '<tr><td class="empty error" colspan="9">' + esc(error.message) + '</td></tr>';
+            writeLogMore.hidden = true;
+        }
+    }
+
+    if (writeLogMore) writeLogMore.addEventListener('click', function () { loadWriteLog(false); });
+
     keysBody.addEventListener('click', async function (event) {
+        const logButton = event.target.closest('[data-write-log]');
+        if (logButton && writeLogDialog) {
+            writeLogState.id = Number(logButton.dataset.writeLog);
+            writeLogTitle.textContent = 'Schrijflogboek: ' + (logButton.dataset.label || '');
+            writeLogDialog.showModal();
+            await loadWriteLog(true);
+            return;
+        }
         const button = event.target.closest('[data-revoke]');
         if (!button) return;
         if (!window.confirm('Deze sleutel intrekken?')) return;
         try {
             await api('ui_api.php?action=keys_revoke', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Mimir-CSRF': csrfToken },
                 body: JSON.stringify({ id: Number(button.dataset.revoke) }),
             });
             await loadKeys();
         } catch (error) {
+            keyStatus.textContent = error.message;
+            keyStatus.classList.add('error');
+        }
+    });
+
+    keysBody.addEventListener('change', async function (event) {
+        const box = event.target.closest('[data-can-write]');
+        if (!box) return;
+        const wanted = box.checked;
+        if (wanted && !window.confirm('Deze sleutel laten schrijven naar Business Central (insert, update, delete via api/write.php)?')) {
+            box.checked = false;
+            return;
+        }
+        box.disabled = true;
+        try {
+            await api('ui_api.php?action=keys_set_write', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Mimir-CSRF': csrfToken },
+                body: JSON.stringify({ id: Number(box.dataset.canWrite), can_write: wanted }),
+            });
+            keyStatus.textContent = wanted ? 'Schrijven naar BC staat aan voor deze sleutel.' : 'Schrijven naar BC staat uit voor deze sleutel.';
+            keyStatus.classList.remove('error');
+            await loadKeys();
+        } catch (error) {
+            box.checked = !wanted;
+            box.disabled = false;
             keyStatus.textContent = error.message;
             keyStatus.classList.add('error');
         }

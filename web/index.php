@@ -13,6 +13,7 @@ require_once __DIR__ . '/mimir_reliability.php';
 $email = (string) ($_SESSION['user']['email'] ?? '');
 $mimirCircuit = mimir_circuit_public_state();
 $mimirEvents = mimir_event_log_recent(40);
+$mimirCsrf = mimir_csrf_token();
 function mimir_h(string $value): string
 {
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -24,6 +25,7 @@ function mimir_h(string $value): string
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#0099cc">
+    <meta name="mimir-csrf" content="<?= mimir_h($mimirCsrf) ?>">
     <title>Mímir · OData-cache</title>
     <link rel="stylesheet" href="brand.css">
     <link rel="stylesheet" href="mimir.css">
@@ -117,12 +119,16 @@ function mimir_h(string $value): string
         <section class="panel">
             <div class="panel-head">
                 <h2>API-sleutels</h2>
-                <p>De volledige sleutel blijft zichtbaar voor jou. Hij staat in leesbare vorm in de SQLite-database achter deze login, en de lookup gebruikt SHA-256. Per sleutel zie je het daggemiddelde van de laatste maand, welk aandeel van de query-aanroepen afgelopen week geen Business Central nodig had dankzij cache van een andere sleutel/app («Waarvan gedeeld»), en een weekraster van de aanroepen (maandag tot zondag).</p>
+                <p>De volledige sleutel blijft zichtbaar voor jou. Hij staat in leesbare vorm in de SQLite-database achter deze login, en de lookup gebruikt SHA-256. Per sleutel zie je het daggemiddelde van de laatste maand, welk aandeel van de query-aanroepen afgelopen week geen Business Central nodig had dankzij cache van een andere sleutel/app («Waarvan gedeeld»), en een weekraster van de aanroepen (maandag tot zondag), apart voor leesacties en schrijfacties. Schrijven naar Business Central (api/write.php) staat standaard uit en zet je per sleutel aan met «Mag schrijven naar BC».</p>
             </div>
             <form id="key-form" class="key-form">
                 <label class="field grow">
                     <span>Label</span>
                     <input id="key-label" name="label" type="text" maxlength="80" required placeholder="Bijvoorbeeld Consus">
+                </label>
+                <label class="field-check">
+                    <input id="key-can-write" name="can_write" type="checkbox">
+                    <span>Mag schrijven naar BC</span>
                 </label>
                 <button type="submit" class="primary">Sleutel maken</button>
             </form>
@@ -136,6 +142,7 @@ function mimir_h(string $value): string
                             <th>Gem. calls / dag</th>
                             <th>Waarvan gedeeld</th>
                             <th>Laatste weken</th>
+                            <th>Mag schrijven naar BC</th>
                             <th>Aangemaakt</th>
                             <th></th>
                         </tr>
@@ -144,6 +151,21 @@ function mimir_h(string $value): string
                 </table>
             </div>
         </section>
+
+        <dialog id="write-log-dialog" class="write-log-dialog">
+            <form method="dialog" class="write-log-head">
+                <h2 id="write-log-title">Schrijflogboek</h2>
+                <button type="submit">Sluiten</button>
+            </form>
+            <p class="write-log-note">Nieuwste eerst, tijden in Europe/Amsterdam. Alleen veldnamen, geen waarden.</p>
+            <div class="table-wrap">
+                <table id="write-log-table">
+                    <thead><tr><th>Tijd</th><th>Methode</th><th>Bedrijf</th><th>Environment</th><th>Tabel</th><th>Status</th><th>Duur</th><th>Velden</th><th>Geforceerd</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <button type="button" id="write-log-more" hidden>Meer laden</button>
+        </dialog>
 
         <section class="panel" id="reliability">
             <div class="panel-head">
