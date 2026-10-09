@@ -37,5 +37,7 @@ echo json_encode([
     'db' => $db,
     'schema_version' => $schema,
     'schema_expected' => MIMIR_SCHEMA_VERSION,
+    'meta_db' => basename(mimir_db_path()),
+    'split_migrated' => basename(mimir_db_path()) === 'mimir-meta.sqlite',
     'circuit' => ['mode' => $circuit['mode'], 'since' => $circuit['since']],
 ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);

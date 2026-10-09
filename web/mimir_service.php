@@ -309,7 +309,10 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
     };
     $maxAge = $forceMaxAge ?? ($spec['max_age'] ?? MIMIR_DEFAULT_MAX_AGE);
 
-    return mimir_query_entity($pdo, [
+    // Rijcache in de eigen database van environment + tabel.
+    $cachePdo = mimir_cache_pdo_for($pdo, $environment, $schema['name']);
+
+    return mimir_query_entity($cachePdo, [
         'environment' => $environment,
         'company' => $company,
         'entity' => $schema['name'],

@@ -113,6 +113,22 @@ Business Central laat ongeveer vijf gelijktijdige requests per environment toe. 
 
 Een worker die midden in een request sterft (PHP-timeout, OOM, deploy) laat geen slot achter: de kernel geeft `flock` vrij zodra het proces de filedescriptor sluit. Er is geen houder- of wachtrijtabel die een dode worker kan laten staan. Een shutdown-handler geeft slots van dit proces ook vrij als `finally` niet liep. Lukt het aanmaken van de slotbestanden niet, dan valt Mímir terug op één exclusive lock per environment. Lukt ook die lock niet (rechten, I/O, directory niet te maken), dan gaat het verzoek **live naar Business Central** zonder slot, met een regel `bypassed-to-BC` in het gebeurtenislog. Een volle wachtrij blijft HTTP **503**; bezet is geen kapotte coördinatie. Het oude `web/data/bc_limit.sqlite` wordt niet meer gebruikt en mag weg.
 
+## Databases: meta en cache per tabel
+
+- **Meta-database** `web/data/mimir-meta.sqlite`: `api_keys`, `api_usage` (heatmap, `kind` read/write), `write_log`, `meta_cache` (metadata, bedrijvenkaart). Klein en snel. Tot de eenmalige migratie klaar is (marker `web/data/mimir-split.done`), blijft dit het oude `mimir.sqlite`.
+- **Rijcache per environment + tabel** `web/data/cache/<environment>/<tabel>.sqlite` (`cache_rows`, `cache_coverage`). Een trage of kapotte tabel-database blokkeert de rest niet: bij een storage-fout krijgt alleen die database een eigen circuit (`<tabel>.sqlite.circuit`, 30 s) en gaat die query live naar BC, zonder cache. Een write-invalidatie op zo'n database komt in de pending-wachtrij.
+- De oude rijcache (2,4 GB) wordt niet overgezet; de nieuwe bestanden lopen vanzelf weer vol.
+- `api/health.php` toont `meta_db` en `split_migrated`.
+
+### Eenmalige migratie (op de server, buiten het request-pad)
+
+```sh
+cd /var/www/html/mimir
+php cli/migrate_split.php            # optioneel --data=/pad/naar/data --settle=10
+```
+
+Het script neemt een exclusieve lock (`data/mimir-split.lock`), kopieert `api_keys`, `api_usage`, `write_log` en `meta_cache` met dezelfde id's (INSERT OR IGNORE, dus idempotent), controleert per tabel dat elke oude id aanwezig is, zet pas dan de marker, wacht `--settle` seconden op lopende requests en doet een inhaalronde. Exitcode 0 = klaar; anders gewoon opnieuw draaien. `cli/` weigert web-aanroepen (403).
+
 ## Als de database vastzit
 
 SQLite krijgt `busy_timeout` van 3 seconden. Tijdelijke fouten (`SQLITE_BUSY` / `SQLITE_LOCKED`, "database is locked", disk I/O error) worden een paar keer opnieuw geprobeerd met exponentiële backoff en jitter, binnen een begrensde wachttijd. Timeouts, HTTP 429, 5xx en connection resets naar Business Central ook, met respect voor `Retry-After`.
@@ -328,6 +344,7 @@ php tests/mimir_write_test.php
 php tests/mimir_write_resilience_test.php
 php tests/mimir_migrate_test.php
 node tests/mimir_keys_render_test.js
+php tests/mimir_split_test.php
 ```
 
 De tests hebben de PHP-extensie `pdo_sqlite` nodig (Debian: `php-sqlite3`). `mimir_write_test.php` gebruikt een gemockte HTTP-client en belt Business Central nooit.
