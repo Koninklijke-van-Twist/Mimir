@@ -69,6 +69,7 @@ jobs:
             --exclude-glob .htaccess \
             --exclude-glob auth.php \
             --exclude-glob data \
+            --exclude-glob data/ \
             --exclude-glob data/** \
             --exclude-glob data/*.sqlite \
             --exclude-glob data/*.sqlite-* \
@@ -79,6 +80,7 @@ jobs:
             --exclude-glob data/*.checkpoint \
             --exclude-glob data/*.checkpoint/** \
             --exclude-glob cache \
+            --exclude-glob cache/ \
             --exclude-glob cache/** \
             --exclude-glob analytics/*.sqlite \
             --exclude-glob analytics/*.sqlite-* \
@@ -127,3 +129,16 @@ jobs:
 
           bye
           EOF
+
+      # Na de upload: health aanroepen. Ging het circuit open tijdens de
+      # upload (halve bestanden, migratie), dan sluit de lichte probe het hier
+      # meteen in plaats van bij het eerstvolgende UI-verzoek. Best-effort.
+      - name: health check (closes a circuit opened during deploy)
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(curl -s -m 30 https://sleutels.kvt.nl/mimir/api/health.php || true)
+            echo "$out"
+            case "$out" in *'"status":"ok"'*) exit 0;; esac
+            sleep 10
+          done
+          echo "::warning::Mimir health niet ok na deploy"

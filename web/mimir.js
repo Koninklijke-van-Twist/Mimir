@@ -14,7 +14,6 @@
     const keyCanWrite = document.getElementById('key-can-write');
     const csrfMeta = document.querySelector('meta[name="mimir-csrf"]');
     const csrfToken = csrfMeta ? csrfMeta.getAttribute('content') || '' : '';
-    const writeDisabledText = 'Schrijven niet toegestaan';
     const keyStatus = document.getElementById('key-status');
     const keysBody = document.querySelector('#keys tbody');
     const sharedGlobalEl = document.getElementById('shared-global');
@@ -491,6 +490,8 @@
         return new Intl.NumberFormat('nl-NL', { maximumFractionDigits: 0 }).format(Number(value)) + '%';
     }
 
+    let keysRetry = 0;
+
     async function loadKeys() {
         try {
             const data = await api('ui_api.php?action=keys');
@@ -500,29 +501,29 @@
                 sharedGlobalEl.innerHTML = 'Gedeeld <strong>' + esc(formatSharedPct(data.shared_pct_global)) + '</strong>';
             }
             keysBody.innerHTML = rows.length ? rows.map(function (row) {
-                const avg = new Intl.NumberFormat('nl-NL', { maximumFractionDigits: 2 }).format(row.avg_per_day || 0);
-                const shared = formatSharedPct(row.shared_pct);
-                const revoked = row.revoked_at ? ' class="revoked"' : '';
-                const logButton = row.has_write_log ? '<br><button type="button" class="write-log-button" data-write-log="' + row.id + '" data-label="' + esc(row.label) + '">Schrijflogboek</button>' : '';
-                const button = (row.revoked_at ? 'Ingetrokken' : '<button type="button" data-revoke="' + row.id + '">Intrekken</button>') + logButton;
-                const canWrite = row.can_write === true;
-                const badge = canWrite
-                    ? '<span class="key-badge key-badge-write">lezen + schrijven</span>'
-                    : '<span class="key-badge">alleen lezen</span>';
-                const readGrid = renderHeatmapSvg(row.days || [], heatmap);
-                const writeBlock = canWrite
-                    ? renderHeatmapSvg(row.write_days || [], heatmap) + '<p class="heatmap-caption">ma–zo</p>'
-                    : '<p class="heatmap-disabled">' + esc(row.write_note || heatmap.write_disabled_text || writeDisabledText) + '</p>';
-                const grid = '<div class="heatmap-split">'
-                    + '<div class="heatmap-part"><p class="heatmap-title">Leesacties</p>' + readGrid + '<p class="heatmap-caption">ma–zo</p></div>'
-                    + '<div class="heatmap-part"><p class="heatmap-title">Schrijfacties</p>' + writeBlock + '</div>'
-                    + '</div>';
-                const toggle = '<label class="field-check"><input type="checkbox" data-can-write="' + row.id + '"' + (canWrite ? ' checked' : '') + (row.revoked_at ? ' disabled' : '') + '> <span>Mag schrijven naar BC</span></label>';
-                return '<tr' + revoked + '><td>' + esc(row.label) + ' ' + badge + '</td><td><code class="key">' + esc(row.key) + '</code></td><td>' + avg + '</td><td>' + esc(shared) + '</td><td>' + grid + '</td><td>' + toggle + '</td><td>' + esc(formatWhen(row.created_at)) + '</td><td>' + button + '</td></tr>';
+                return window.MimirKeysRender.renderKeyRow(row, {
+                    heatmap: heatmap,
+                    renderHeatmap: renderHeatmapSvg,
+                    avg: new Intl.NumberFormat('nl-NL', { maximumFractionDigits: 2 }).format(row.avg_per_day || 0),
+                    shared: formatSharedPct(row.shared_pct),
+                    when: formatWhen(row.created_at),
+                });
             }).join('') : '<tr><td class="empty" colspan="8">Nog geen sleutels.</td></tr>';
+            // Een eerdere (tijdelijke) fout niet laten staan na een geslaagde load.
+            if (keyStatus.classList.contains('error')) {
+                keyStatus.textContent = '';
+                keyStatus.classList.remove('error');
+            }
+            keysRetry = 0;
         } catch (error) {
             keyStatus.textContent = error.message;
             keyStatus.classList.add('error');
+            // Kort na een deploy kan de database even niet bereikbaar zijn;
+            // opnieuw proberen in plaats van de melding te laten staan.
+            if (keysRetry < 5) {
+                keysRetry++;
+                window.setTimeout(loadKeys, 3000 * keysRetry);
+            }
         }
     }
 

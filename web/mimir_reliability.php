@@ -20,7 +20,7 @@ const MIMIR_SQLITE_RETRY_BASE_US = 40000;
 const MIMIR_BC_RETRY_ATTEMPTS = 3;
 const MIMIR_BC_RETRY_BUDGET_US = 8000000;
 const MIMIR_BC_RETRY_BASE_US = 200000;
-const MIMIR_CIRCUIT_PROBE_SECONDS = 15;
+const MIMIR_CIRCUIT_PROBE_SECONDS = 5;
 const MIMIR_EVENT_LOG_MAX_BYTES = 262144;
 const MIMIR_EVENT_LOG_KEEP = 3;
 const MIMIR_BC_TIMEOUT_NO_RETRY_SECONDS = 45.0;
@@ -968,13 +968,20 @@ function mimir_db_health_probe(?string $path = null): bool
 
         return false;
     }
+    // Bewust licht: openen (WAL, migratie-versie) + schema lezen + SELECT 1.
+    // PRAGMA quick_check leest de hele database; op 2,4 GB duurde dat langer
+    // dan een request mocht, faalde de probe en bleef het circuit na elke
+    // deploy open («Database niet beschikbaar.»).
     try {
         $pdo = mimir_db($path);
-        $check = $pdo->query('PRAGMA quick_check');
-        $value = strtolower(trim((string) ($check === false ? '' : $check->fetchColumn())));
-        if ($value !== 'ok') {
+        $schema = $pdo->query('SELECT COUNT(*) FROM sqlite_master');
+        $tables = (int) ($schema === false ? 0 : $schema->fetchColumn());
+        if ($schema !== false) {
+            $schema->closeCursor();
+        }
+        if ($tables < 1) {
             mimir_pdo_release($pdo);
-            mimir_circuit_trip('quick_check: ' . $value);
+            mimir_circuit_trip('schema leeg');
 
             return false;
         }
@@ -993,7 +1000,7 @@ function mimir_db_health_probe(?string $path = null): bool
         return false;
     }
     mimir_db_relax_perms($path);
-    mimir_circuit_close('quick_check ok');
+    mimir_circuit_close('probe ok');
 
     return true;
 }

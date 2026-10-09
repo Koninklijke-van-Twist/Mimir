@@ -62,6 +62,9 @@ function mimir_db(string $path, ?int $busyTimeoutMs = null): PDO
                 $pdo->exec('PRAGMA synchronous = NORMAL');
                 $mode = $pdo->query('PRAGMA journal_mode');
                 $journal = strtolower(trim((string) ($mode === false ? '' : $mode->fetchColumn())));
+                if ($mode !== false) {
+                    $mode->closeCursor();
+                }
                 mimir_db_relax_perms($path);
             }
         } catch (Throwable $error) {
@@ -118,10 +121,58 @@ function mimir_sqlite_columns(PDO $pdo, string $table): array
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $columns[] = (string) ($row['name'] ?? '');
     }
+    $stmt->closeCursor();
     return $columns;
 }
 
+/**
+ * Schemaversie in PRAGMA user_version. Verhoog bij elke schemawijziging.
+ * Een database op deze versie slaat de DDL helemaal over: geen locks per request.
+ */
+const MIMIR_SCHEMA_VERSION = 3;
+
+/**
+ * Migratie in één BEGIN IMMEDIATE-transactie. Na een deploy openen meerdere
+ * requests tegelijk de database; zonder lock deden ze allemaal dezelfde
+ * ALTER TABLE en kreeg de tweede "duplicate column name". Dat is een
+ * PDOException, dus telde het als storage-fout: circuit open en «Database
+ * niet beschikbaar.». Nu wacht de tweede op de eerste en ziet daarna de
+ * nieuwe versie.
+ */
 function mimir_migrate(PDO $pdo): void
+{
+    if (mimir_schema_version($pdo) >= MIMIR_SCHEMA_VERSION) {
+        return;
+    }
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        if (mimir_schema_version($pdo) < MIMIR_SCHEMA_VERSION) {
+            mimir_migrate_schema($pdo);
+            $pdo->exec('PRAGMA user_version = ' . MIMIR_SCHEMA_VERSION);
+        }
+        $pdo->exec('COMMIT');
+    } catch (Throwable $error) {
+        try {
+            $pdo->exec('ROLLBACK');
+        } catch (Throwable) {
+        }
+        throw $error;
+    }
+}
+
+function mimir_schema_version(PDO $pdo): int
+{
+    $stmt = $pdo->query('PRAGMA user_version');
+    if ($stmt === false) {
+        return 0;
+    }
+    $version = (int) $stmt->fetchColumn();
+    $stmt->closeCursor();
+
+    return $version;
+}
+
+function mimir_migrate_schema(PDO $pdo): void
 {
     $rowColumns = mimir_sqlite_columns($pdo, 'cache_rows');
     if ($rowColumns !== [] && !in_array('environment', $rowColumns, true)) {

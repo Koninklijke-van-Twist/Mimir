@@ -117,7 +117,11 @@ Een worker die midden in een request sterft (PHP-timeout, OOM, deploy) laat geen
 
 SQLite krijgt `busy_timeout` van 3 seconden. Tijdelijke fouten (`SQLITE_BUSY` / `SQLITE_LOCKED`, "database is locked", disk I/O error) worden een paar keer opnieuw geprobeerd met exponentiële backoff en jitter, binnen een begrensde wachttijd. Timeouts, HTTP 429, 5xx en connection resets naar Business Central ook, met respect voor `Retry-After`.
 
-Blijft de database locked, onleesbaar, readonly of corrupt, of zijn de retries op, dan gaat het verzoek **live naar Business Central** in hetzelfde JSON-formaat. `meta.source` is dan `bc-live`. Een circuit houdt dat vol tot een health probe (`PRAGMA quick_check`) de database weer gezond vindt. Andere interne fouten vallen ook terug op BC zolang de credentials er zijn. Clientfouten (ontbrekend veld, ongeldig filter) blijven een foutantwoord.
+Blijft de database locked, onleesbaar, readonly of corrupt, of zijn de retries op, dan gaat het verzoek **live naar Business Central** in hetzelfde JSON-formaat. `meta.source` is dan `bc-live`. Een circuit houdt dat vol tot een lichte health probe (openen in WAL, `sqlite_master` lezen, `SELECT 1`; hooguit elke 5 s) slaagt; die sluit het circuit meteen. Bewust geen `PRAGMA quick_check`: die leest de hele database (2,4 GB) en duurde langer dan een request, waardoor het circuit na een deploy open bleef.
+
+**Migraties** draaien alleen als `PRAGMA user_version` lager is dan `MIMIR_SCHEMA_VERSION`, in één `BEGIN IMMEDIATE`-transactie. Op de huidige versie draait er geen DDL per request; gelijktijdige requests na een deploy wachten op elkaar in plaats van allebei `ALTER TABLE` te doen.
+
+**Health:** `GET /mimir/api/health.php` (publiek, geen secrets) geeft `{status, db, schema_version, schema_expected, circuit}` en probeert bij een open circuit meteen te herstellen. De deploy-workflow roept hem aan na de upload. Andere interne fouten vallen ook terug op BC zolang de credentials er zijn. Clientfouten (ontbrekend veld, ongeldig filter) blijven een foutantwoord.
 
 Het gebeurtenislog (`web/data/mimir-events.jsonl`, tijdzone Europe/Amsterdam) staat buiten SQLite en is zichtbaar op de Mímir-pagina, samen met de circuit-staat (normal of bypass-to-BC) en sinds wanneer. Er komen geen secrets in dat log.
 
@@ -322,6 +326,8 @@ php tests/mimir_reliability_test.php
 php tests/mimir_metadata_test.php
 php tests/mimir_write_test.php
 php tests/mimir_write_resilience_test.php
+php tests/mimir_migrate_test.php
+node tests/mimir_keys_render_test.js
 ```
 
 De tests hebben de PHP-extensie `pdo_sqlite` nodig (Debian: `php-sqlite3`). `mimir_write_test.php` gebruikt een gemockte HTTP-client en belt Business Central nooit.
