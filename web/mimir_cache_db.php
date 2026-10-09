@@ -107,6 +107,7 @@ function mimir_cache_db(string $environment, string $entity): ?PDO
         return null;
     }
     $GLOBALS['mimir_cache_db_pool'][$path] = $pdo;
+    mimir_cache_db_identities()[$pdo] = $path;
 
     return $pdo;
 }
@@ -130,18 +131,31 @@ function mimir_cache_pdo_for(PDO $metaPdo, string $environment, string $entity):
 }
 
 /**
+ * Welke tabel-database achter een PDO zit, los van de pool. Een PDO die na
+ * een fout uit de pool is gehaald, blijft zo herkenbaar: een tweede fout op
+ * dezelfde PDO (nog een upsert, coverage, refresh) blijft per tabel en raakt
+ * het globale circuit niet. WeakMap: verdwijnt de PDO, dan ook de entry.
+ *
+ * @return WeakMap<PDO, string>
+ */
+function mimir_cache_db_identities(): WeakMap
+{
+    if (!isset($GLOBALS['mimir_cache_db_identity']) || !$GLOBALS['mimir_cache_db_identity'] instanceof WeakMap) {
+        $GLOBALS['mimir_cache_db_identity'] = new WeakMap();
+    }
+
+    return $GLOBALS['mimir_cache_db_identity'];
+}
+
+/**
  * Pad van de tabel-database achter deze PDO, of null als het geen
- * tabel-database uit de pool is (meta-PDO, in-memory).
+ * tabel-database is (meta-PDO, in-memory).
  */
 function mimir_cache_db_path_of(PDO $pdo): ?string
 {
-    foreach ($GLOBALS['mimir_cache_db_pool'] ?? [] as $path => $pooled) {
-        if ($pooled === $pdo) {
-            return (string) $path;
-        }
-    }
+    $identities = mimir_cache_db_identities();
 
-    return null;
+    return isset($identities[$pdo]) ? (string) $identities[$pdo] : null;
 }
 
 /**
@@ -158,7 +172,9 @@ function mimir_cache_db_fail(PDO $pdo, Throwable $error, string $environment = '
         return false;
     }
     mimir_cache_db_circuit_trip($path, $error->getMessage());
-    unset($GLOBALS['mimir_cache_db_pool'][$path]);
+    if (($GLOBALS['mimir_cache_db_pool'][$path] ?? null) === $pdo) {
+        unset($GLOBALS['mimir_cache_db_pool'][$path]);
+    }
     mimir_event_log('sqlite', 'Cache-database van deze tabel faalt, tabel gaat live: ' . $error->getMessage(), $environment, $entity, 'bypassed-to-BC');
 
     return true;

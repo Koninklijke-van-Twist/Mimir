@@ -52,6 +52,34 @@ mimir_tc_same(mimir_pdo_is_memory(mimir_cache_pdo_for($meta, $env, 'Customer')),
 mimir_tc_same(mimir_pdo_is_memory(mimir_cache_pdo_for($meta, $env, 'ItemCard')), false, 'other tables keep their cache');
 mimir_tc_same(count(mimir_cache_all(mimir_cache_pdo_for($meta, $env, 'ItemCard'), $env, 'KVT', 'ItemCard')), 1, 'other table cache intact');
 
+// --- 1b. Tweede storage-fout op dezelfde (al uit de pool gehaalde) PDO ---
+mimir_circuit_close('test');
+mimir_cache_storage_failure($customer, new PDOException('database is locked'), $env, 'Customer');
+mimir_tc_same(mimir_circuit_is_open(), false, 'second error on the same table PDO stays per table');
+$coverageError = null;
+try {
+    mimir_coverage_put($customer, $env, 'KVT', 'Customer', '', '', $now, 1);
+} catch (Throwable $error) {
+    $coverageError = $error;
+}
+mimir_tc_same($coverageError instanceof Throwable, false, 'coverage table still exists (only cache_rows dropped)');
+mimir_fetch_collection($customer, $env, 'KVT', 'Customer', $prefix, null, ['No' => 'Edm.String', 'Name' => 'Edm.String'], ['No'], [], null, 'local', $fetch, $now);
+mimir_tc_same(mimir_circuit_is_open(), false, 'repeated fetch on the failed table PDO keeps the global circuit closed');
+mimir_tc_same(mimir_cache_db_fail($customer, new PDOException('disk I/O error'), $env, 'Customer'), true, 'failed PDO is still recognised as a table db');
+$GLOBALS['mimir_stamp_bc_live'] = false;
+$second = mimir_query_entity_isolated($customer, [
+    'environment' => $env,
+    'company' => 'KVT',
+    'entity' => 'Customer',
+    'service_prefix' => $prefix,
+    'top' => 1,
+    'max_age' => 0,
+    'schema' => ['keys' => ['No'], 'properties' => ['No' => 'Edm.String', 'Name' => 'Edm.String']],
+], $fetch, $now);
+mimir_tc_same(count($second['value']), 1, 'query on the failed PDO is answered live');
+mimir_tc_same(mimir_circuit_is_open(), false, 'still no global circuit');
+mimir_tc_same(mimir_ui_open_db() instanceof PDO, true, 'keys page fine after repeated errors');
+
 // --- 2. Leesfout in de query (via mimir_with_cache_or_live, zoals de API) ---
 @unlink($customerPath . '.circuit');
 mimir_cache_db_reset_pool();
@@ -107,6 +135,16 @@ mimir_tc_same(mimir_pending_apply($meta), 2, 'stale claim is recovered and appli
 mimir_tc_same(glob(mimir_pending_path() . '.processing.*') ?: [], [], 'claim removed after apply');
 mimir_tc_same(mimir_cache_all(mimir_cache_pdo_for($meta, $env, 'Contact'), $env, 'KVT', 'Contact'), [], 'invalidation was not lost');
 mimir_tc_same((int) $meta->query("SELECT COUNT(*) FROM api_usage WHERE kind = 'write'")->fetchColumn(), 1, 'usage was not lost');
+
+// Claim van een wachtrij die al lang bestaat (storing > 10 min) is vers:
+// rename behoudt de oude mtime, dus de claim moet zelf worden aangeraakt.
+mimir_pending_add('usage', ['key_id' => $key['id'], 'endpoint' => 'write', 'at' => $now]);
+touch(mimir_pending_path(), time() - MIMIR_PENDING_STALE_SECONDS - 60);
+$claim = mimir_pending_take(); // proces A is hiermee bezig
+mimir_tc_same(count($claim['items']), 1, 'old queue claimed');
+mimir_tc_same(mimir_pending_apply($meta), 0, 'another process does not take over a fresh claim of an old queue');
+mimir_tc_same((int) $meta->query("SELECT COUNT(*) FROM api_usage WHERE kind = 'write'")->fetchColumn(), 1, 'no duplicate usage');
+mimir_pending_done($claim['files']);
 
 // Item dat niet lukt gaat terug in de wachtrij; het claimbestand verdwijnt.
 mimir_pending_add('invalidate', ['environment' => $env, 'company' => 'KVT', 'entity' => 'Broken', 'at' => $now]);

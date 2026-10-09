@@ -1297,6 +1297,10 @@ function mimir_pending_take(): array
     if (is_file($path)) {
         $claimed = mimir_pending_claim_name($path);
         if (@rename($path, $claimed)) {
+            // rename houdt de mtime van de laatste pending_add; zonder touch
+            // zou een ander proces deze verse claim na een lange storing
+            // meteen als achtergelaten zien en dubbel toepassen.
+            @touch($claimed);
             $claims[] = $claimed;
         }
     }
