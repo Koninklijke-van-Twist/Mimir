@@ -7,6 +7,7 @@ require_once __DIR__ . '/mimir_filter.php';
 require_once __DIR__ . '/odata.php';
 require_once __DIR__ . '/mimir_heatmap.php';
 require_once __DIR__ . '/mimir_bc_limit.php';
+require_once __DIR__ . '/mimir_cache_db.php';
 
 const MIMIR_UI_MAX_AGE = 600;
 const MIMIR_DEFAULT_MAX_AGE = 3600;
@@ -100,10 +101,25 @@ function mimir_db(string $path, ?int $busyTimeoutMs = null): PDO
     }
 }
 
+/**
+ * Meta-database (sleutels, heatmap, schrijflog, metadata). Tot de eenmalige
+ * migratie (cli/migrate_split.php) klaar is, blijft dat het oude
+ * mimir.sqlite; daarna data/mimir-meta.sqlite. De rijcache staat sowieso in
+ * data/cache/<environment>/<tabel>.sqlite.
+ */
 function mimir_db_path(): string
 {
-    return __DIR__ . '/data/mimir.sqlite';
+    if (isset($GLOBALS['mimir_db_path_override']) && is_string($GLOBALS['mimir_db_path_override']) && $GLOBALS['mimir_db_path_override'] !== '') {
+        return $GLOBALS['mimir_db_path_override'];
+    }
+    $dir = isset($GLOBALS['mimir_runtime_dir']) && is_string($GLOBALS['mimir_runtime_dir']) && $GLOBALS['mimir_runtime_dir'] !== ''
+        ? $GLOBALS['mimir_runtime_dir']
+        : __DIR__ . '/data';
+
+    return is_file($dir . '/' . MIMIR_SPLIT_MARKER) ? $dir . '/mimir-meta.sqlite' : $dir . '/mimir.sqlite';
 }
+
+const MIMIR_SPLIT_MARKER = 'mimir-split.done';
 
 /**
  * @return list<string>
@@ -783,8 +799,15 @@ function mimir_cache_delete(PDO $pdo, string $environment, string $company, stri
  *
  * @return array{rows: int, coverage: int}
  */
-function mimir_cache_invalidate_entity(PDO $pdo, string $environment, string $company, string $entity): array
+function mimir_cache_invalidate_entity(PDO $metaPdo, string $environment, string $company, string $entity): array
 {
+    $pdo = $metaPdo;
+    if (empty($GLOBALS['mimir_cache_split_disabled']) && !mimir_pdo_is_memory($metaPdo)) {
+        $pdo = mimir_cache_db($environment, $entity);
+        if (!$pdo instanceof PDO) {
+            throw new RuntimeException('Cache-database van ' . $environment . '/' . $entity . ' niet bruikbaar; invalidatie blijft pending.');
+        }
+    }
     return mimir_db_retry(static function () use ($pdo, $environment, $company, $entity): array {
         $params = [':environment' => $environment, ':company' => $company, ':entity' => $entity];
         $rows = $pdo->prepare('DELETE FROM cache_rows WHERE environment = :environment AND company = :company COLLATE NOCASE AND entity = :entity COLLATE NOCASE');
