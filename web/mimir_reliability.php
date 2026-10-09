@@ -1263,33 +1263,78 @@ function mimir_pending_add(string $type, array $data): bool
 }
 
 /**
+ * Na zoveel seconden geldt een geclaimd bestand (.processing.*) als
+ * achtergelaten: het proces dat het oppakte is gecrasht of over zijn
+ * tijdslimiet gegaan. De volgende take neemt het dan over.
+ */
+const MIMIR_PENDING_STALE_SECONDS = 600;
+
+/**
  * Pakt de wachtrij atomair op (rename), zodat twee processen hem niet dubbel
- * toepassen. Wat de aanroeper niet kan toepassen, zet hij terug met
- * mimir_pending_add.
+ * toepassen. Het geclaimde bestand blijft bestaan tot de aanroeper klaar is
+ * (mimir_pending_done); een crash, timeout of leesfout laat het dus staan en
+ * een latere take neemt het na MIMIR_PENDING_STALE_SECONDS over. Wat de
+ * aanroeper niet kan toepassen, zet hij terug met mimir_pending_add.
  *
- * @return list<array{type: string, data: array<string, mixed>}>
+ * @return array{items: list<array{type: string, data: array<string, mixed>}>, files: list<string>}
  */
 function mimir_pending_take(): array
 {
     $path = mimir_pending_path();
-    if (!is_file($path)) {
-        return [];
+    $claims = [];
+    foreach (glob($path . '.processing.*') ?: [] as $stale) {
+        $mtime = @filemtime($stale);
+        if ($mtime === false || (time() - $mtime) < MIMIR_PENDING_STALE_SECONDS) {
+            continue;
+        }
+        // Opnieuw claimen met rename: maar één proces neemt het over.
+        $claimed = mimir_pending_claim_name($path);
+        if (@rename($stale, $claimed)) {
+            @touch($claimed);
+            $claims[] = $claimed;
+        }
     }
-    $claimed = $path . '.processing.' . getmypid() . '.' . bin2hex(random_bytes(3));
-    if (!@rename($path, $claimed)) {
-        return [];
+    if (is_file($path)) {
+        $claimed = mimir_pending_claim_name($path);
+        if (@rename($path, $claimed)) {
+            $claims[] = $claimed;
+        }
     }
     $items = [];
-    $raw = @file_get_contents($claimed);
-    @unlink($claimed);
-    foreach (explode("\n", is_string($raw) ? $raw : '') as $line) {
-        $decoded = json_decode(trim($line), true);
-        if (is_array($decoded) && is_string($decoded['type'] ?? null) && is_array($decoded['data'] ?? null)) {
-            $items[] = ['type' => $decoded['type'], 'data' => $decoded['data']];
+    $files = [];
+    foreach ($claims as $claimed) {
+        $raw = @file_get_contents($claimed);
+        if (!is_string($raw)) {
+            // Niet leesbaar: laten staan, een latere take probeert het opnieuw.
+            continue;
+        }
+        $files[] = $claimed;
+        foreach (explode("\n", $raw) as $line) {
+            $decoded = json_decode(trim($line), true);
+            if (is_array($decoded) && is_string($decoded['type'] ?? null) && is_array($decoded['data'] ?? null)) {
+                $items[] = ['type' => $decoded['type'], 'data' => $decoded['data']];
+            }
         }
     }
 
-    return $items;
+    return ['items' => $items, 'files' => $files];
+}
+
+function mimir_pending_claim_name(string $path): string
+{
+    return $path . '.processing.' . getmypid() . '.' . bin2hex(random_bytes(3));
+}
+
+/**
+ * Alles uit deze geclaimde bestanden is toegepast of teruggezet: weg ermee.
+ *
+ * @param list<string> $files
+ */
+function mimir_pending_done(array $files): void
+{
+    foreach ($files as $file) {
+        @unlink($file);
+    }
 }
 
 function mimir_key_mirror_revoke(int $id): void
