@@ -1221,51 +1221,68 @@ function mimir_key_mirror_set_write(int $id, bool $canWrite): void
     }
 }
 
-function mimir_cache_invalidation_pending_path(): string
+function mimir_pending_path(): string
 {
-    return mimir_runtime_dir() . '/mimir-invalidate-pending.json';
+    return mimir_runtime_dir() . '/mimir-pending.jsonl';
 }
 
 /**
- * Een write die slaagde terwijl SQLite niet bereikbaar was: onthoud welke
- * tabel ongeldig moet, zodat de cache na herstel niet de oude rijen serveert.
+ * Bijtaak van een write die nu niet lukte (SQLite weg, circuit open):
+ * `invalidate` (cache legen), `usage` (heatmap) of `log` (schrijflog in
+ * SQLite). Append-only JSONL met LOCK_EX, zodat gelijktijdige writes niets
+ * kwijtraken. Faalt zelf nooit hard.
+ *
+ * @param array<string, mixed> $data
  */
-function mimir_cache_invalidation_pending_add(string $environment, string $company, string $entity, int $now): void
+function mimir_pending_add(string $type, array $data): bool
 {
-    $data = mimir_json_file_read(mimir_cache_invalidation_pending_path());
-    $items = is_array($data['items'] ?? null) ? $data['items'] : [];
-    $items[strtolower($environment . '|' . $company . '|' . $entity)] = [
-        'environment' => $environment,
-        'company' => $company,
-        'entity' => $entity,
-        'at' => $now,
-    ];
-    mimir_json_file_write(mimir_cache_invalidation_pending_path(), ['items' => $items]);
+    try {
+        $path = mimir_pending_path();
+        $dir = dirname($path);
+        if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+            return false;
+        }
+        $json = json_encode(['type' => $type, 'data' => $data], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($json === false) {
+            return false;
+        }
+        $ok = @file_put_contents($path, $json . "\n", FILE_APPEND | LOCK_EX) !== false;
+        @chmod($path, 0666);
+
+        return $ok;
+    } catch (Throwable) {
+        return false;
+    }
 }
 
-function mimir_cache_invalidation_apply_pending(PDO $pdo): void
+/**
+ * Pakt de wachtrij atomair op (rename), zodat twee processen hem niet dubbel
+ * toepassen. Wat de aanroeper niet kan toepassen, zet hij terug met
+ * mimir_pending_add.
+ *
+ * @return list<array{type: string, data: array<string, mixed>}>
+ */
+function mimir_pending_take(): array
 {
-    $path = mimir_cache_invalidation_pending_path();
-    if (!is_file($path) || !function_exists('mimir_cache_invalidate_entity')) {
-        return;
+    $path = mimir_pending_path();
+    if (!is_file($path)) {
+        return [];
     }
-    try {
-        $data = mimir_json_file_read($path);
-        $items = is_array($data['items'] ?? null) ? $data['items'] : [];
-        foreach ($items as $item) {
-            if (!is_array($item)) {
-                continue;
-            }
-            mimir_cache_invalidate_entity(
-                $pdo,
-                (string) ($item['environment'] ?? ''),
-                (string) ($item['company'] ?? ''),
-                (string) ($item['entity'] ?? '')
-            );
+    $claimed = $path . '.processing.' . getmypid() . '.' . bin2hex(random_bytes(3));
+    if (!@rename($path, $claimed)) {
+        return [];
+    }
+    $items = [];
+    $raw = @file_get_contents($claimed);
+    @unlink($claimed);
+    foreach (explode("\n", is_string($raw) ? $raw : '') as $line) {
+        $decoded = json_decode(trim($line), true);
+        if (is_array($decoded) && is_string($decoded['type'] ?? null) && is_array($decoded['data'] ?? null)) {
+            $items[] = ['type' => $decoded['type'], 'data' => $decoded['data']];
         }
-        @unlink($path);
-    } catch (Throwable) {
     }
+
+    return $items;
 }
 
 function mimir_key_mirror_revoke(int $id): void

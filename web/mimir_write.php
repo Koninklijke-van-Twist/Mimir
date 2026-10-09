@@ -60,7 +60,7 @@ function mimir_write_decode_body(?string $raw): array
  *
  * @param array<string, mixed> $query
  * @param array<string, mixed> $body
- * @return array{method: string, company: string, table: string, key: array<string, mixed>, etag: string, data: array<string, mixed>}
+ * @return array{method: string, company: string, table: string, key: array<string, mixed>, etag: string, data: array<string, mixed>, forced: bool}
  */
 function mimir_write_parse_request(string $method, array $query, array $body, string $ifMatch = ''): array
 {
@@ -96,6 +96,18 @@ function mimir_write_parse_request(string $method, array $query, array $body, st
         $etag = trim((string) ($body['etag'] ?? $data['@odata.etag'] ?? ''));
     }
     unset($data['@odata.etag']);
+    // Overschrijven zonder versiecheck alleen als de aanroeper het expliciet
+    // vraagt: etag "*" (body of If-Match) of "force": true.
+    $force = $body['force'] ?? false;
+    if (!is_bool($force)) {
+        throw new MimirWriteException('force moet true of false zijn.', 400, 'invalid_request');
+    }
+    if ($force) {
+        if ($etag !== '' && $etag !== '*') {
+            throw new MimirWriteException('force: true en een etag sluiten elkaar uit. Stuur de etag óf force.', 400, 'invalid_request');
+        }
+        $etag = '*';
+    }
 
     if ($method === 'POST' && $data === []) {
         throw new MimirWriteException('data is verplicht bij POST.', 400, 'invalid_body');
@@ -122,6 +134,7 @@ function mimir_write_parse_request(string $method, array $query, array $body, st
         'key' => is_array($key) ? $key : [],
         'etag' => $etag,
         'data' => $data,
+        'forced' => $method !== 'POST' && $etag === '*',
     ];
 }
 
@@ -242,35 +255,80 @@ function mimir_write_log_path(): string
 }
 
 /**
- * Eén regel per write. Geen veldwaarden, alleen de namen.
+ * Eén regel per write. Geen veldwaarden, alleen de namen. Gaat altijd naar
+ * het jsonl-bestand (audit/fallback) en daarnaast naar SQLite (UI en API).
+ * Lukt SQLite niet, dan komt de regel in de pending-wachtrij. Gooit nooit.
  *
  * @param array<string, mixed> $entry
  */
-function mimir_write_log(array $entry): void
+function mimir_write_log(?PDO $pdo, array $entry): void
 {
-    $caller = $GLOBALS['mimir_caller'] ?? [];
-    $line = [
-        'ts' => mimir_event_timestamp(),
-        'key_id' => (int) ($caller['key_id'] ?? 0),
-        'label' => (string) ($caller['label'] ?? ''),
-        'owner' => (string) ($caller['owner'] ?? ''),
-    ] + $entry;
-    $json = json_encode($line, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    if ($json === false) {
+    try {
+        $caller = $GLOBALS['mimir_caller'] ?? [];
+        $line = [
+            'ts' => mimir_event_timestamp((int) ($entry['logged_at'] ?? time())),
+            'entry_id' => bin2hex(random_bytes(8)),
+            'key_id' => (int) ($caller['key_id'] ?? 0),
+            'label' => (string) ($caller['label'] ?? ''),
+            'owner' => (string) ($caller['owner'] ?? ''),
+        ] + $entry;
+    } catch (Throwable) {
         return;
     }
-    $path = mimir_write_log_path();
-    $dir = dirname($path);
-    if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+    try {
+        $json = json_encode($line, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $path = mimir_write_log_path();
+        $dir = dirname($path);
+        if ($json !== false && (is_dir($dir) || @mkdir($dir, 0777, true))) {
+            if (is_file($path) && (int) @filesize($path) > MIMIR_WRITE_LOG_MAX_BYTES) {
+                @unlink($path . '.1');
+                @rename($path, $path . '.1');
+            }
+            @file_put_contents($path, $json . "\n", FILE_APPEND | LOCK_EX);
+            @chmod($path, 0666);
+        }
+    } catch (Throwable) {
+    }
+    $stored = false;
+    if ($pdo instanceof PDO && !mimir_write_side_task_failing('log')) {
+        try {
+            mimir_write_log_insert($pdo, $line);
+            $stored = true;
+        } catch (Throwable) {
+        }
+    }
+    if (!$stored) {
+        mimir_pending_add('log', $line);
+    }
+}
+
+/**
+ * Testhaak: $GLOBALS['mimir_write_fail_side_tasks'] = ['log', 'usage', 'invalidate'].
+ */
+function mimir_write_side_task_failing(string $task): bool
+{
+    $failing = $GLOBALS['mimir_write_fail_side_tasks'] ?? [];
+
+    return is_array($failing) && in_array($task, $failing, true);
+}
+
+/**
+ * Heatmapregistratie, best-effort; anders pending.
+ */
+function mimir_write_record_usage(?PDO $pdo, int $keyId, int $now): void
+{
+    if ($keyId < 1) {
         return;
     }
-    if (is_file($path) && (int) @filesize($path) > MIMIR_WRITE_LOG_MAX_BYTES) {
-        $rotated = $path . '.1';
-        @unlink($rotated);
-        @rename($path, $rotated);
+    if ($pdo instanceof PDO && !mimir_write_side_task_failing('usage')) {
+        try {
+            mimir_usage_log($pdo, $keyId, 'write', $now, 0, 1, 0, 0, MIMIR_USAGE_KIND_WRITE);
+
+            return;
+        } catch (Throwable) {
+        }
     }
-    @file_put_contents($path, $json . "\n", FILE_APPEND | LOCK_EX);
-    @chmod($path, 0666);
+    mimir_pending_add('usage', ['key_id' => $keyId, 'endpoint' => 'write', 'at' => $now]);
 }
 
 /**
@@ -288,21 +346,21 @@ function mimir_write_execute(?PDO $pdo, array $record, array $spec, int $now, ?c
     $send ??= 'odata_write_request';
     $started = microtime(true);
     $logBase = [
+        'logged_at' => $now,
         'company' => $spec['company'],
         'table' => $spec['table'],
         'method' => $spec['method'],
         'fields' => array_values(array_map('strval', array_keys($spec['data']))),
+        'forced' => !empty($spec['forced']),
     ];
     $environment = '';
     $status = 0;
     $error = '';
     $bcCalled = false;
     try {
-        $metaPdo = $pdo instanceof PDO ? $pdo : mimir_db(':memory:');
-        $environment = mimir_environment_for_company($metaPdo, $spec['company'], $now);
+        [$environment, $metadata] = mimir_write_resolve($pdo, $spec['company'], $now);
         $auth = auth_get_auth_for_environment($environment);
         $prefix = mimir_odata_prefix_for_environment($environment);
-        $metadata = mimir_metadata_for_environment($metaPdo, $environment, $now);
         try {
             $schema = mimir_schema_for_set($metadata, $spec['table']);
         } catch (RuntimeException) {
@@ -371,6 +429,7 @@ function mimir_write_execute(?PDO $pdo, array $record, array $spec, int $now, ?c
                 'bc_status' => $status,
                 'etag' => $etag !== '' ? $etag : null,
                 'value' => $value,
+                'forced' => !empty($spec['forced']),
                 'meta' => [
                     'source' => 'bc-live',
                     'cache_invalidated' => $invalidated,
@@ -404,20 +463,55 @@ function mimir_write_execute(?PDO $pdo, array $record, array $spec, int $now, ?c
         mimir_event_log('write', $other->getMessage(), $environment, $spec['table'], 'bc-failed');
         throw new MimirWriteException('Write naar Business Central mislukt: ' . mimir_event_redact(mimir_public_error($other)), 502, 'bc_unreachable', ['environment' => $environment]);
     } finally {
-        mimir_write_log($logBase + [
-            'environment' => $environment,
-            'status' => $status,
-            'duration_ms' => (int) round((microtime(true) - $started) * 1000),
-            'bc_called' => $bcCalled,
-            'error' => $error !== '' ? substr($error, 0, 300) : null,
-        ]);
-        if ($bcCalled && $pdo instanceof PDO) {
+        // Bijtaken: best-effort, nooit blokkerend; mislukt -> pending-wachtrij.
+        try {
+            mimir_write_log($pdo, $logBase + [
+                'environment' => $environment,
+                'status' => $status,
+                'duration_ms' => (int) round((microtime(true) - $started) * 1000),
+                'bc_called' => $bcCalled,
+                'error' => $error !== '' ? substr($error, 0, 300) : null,
+            ]);
+        } catch (Throwable) {
+        }
+        if ($bcCalled) {
             try {
-                mimir_usage_log($pdo, (int) $record['id'], 'write', $now, 0, 1, 0, 0, MIMIR_USAGE_KIND_WRITE);
+                mimir_write_record_usage($pdo, (int) $record['id'], $now);
             } catch (Throwable) {
             }
         }
     }
+}
+
+/**
+ * Environment en metadata voor het bedrijf. Faalt SQLite hier, dan dezelfde
+ * route als bij een open circuit (bedrijfskaart- en metadata-snapshot, of live
+ * $metadata), zodat de write niet op de cache strandt.
+ *
+ * @return array{0: string, 1: array<string, mixed>}
+ */
+function mimir_write_resolve(?PDO $pdo, string $company, int $now): array
+{
+    if ($pdo instanceof PDO) {
+        try {
+            $environment = mimir_environment_for_company($pdo, $company, $now);
+
+            return [$environment, mimir_metadata_for_environment($pdo, $environment, $now)];
+        } catch (MimirUserException $error) {
+            throw $error;
+        } catch (Throwable $error) {
+            mimir_event_log('write', 'SQLite bij write niet bruikbaar, verder via snapshot/live: ' . $error->getMessage(), '', '', 'bypassed-to-BC');
+        }
+    }
+    $GLOBALS['mimir_live_bypass'] = true;
+    try {
+        mimir_prepare_live_globals();
+    } catch (Throwable) {
+    }
+    $memory = mimir_db(':memory:');
+    $environment = mimir_environment_for_company($memory, $company, $now);
+
+    return [$environment, mimir_metadata_for_environment($memory, $environment, $now)];
 }
 
 /**
@@ -426,16 +520,19 @@ function mimir_write_execute(?PDO $pdo, array $record, array $spec, int $now, ?c
  */
 function mimir_write_invalidate(?PDO $pdo, string $environment, string $company, string $entity, int $now): bool
 {
-    if ($pdo instanceof PDO) {
-        try {
-            mimir_cache_invalidate_entity($pdo, $environment, $company, $entity);
+    try {
+        if ($pdo instanceof PDO && !mimir_write_side_task_failing('invalidate')) {
+            try {
+                mimir_cache_invalidate_entity($pdo, $environment, $company, $entity);
 
-            return true;
-        } catch (Throwable $error) {
-            mimir_event_log('write', 'Cache-invalidatie mislukt: ' . $error->getMessage(), $environment, $entity, 'failed');
+                return true;
+            } catch (Throwable $error) {
+                mimir_event_log('write', 'Cache-invalidatie mislukt (pending): ' . $error->getMessage(), $environment, $entity, 'failed');
+            }
         }
+        mimir_pending_add('invalidate', ['environment' => $environment, 'company' => $company, 'entity' => $entity, 'at' => $now]);
+    } catch (Throwable) {
     }
-    mimir_cache_invalidation_pending_add($environment, $company, $entity, $now);
 
     return false;
 }
@@ -454,23 +551,26 @@ function mimir_write_handle(string $method, string $apiKey, array $query, ?strin
         }
         mimir_caller_reset();
         mimir_caller_bind_api_key(null, $apiKey);
-        if ($pdo instanceof PDO) {
-            $record = mimir_key_lookup($pdo, $apiKey);
-        } else {
-            $record = mimir_authenticate_api_key($apiKey, $pdo);
-            if ($record === null && !$pdo instanceof PDO) {
-                throw new MimirWriteException('Database niet beschikbaar en de API-sleutel kan niet worden gecontroleerd.', 503, 'unavailable');
+        $record = null;
+        try {
+            if ($pdo instanceof PDO) {
+                $record = mimir_key_lookup($pdo, $apiKey);
+            } else {
+                $record = mimir_authenticate_api_key($apiKey, $pdo);
             }
+        } catch (Throwable) {
+            // SQLite weg: schrijfrecht via de sleutelspiegel, zoals bij een open circuit.
+            $pdo = null;
+            $record = mimir_key_mirror_lookup($apiKey);
+        }
+        if ($record === null && !$pdo instanceof PDO) {
+            throw new MimirWriteException('Database niet beschikbaar en de API-sleutel staat niet in de sleutelspiegel.', 503, 'unavailable');
         }
         if (is_array($record)) {
             mimir_caller_bind_api_key($record, $apiKey);
         }
         mimir_write_authorize($record);
         $spec = mimir_write_parse_request($method, $query, mimir_write_decode_body($rawBody), $ifMatch);
-        if (!$pdo instanceof PDO) {
-            $GLOBALS['mimir_live_bypass'] = true;
-            mimir_prepare_live_globals();
-        }
 
         return mimir_write_execute($pdo, $record, $spec, time(), $send);
     } catch (MimirWriteException $error) {
@@ -506,5 +606,151 @@ function mimir_write_api_main(): void
         $raw === false ? null : $raw,
         trim((string) ($_SERVER['HTTP_IF_MATCH'] ?? ''))
     );
+    mimir_json($result['payload'], $result['status']);
+}
+
+/**
+ * Query-parameters voor het schrijflog: limit (max 200), since (unix of
+ * ISO-datum/tijd, Europe/Amsterdam), before_id (paginering), table, company.
+ *
+ * @param array<string, mixed> $get
+ * @return array{limit: int, since: int, before_id: int, table: string, company: string}
+ */
+function mimir_write_log_options(array $get): array
+{
+    $since = trim((string) ($get['since'] ?? ''));
+    $sinceUnix = 0;
+    if ($since !== '') {
+        if (ctype_digit($since)) {
+            $sinceUnix = (int) $since;
+        } else {
+            try {
+                $sinceUnix = (new DateTimeImmutable($since, new DateTimeZone('Europe/Amsterdam')))->getTimestamp();
+            } catch (Throwable) {
+                throw new MimirWriteException('since is ongeldig (unix-tijd of ISO-datum).', 400, 'invalid_request');
+            }
+        }
+    }
+    $table = trim((string) ($get['table'] ?? ''));
+    if ($table !== '' && preg_match('/^[A-Za-z_][A-Za-z0-9_]{0,127}$/', $table) !== 1) {
+        throw new MimirWriteException('Tabelnaam is ongeldig.', 400, 'invalid_table');
+    }
+
+    return [
+        'limit' => max(1, min(MIMIR_WRITE_LOG_MAX_LIMIT, (int) ($get['limit'] ?? MIMIR_WRITE_LOG_DEFAULT_LIMIT) ?: MIMIR_WRITE_LOG_DEFAULT_LIMIT)),
+        'since' => $sinceUnix,
+        'before_id' => max(0, (int) ($get['before_id'] ?? 0)),
+        'table' => $table,
+        'company' => substr(trim((string) ($get['company'] ?? '')), 0, 120),
+    ];
+}
+
+/**
+ * Fallback zonder SQLite: het jsonl-bestand (en .1) filteren op key_id.
+ * Alleen bij een open circuit; normaal gaat alles via de index in SQLite.
+ *
+ * @param array{limit: int, since: int, before_id: int, table: string, company: string} $options
+ * @return array{value: list<array<string, mixed>>, next_before_id: ?int, source: string}
+ */
+function mimir_write_log_from_file(int $keyId, array $options): array
+{
+    $rows = [];
+    $path = mimir_write_log_path();
+    foreach ([$path . '.1', $path] as $file) {
+        $raw = is_file($file) ? @file_get_contents($file) : false;
+        if (!is_string($raw)) {
+            continue;
+        }
+        foreach (explode("\n", $raw) as $line) {
+            $entry = json_decode(trim($line), true);
+            if (!is_array($entry) || (int) ($entry['key_id'] ?? 0) !== $keyId) {
+                continue;
+            }
+            $at = (int) ($entry['logged_at'] ?? 0);
+            if ($options['since'] > 0 && $at < $options['since']) {
+                continue;
+            }
+            if ($options['table'] !== '' && strcasecmp((string) ($entry['table'] ?? ''), $options['table']) !== 0) {
+                continue;
+            }
+            if ($options['company'] !== '' && strcasecmp((string) ($entry['company'] ?? ''), $options['company']) !== 0) {
+                continue;
+            }
+            $rows[] = mimir_write_log_public_row([
+                'id' => 0,
+                'logged_at' => $at,
+                'method' => $entry['method'] ?? '',
+                'company' => $entry['company'] ?? '',
+                'environment' => $entry['environment'] ?? '',
+                'table_name' => $entry['table'] ?? '',
+                'status' => $entry['status'] ?? 0,
+                'duration_ms' => $entry['duration_ms'] ?? 0,
+                'fields' => json_encode($entry['fields'] ?? []),
+                'forced' => !empty($entry['forced']) ? 1 : 0,
+                'bc_called' => !empty($entry['bc_called']) ? 1 : 0,
+                'error' => $entry['error'] ?? null,
+            ]);
+        }
+    }
+    $rows = array_reverse($rows);
+
+    return ['value' => array_slice($rows, 0, $options['limit']), 'next_before_id' => null, 'source' => 'file'];
+}
+
+/**
+ * api/write_log.php: een API-sleutel leest alleen zijn eigen writes.
+ *
+ * @param array<string, mixed> $get
+ * @return array{status: int, payload: array<string, mixed>}
+ */
+function mimir_write_log_api_handle(string $method, string $apiKey, array $get, ?PDO $pdo = null): array
+{
+    try {
+        if (strtoupper($method) !== 'GET') {
+            throw new MimirWriteException('GET verwacht.', 405, 'method_not_allowed');
+        }
+        if ($apiKey === '') {
+            throw new MimirWriteException('API-sleutel ontbreekt. Gebruik Authorization: Bearer of de header X-API-Key.', 401, 'unauthorized');
+        }
+        mimir_caller_reset();
+        mimir_caller_bind_api_key(null, $apiKey);
+        try {
+            $record = $pdo instanceof PDO ? mimir_key_lookup($pdo, $apiKey) : mimir_authenticate_api_key($apiKey, $pdo);
+        } catch (Throwable) {
+            $pdo = null;
+            $record = mimir_key_mirror_lookup($apiKey);
+        }
+        if (!is_array($record)) {
+            throw new MimirWriteException('API-sleutel is ongeldig of ingetrokken.', 401, 'unauthorized');
+        }
+        mimir_caller_bind_api_key($record, $apiKey);
+        $options = mimir_write_log_options($get);
+        $keyId = (int) $record['id'];
+        $result = null;
+        if ($pdo instanceof PDO) {
+            try {
+                $result = mimir_write_log_list($pdo, $keyId, $options) + ['source' => 'sqlite'];
+                mimir_usage_log_best_effort($pdo, $keyId, 'write_log', time());
+            } catch (Throwable) {
+                $result = null;
+            }
+        }
+        $result ??= mimir_write_log_from_file($keyId, $options);
+
+        return ['status' => 200, 'payload' => $result + ['key_id' => $keyId, 'limit' => $options['limit']]];
+    } catch (MimirWriteException $error) {
+        return ['status' => $error->status, 'payload' => ['error' => $error->getMessage(), 'code' => $error->errorCode]];
+    } catch (Throwable $error) {
+        return ['status' => 500, 'payload' => ['error' => mimir_public_error($error), 'code' => 'internal_error']];
+    }
+}
+
+function mimir_write_log_api_main(): void
+{
+    $apiKey = mimir_request_api_key();
+    if ($apiKey !== '') {
+        mimir_load_auth(true);
+    }
+    $result = mimir_write_log_api_handle((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'), $apiKey, $_GET);
     mimir_json($result['payload'], $result['status']);
 }

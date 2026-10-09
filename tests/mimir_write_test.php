@@ -239,7 +239,7 @@ try {
 // Pending invalidatie bij een write zonder SQLite
 mimir_cache_upsert($pdo, 'kvtmdlive_aad', 'Koninklijke van Twist', 'ItemCard', 'B', ['No' => 'B'], $now);
 mimir_write_same(mimir_write_invalidate(null, 'kvtmdlive_aad', 'Koninklijke van Twist', 'ItemCard', $now), false, 'without DB invalidation is pending');
-mimir_cache_invalidation_apply_pending($pdo);
+mimir_pending_apply($pdo);
 mimir_write_same(mimir_cache_all($pdo, 'kvtmdlive_aad', 'Koninklijke van Twist', 'ItemCard'), [], 'pending invalidation applied on next open');
 
 exec('rm -rf ' . escapeshellarg($tmp));

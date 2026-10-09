@@ -17,6 +17,8 @@ const MIMIR_METADATA_TTL = 3600;
 const MIMIR_COMPANY_TTL = 86400;
 const MIMIR_USAGE_KIND_READ = 'read';
 const MIMIR_USAGE_KIND_WRITE = 'write';
+const MIMIR_WRITE_LOG_DEFAULT_LIMIT = 50;
+const MIMIR_WRITE_LOG_MAX_LIMIT = 200;
 
 class MimirUserException extends RuntimeException
 {
@@ -83,7 +85,7 @@ function mimir_db(string $path, ?int $busyTimeoutMs = null): PDO
             mimir_db_track_path($path);
             if ($path === mimir_reliability_db_path()) {
                 mimir_key_mirror_sync($pdo);
-                mimir_cache_invalidation_apply_pending($pdo);
+                mimir_pending_apply($pdo);
             }
         }
 
@@ -232,6 +234,28 @@ function mimir_migrate(PDO $pdo): void
         }
     }
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_api_usage_key_kind_time ON api_usage(key_id, kind, called_at)');
+    // Schrijflog per sleutel (bron voor de UI en api/write_log.php). Het
+    // jsonl-bestand blijft als fallback/audit; zie mimir_write_log.
+    $pdo->exec(
+        'CREATE TABLE IF NOT EXISTS write_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id INTEGER NOT NULL,
+            logged_at INTEGER NOT NULL,
+            method TEXT NOT NULL,
+            company TEXT NOT NULL,
+            environment TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            status INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            fields TEXT NOT NULL,
+            forced INTEGER NOT NULL DEFAULT 0,
+            bc_called INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            entry_id TEXT
+        )'
+    );
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_write_log_key ON write_log(key_id, id)');
+    $pdo->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_write_log_entry ON write_log(entry_id)');
 }
 
 function mimir_key_hash(string $key): string
@@ -380,6 +404,7 @@ function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
             'days' => mimir_key_usage_days($pdo, $id, $now, MIMIR_USAGE_KIND_READ),
             'write_days' => $canWrite ? mimir_key_usage_days($pdo, $id, $now, MIMIR_USAGE_KIND_WRITE) : [],
             'write_note' => $canWrite ? null : MIMIR_HEATMAP_WRITE_DISABLED_TEXT,
+            'has_write_log' => mimir_write_log_exists($pdo, $id),
         ];
     }
     return $rows;
@@ -1939,3 +1964,148 @@ function mimir_strip_odata_noise(array $row): array
     }
     return $clean;
 }
+
+/**
+ * Eén write in de SQLite-log. `entry_id` is uniek, zodat een regel die via de
+ * pending-wachtrij nog eens binnenkomt niet dubbel staat.
+ *
+ * @param array<string, mixed> $entry
+ */
+function mimir_write_log_insert(PDO $pdo, array $entry): void
+{
+    $stmt = $pdo->prepare(
+        'INSERT OR IGNORE INTO write_log (key_id, logged_at, method, company, environment, table_name, status, duration_ms, fields, forced, bc_called, error, entry_id)
+         VALUES (:key_id, :logged_at, :method, :company, :environment, :table_name, :status, :duration_ms, :fields, :forced, :bc_called, :error, :entry_id)'
+    );
+    $fields = json_encode(array_values(array_map('strval', is_array($entry['fields'] ?? null) ? $entry['fields'] : [])));
+    $stmt->execute([
+        ':key_id' => (int) ($entry['key_id'] ?? 0),
+        ':logged_at' => (int) ($entry['logged_at'] ?? time()),
+        ':method' => (string) ($entry['method'] ?? ''),
+        ':company' => (string) ($entry['company'] ?? ''),
+        ':environment' => (string) ($entry['environment'] ?? ''),
+        ':table_name' => (string) ($entry['table'] ?? ''),
+        ':status' => (int) ($entry['status'] ?? 0),
+        ':duration_ms' => (int) ($entry['duration_ms'] ?? 0),
+        ':fields' => $fields === false ? '[]' : $fields,
+        ':forced' => !empty($entry['forced']) ? 1 : 0,
+        ':bc_called' => !empty($entry['bc_called']) ? 1 : 0,
+        ':error' => isset($entry['error']) && $entry['error'] !== null ? substr((string) $entry['error'], 0, 300) : null,
+        ':entry_id' => (string) ($entry['entry_id'] ?? bin2hex(random_bytes(8))),
+    ]);
+}
+
+/** Indexlookup (key_id, id); geen scan van het jsonl-bestand. */
+function mimir_write_log_exists(PDO $pdo, int $keyId): bool
+{
+    try {
+        $stmt = $pdo->prepare('SELECT 1 FROM write_log WHERE key_id = :id LIMIT 1');
+        $stmt->execute([':id' => $keyId]);
+
+        return $stmt->fetchColumn() !== false;
+    } catch (Throwable) {
+        return false;
+    }
+}
+
+/**
+ * Nieuwste eerst. Paginering via before_id (de id van de laatst getoonde regel).
+ *
+ * @param array{limit?: int, since?: int, before_id?: int, table?: string, company?: string} $options
+ * @return array{value: list<array<string, mixed>>, next_before_id: ?int}
+ */
+function mimir_write_log_list(PDO $pdo, int $keyId, array $options = []): array
+{
+    $limit = max(1, min(MIMIR_WRITE_LOG_MAX_LIMIT, (int) ($options['limit'] ?? MIMIR_WRITE_LOG_DEFAULT_LIMIT)));
+    $where = ['key_id = :key_id'];
+    $params = [':key_id' => $keyId];
+    if (!empty($options['since'])) {
+        $where[] = 'logged_at >= :since';
+        $params[':since'] = (int) $options['since'];
+    }
+    if (!empty($options['before_id'])) {
+        $where[] = 'id < :before_id';
+        $params[':before_id'] = (int) $options['before_id'];
+    }
+    if (($options['table'] ?? '') !== '') {
+        $where[] = 'table_name = :table COLLATE NOCASE';
+        $params[':table'] = (string) $options['table'];
+    }
+    if (($options['company'] ?? '') !== '') {
+        $where[] = 'company = :company COLLATE NOCASE';
+        $params[':company'] = (string) $options['company'];
+    }
+    $stmt = $pdo->prepare('SELECT * FROM write_log WHERE ' . implode(' AND ', $where) . ' ORDER BY id DESC LIMIT ' . ($limit + 1));
+    $stmt->execute($params);
+    $rows = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $rows[] = mimir_write_log_public_row($row);
+    }
+    $next = null;
+    if (count($rows) > $limit) {
+        array_pop($rows);
+        $next = $rows[count($rows) - 1]['id'];
+    }
+
+    return ['value' => $rows, 'next_before_id' => $next];
+}
+
+/**
+ * @param array<string, mixed> $row
+ * @return array<string, mixed>
+ */
+function mimir_write_log_public_row(array $row): array
+{
+    $at = (int) ($row['logged_at'] ?? 0);
+    $fields = json_decode((string) ($row['fields'] ?? '[]'), true);
+
+    return [
+        'id' => (int) ($row['id'] ?? 0),
+        'logged_at' => $at,
+        'logged_at_label' => (new DateTimeImmutable('@' . $at))->setTimezone(new DateTimeZone('Europe/Amsterdam'))->format('Y-m-d H:i:s'),
+        'method' => (string) ($row['method'] ?? ''),
+        'company' => (string) ($row['company'] ?? ''),
+        'environment' => (string) ($row['environment'] ?? ''),
+        'table' => (string) ($row['table_name'] ?? ''),
+        'status' => (int) ($row['status'] ?? 0),
+        'duration_ms' => (int) ($row['duration_ms'] ?? 0),
+        'fields' => is_array($fields) ? array_values($fields) : [],
+        'forced' => (int) ($row['forced'] ?? 0) === 1,
+        'bc_called' => (int) ($row['bc_called'] ?? 0) === 1,
+        'error' => isset($row['error']) ? (string) $row['error'] : null,
+    ];
+}
+
+/**
+ * Past de pending-wachtrij van writes toe (cache legen, heatmap, log). Wat
+ * nog steeds niet lukt gaat terug in de wachtrij. Gooit nooit.
+ */
+function mimir_pending_apply(PDO $pdo): int
+{
+    $applied = 0;
+    try {
+        $items = mimir_pending_take();
+    } catch (Throwable) {
+        return 0;
+    }
+    foreach ($items as $item) {
+        $data = $item['data'];
+        try {
+            if ($item['type'] === 'invalidate') {
+                mimir_cache_invalidate_entity($pdo, (string) ($data['environment'] ?? ''), (string) ($data['company'] ?? ''), (string) ($data['entity'] ?? ''));
+            } elseif ($item['type'] === 'usage') {
+                mimir_usage_log($pdo, (int) ($data['key_id'] ?? 0), (string) ($data['endpoint'] ?? 'write'), (int) ($data['at'] ?? time()), 0, 1, 0, 0, MIMIR_USAGE_KIND_WRITE);
+            } elseif ($item['type'] === 'log') {
+                mimir_write_log_insert($pdo, $data);
+            } else {
+                continue;
+            }
+            $applied++;
+        } catch (Throwable) {
+            mimir_pending_add($item['type'], $data);
+        }
+    }
+
+    return $applied;
+}
+

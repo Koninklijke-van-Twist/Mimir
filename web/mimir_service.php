@@ -856,6 +856,26 @@ function mimir_ui_require_csrf(string $action): void
     }
 }
 
+/**
+ * Schrijflogboek van één sleutel voor de pagina. Alleen de eigenaar (zelfde
+ * regel als intrekken). Alleen lezen, dus GET zonder CSRF.
+ *
+ * @param array<string, mixed> $get
+ * @return array<string, mixed>
+ */
+function mimir_ui_key_write_log(PDO $pdo, string $email, int $keyId, array $get): array
+{
+    $stmt = $pdo->prepare('SELECT owner_email FROM api_keys WHERE id = :id');
+    $stmt->execute([':id' => $keyId]);
+    $owner = $stmt->fetchColumn();
+    if ($owner === false || strtolower((string) $owner) !== strtolower(trim($email))) {
+        throw new MimirUserException('Sleutel niet gevonden.', 404);
+    }
+    $limit = max(1, min(MIMIR_WRITE_LOG_MAX_LIMIT, (int) ($get['limit'] ?? MIMIR_WRITE_LOG_DEFAULT_LIMIT) ?: MIMIR_WRITE_LOG_DEFAULT_LIMIT));
+
+    return mimir_write_log_list($pdo, $keyId, ['limit' => $limit, 'before_id' => (int) ($get['before_id'] ?? 0)]) + ['id' => $keyId];
+}
+
 function mimir_ui_open_db(): ?PDO
 {
     if (mimir_circuit_should_bypass()) {
@@ -886,6 +906,9 @@ function mimir_ui_cached_payload(PDO $pdo, string $action, string $email, int $n
             'heatmap' => mimir_heatmap_options(),
             'shared_pct_global' => mimir_usage_shared_pct_global($pdo, $now),
         ];
+    }
+    if ($action === 'keys_write_log') {
+        return mimir_ui_key_write_log($pdo, $email, (int) ($_GET['id'] ?? 0), $_GET);
     }
     mimir_ui_require_csrf($action);
     if ($action === 'keys_create') {
@@ -984,7 +1007,7 @@ function mimir_ui_main(): void
     $action = trim((string) ($_GET['action'] ?? ''));
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     $now = time();
-    $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST', 'keys_set_write' => 'POST'];
+    $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST', 'keys_set_write' => 'POST', 'keys_write_log' => 'GET'];
     $dataActions = ['companies' => 'GET', 'tables' => 'GET', 'schema' => 'GET', 'query' => 'POST'];
     $metadataActions = ['metadata' => 'GET', 'metadata_refresh' => 'POST'];
 

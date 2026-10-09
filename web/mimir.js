@@ -503,7 +503,8 @@
                 const avg = new Intl.NumberFormat('nl-NL', { maximumFractionDigits: 2 }).format(row.avg_per_day || 0);
                 const shared = formatSharedPct(row.shared_pct);
                 const revoked = row.revoked_at ? ' class="revoked"' : '';
-                const button = row.revoked_at ? 'Ingetrokken' : '<button type="button" data-revoke="' + row.id + '">Intrekken</button>';
+                const logButton = row.has_write_log ? '<br><button type="button" class="write-log-button" data-write-log="' + row.id + '" data-label="' + esc(row.label) + '">Schrijflogboek</button>' : '';
+                const button = (row.revoked_at ? 'Ingetrokken' : '<button type="button" data-revoke="' + row.id + '">Intrekken</button>') + logButton;
                 const canWrite = row.can_write === true;
                 const badge = canWrite
                     ? '<span class="key-badge key-badge-write">lezen + schrijven</span>'
@@ -544,7 +545,49 @@
             keyStatus.classList.add('error');
         }
     });
+    const writeLogDialog = document.getElementById('write-log-dialog');
+    const writeLogBody = document.querySelector('#write-log-table tbody');
+    const writeLogTitle = document.getElementById('write-log-title');
+    const writeLogMore = document.getElementById('write-log-more');
+    const writeLogState = { id: 0, before: null };
+
+    function writeLogRow(entry) {
+        const ok = entry.status >= 200 && entry.status < 300;
+        return '<tr><td>' + esc(entry.logged_at_label) + '</td><td>' + esc(entry.method) + '</td><td>' + esc(entry.company) + '</td><td>' + esc(entry.environment)
+            + '</td><td>' + esc(entry.table) + '</td><td class="' + (ok ? '' : 'error') + '">' + esc(entry.status) + '</td><td>' + esc(entry.duration_ms) + ' ms</td><td>'
+            + esc((entry.fields || []).join(', ')) + '</td><td>' + (entry.forced ? 'ja' : 'nee') + '</td></tr>';
+    }
+
+    async function loadWriteLog(reset) {
+        if (reset) {
+            writeLogState.before = null;
+            writeLogBody.innerHTML = '';
+        }
+        const url = 'ui_api.php?action=keys_write_log&id=' + writeLogState.id + '&limit=50' + (writeLogState.before ? '&before_id=' + writeLogState.before : '');
+        try {
+            const data = await api(url);
+            const rows = data.value || [];
+            writeLogBody.insertAdjacentHTML('beforeend', rows.map(writeLogRow).join(''));
+            if (!writeLogBody.children.length) writeLogBody.innerHTML = '<tr><td class="empty" colspan="9">Geen schrijfacties.</td></tr>';
+            writeLogState.before = data.next_before_id || null;
+            writeLogMore.hidden = !writeLogState.before;
+        } catch (error) {
+            writeLogBody.innerHTML = '<tr><td class="empty error" colspan="9">' + esc(error.message) + '</td></tr>';
+            writeLogMore.hidden = true;
+        }
+    }
+
+    if (writeLogMore) writeLogMore.addEventListener('click', function () { loadWriteLog(false); });
+
     keysBody.addEventListener('click', async function (event) {
+        const logButton = event.target.closest('[data-write-log]');
+        if (logButton && writeLogDialog) {
+            writeLogState.id = Number(logButton.dataset.writeLog);
+            writeLogTitle.textContent = 'Schrijflogboek: ' + (logButton.dataset.label || '');
+            writeLogDialog.showModal();
+            await loadWriteLog(true);
+            return;
+        }
         const button = event.target.closest('[data-revoke]');
         if (!button) return;
         if (!window.confirm('Deze sleutel intrekken?')) return;

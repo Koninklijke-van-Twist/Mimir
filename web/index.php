@@ -152,6 +152,21 @@ function mimir_h(string $value): string
             </div>
         </section>
 
+        <dialog id="write-log-dialog" class="write-log-dialog">
+            <form method="dialog" class="write-log-head">
+                <h2 id="write-log-title">Schrijflogboek</h2>
+                <button type="submit">Sluiten</button>
+            </form>
+            <p class="write-log-note">Nieuwste eerst, tijden in Europe/Amsterdam. Alleen veldnamen, geen waarden.</p>
+            <div class="table-wrap">
+                <table id="write-log-table">
+                    <thead><tr><th>Tijd</th><th>Methode</th><th>Bedrijf</th><th>Environment</th><th>Tabel</th><th>Status</th><th>Duur</th><th>Velden</th><th>Geforceerd</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <button type="button" id="write-log-more" hidden>Meer laden</button>
+        </dialog>
+
         <section class="panel" id="reliability">
             <div class="panel-head">
                 <h2>Gebeurtenissen</h2>

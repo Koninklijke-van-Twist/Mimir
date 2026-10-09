@@ -171,6 +171,7 @@ Authenticatie voor de data-API: `Authorization: Bearer <sleutel>` of `X-API-Key:
 | GET | `/mimir/api/schema.php?table=ItemList&company=…` | velden, types, sleutels van dat environment |
 | GET | `/mimir/api/companies.php` | bedrijven uit de nightly-cache (`name` + `environment`). Geen live discovery per call |
 | POST | `/mimir/api/query.php` | één tabel, of meerdere via `queries` |
+| GET | `/mimir/api/write_log.php` | schrijflog van de eigen sleutel (`limit`, `since`, `before_id`, `table`, `company`) |
 | POST / PATCH / DELETE | `/mimir/api/write.php` | schrijven naar BC (insert / update / delete). Alleen sleutels met schrijfrecht, zie [Schrijven naar BC](#schrijven-naar-bc) |
 | GET | `/mimir/api/metadata.php` | webservice-metadata: alle tabellen met sleutels en velden. Optioneel `environment`, `q` (zoekfilter op tabel- en veldnamen), `table` (één tabel), `page`/`per_page` (max 50). Ook met de ingelogde sessie, zonder sleutel. Belt BC niet |
 
@@ -255,7 +256,9 @@ Het antwoord is dan `{ "results": { "items": { "value", "meta" }, "vendors": { �
 | PATCH | update | `company`, `table`, `key`, `data`, etag |
 | DELETE | delete | `company`, `table`, `key`, etag |
 
-De etag (`@odata.etag` van de rij) komt uit de header `If-Match`, of uit `etag` / `data.@odata.etag` in de body. `*` mag, maar dan overschrijf je bewust zonder concurrency-check.
+De etag (`@odata.etag` van de rij) komt uit de header `If-Match`, of uit `etag` / `data.@odata.etag` in de body.
+
+**Etag en forceren.** Default: een PATCH of DELETE zonder etag geeft 428 `etag_required`; BC controleert dan of de rij sinds het lezen niet veranderd is (anders 412 van BC, doorgegeven als `bc_error`). Overschrijven zónder versiecheck kan alleen expliciet: `"etag": "*"`, de header `If-Match: *`, of `"force": true` (alias voor `*`). `force: true` samen met een echte etag geeft 400. Een geforceerde write staat in het antwoord (`forced: true`) en in het schrijflog (`forced`).
 
 ```sh
 curl -sS -X PATCH \
@@ -271,8 +274,19 @@ Antwoord: `{ "ok": true, "method", "company", "table", "environment", "bc_status
 - **Environment:** zoals bij lezen uit de bedrijfskaart (`auth_get_environment_for_company`), nooit uit de volgorde van `$auth_list`.
 - **Live:** nooit uit de cache, geen fallback. Een write neemt een BC-slot (3 per environment, 503 `bc_busy` na 120 s wachten). **Geen retry**, ook niet bij time-out of 5xx: een insert kan al gelukt zijn. Time-out na 120 s geeft 504 `bc_timeout`.
 - **Validatie:** `table` moet een kale naam zijn (`^[A-Za-z_][A-Za-z0-9_]*$`) én in de metadata van dat environment staan (gepubliceerde webservice). Veldnamen in `data` en `key` moeten in de metadata staan; alle sleutelvelden zijn verplicht en worden URL-gecodeerd. Body maximaal 256 KB.
-- **Cache:** na een geslaagde write gaan rijen en dekking van die tabel in dat bedrijf (en environment) weg, zodat de volgende read live is. Lukt SQLite niet, dan komt de invalidatie in `web/data/mimir-invalidate-pending.json` en wordt hij bij de volgende gezonde open toegepast.
-- **Log:** `web/data/mimir-writes.jsonl`, één regel per write: `ts`, `key_id`, `label`, `owner`, `environment`, `company`, `table`, `method`, `status`, `duration_ms`, `bc_called`, `fields` (alleen veldnamen, geen waarden) en `error`. Elke write die BC bereikte telt mee in de heatmap Schrijfacties.
+- **Cache:** na een geslaagde write gaan rijen en dekking van die tabel in dat bedrijf (en environment) weg, zodat de volgende read live is. Lukt dat niet, dan komt de invalidatie in de pending-wachtrij (zie hieronder).
+- **Log:** per write één regel met `key_id`, `label`, `owner`, `environment`, `company`, `table`, `method`, `status`, `duration_ms`, `bc_called`, `fields` (alleen veldnamen, geen waarden), `forced` en `error`. De regel gaat altijd naar `web/data/mimir-writes.jsonl` (audit en fallback) en naar de SQLite-tabel `write_log` (index op `key_id`), die de UI en `api/write_log.php` gebruiken. Elke write die BC bereikte telt mee in de heatmap Schrijfacties.
+- **Writes gaan altijd door.** Heatmapregistratie, cache-invalidatie en de SQLite-log zijn bijtaken: best-effort, alle fouten worden afgevangen en een write faalt er nooit op. Wat niet lukt, komt in de wachtrij `web/data/mimir-pending.jsonl` (`invalidate`, `usage`, `log`; append met lock). Die wordt bij de volgende gezonde open van de database (elk request) toegepast; wat dan nog faalt gaat terug in de wachtrij. Is SQLite helemaal weg of het circuit open, dan loopt het schrijfrecht via de sleutelspiegel en het environment en de metadata via de snapshots (of live `$metadata`).
+
+### Schrijflogboek
+
+- **Pagina:** bij een sleutel met logregels staat onder «Intrekken» de knop **Schrijflogboek**. Die opent een venster met de regels, nieuwste eerst (tijd in Europe/Amsterdam, methode, bedrijf, environment, tabel, status, duur, velden, geforceerd), 50 per keer met «Meer laden». Alleen de eigenaar van de sleutel ziet het (`ui_api.php?action=keys_write_log&id=…`, GET, alleen lezen). De check of er regels zijn is één indexlookup per sleutel, geen scan van het jsonl-bestand.
+- **API:** `GET /mimir/api/write_log.php` met de sleutel zelf geeft alleen de eigen writes. Parameters: `limit` (default 50, max 200), `since` (unix-tijd of ISO-datum, Europe/Amsterdam), `before_id` (paginering: de `next_before_id` uit het vorige antwoord), `table`, `company`. Antwoord: `{ "value": [ { "id", "logged_at", "logged_at_label", "method", "company", "environment", "table", "status", "duration_ms", "fields", "forced", "bc_called", "error" } ], "next_before_id", "source", "key_id", "limit" }`. Bij een open circuit komt het uit het jsonl-bestand (`source: "file"`, zonder paginering).
+
+```sh
+curl -sS -H "Authorization: Bearer mimir_…" \
+  "https://sleutels.kvt.nl/mimir/api/write_log.php?limit=20&table=ItemCard"
+```
 
 Foutcodes (veld `code`): `unauthorized` (401), `write_not_allowed` (403), `method_not_allowed` (405), `invalid_request` / `invalid_table` / `invalid_key` / `invalid_field` / `invalid_body` (400), `unknown_company` / `unknown_table` (404), `body_too_large` (413), `etag_required` (428), `bc_error` (BC-status bij 4xx, 502 bij 5xx; met `bc_status` en `bc_error: {code, message}`), `bc_unreachable` (502), `bc_busy` / `unavailable` (503), `bc_timeout` (504).
 
@@ -307,6 +321,7 @@ php tests/mimir_sqlite_test.php
 php tests/mimir_reliability_test.php
 php tests/mimir_metadata_test.php
 php tests/mimir_write_test.php
+php tests/mimir_write_resilience_test.php
 ```
 
 De tests hebben de PHP-extensie `pdo_sqlite` nodig (Debian: `php-sqlite3`). `mimir_write_test.php` gebruikt een gemockte HTTP-client en belt Business Central nooit.
