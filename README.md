@@ -345,6 +345,7 @@ php tests/mimir_write_resilience_test.php
 php tests/mimir_migrate_test.php
 node tests/mimir_keys_render_test.js
 php tests/mimir_split_test.php
+php tests/mimir_table_circuit_test.php
 ```
 
 De tests hebben de PHP-extensie `pdo_sqlite` nodig (Debian: `php-sqlite3`). `mimir_write_test.php` gebruikt een gemockte HTTP-client en belt Business Central nooit.

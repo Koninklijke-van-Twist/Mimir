@@ -310,9 +310,12 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
     $maxAge = $forceMaxAge ?? ($spec['max_age'] ?? MIMIR_DEFAULT_MAX_AGE);
 
     // Rijcache in de eigen database van environment + tabel.
+    // Een storage-fout in die tabel-database (SQLITE_BUSY, I/O, schijf vol)
+    // zet alleen het circuit van die tabel en draait de query opnieuw live,
+    // zonder cache. Zo bereikt de fout mimir_with_cache_or_live niet, dat
+    // anders het globale circuit opent (sleutelpagina 503, alle tabellen live).
     $cachePdo = mimir_cache_pdo_for($pdo, $environment, $schema['name']);
-
-    return mimir_query_entity($cachePdo, [
+    $job = [
         'environment' => $environment,
         'company' => $company,
         'entity' => $schema['name'],
@@ -326,7 +329,9 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
             'keys' => $schema['keys'],
             'properties' => $schema['properties'],
         ],
-    ], $fetch, $now);
+    ];
+
+    return mimir_query_entity_isolated($cachePdo, $job, $fetch, $now);
 }
 
 /**

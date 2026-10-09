@@ -808,6 +808,23 @@ function mimir_cache_invalidate_entity(PDO $metaPdo, string $environment, string
             throw new RuntimeException('Cache-database van ' . $environment . '/' . $entity . ' niet bruikbaar; invalidatie blijft pending.');
         }
     }
+    try {
+        return mimir_cache_invalidate_rows($pdo, $environment, $company, $entity);
+    } catch (Throwable $error) {
+        // Invalidatie mislukt: deze tabel live tot het circuit dicht is, zodat
+        // niemand oude rijen krijgt; de write zet de invalidatie pending.
+        if (mimir_is_storage_failure($error)) {
+            mimir_cache_db_fail($pdo, $error, $environment, $entity);
+        }
+        throw $error;
+    }
+}
+
+/**
+ * @return array{rows: int, coverage: int}
+ */
+function mimir_cache_invalidate_rows(PDO $pdo, string $environment, string $company, string $entity): array
+{
     return mimir_db_retry(static function () use ($pdo, $environment, $company, $entity): array {
         $params = [':environment' => $environment, ':company' => $company, ':entity' => $entity];
         $rows = $pdo->prepare('DELETE FROM cache_rows WHERE environment = :environment AND company = :company COLLATE NOCASE AND entity = :entity COLLATE NOCASE');
@@ -1823,8 +1840,7 @@ function mimir_refresh_whole_row(
                 if (!mimir_is_storage_failure($deleteError)) {
                     throw $deleteError;
                 }
-                mimir_circuit_trip($deleteError->getMessage());
-                mimir_event_log('sqlite', $deleteError->getMessage(), $environment, $entity, 'bypassed-to-BC');
+                mimir_cache_storage_failure($pdo, $deleteError, $environment, $entity);
             }
             return null;
         }
@@ -1851,9 +1867,7 @@ function mimir_refresh_whole_row(
         if (!mimir_is_storage_failure($error)) {
             throw $error;
         }
-        $GLOBALS['mimir_stamp_bc_live'] = true;
-        mimir_circuit_trip($error->getMessage());
-        mimir_event_log('sqlite', $error->getMessage(), $environment, $entity, 'bypassed-to-BC');
+        mimir_cache_storage_failure($pdo, $error, $environment, $entity);
     }
     return ['payload' => $fresh, 'fetched_at' => $now];
 }
@@ -1946,9 +1960,7 @@ function mimir_fetch_collection(
                     throw $error;
                 }
                 $cacheBroken = true;
-                $GLOBALS['mimir_stamp_bc_live'] = true;
-                mimir_circuit_trip($error->getMessage());
-                mimir_event_log('sqlite', $error->getMessage(), $environment, $entity, 'bypassed-to-BC');
+                mimir_cache_storage_failure($pdo, $error, $environment, $entity);
             }
         }
         $stored[] = ['payload' => $clean, 'fetched_at' => $now];
@@ -1963,9 +1975,7 @@ function mimir_fetch_collection(
             if (!mimir_is_storage_failure($error)) {
                 throw $error;
             }
-            $GLOBALS['mimir_stamp_bc_live'] = true;
-            mimir_circuit_trip($error->getMessage());
-            mimir_event_log('sqlite', $error->getMessage(), $environment, $entity, 'bypassed-to-BC');
+            mimir_cache_storage_failure($pdo, $error, $environment, $entity);
         }
     }
 
@@ -2158,11 +2168,14 @@ function mimir_pending_apply(PDO $pdo): int
 {
     $applied = 0;
     try {
-        $items = mimir_pending_take();
+        $claim = mimir_pending_take();
     } catch (Throwable) {
         return 0;
     }
-    foreach ($items as $item) {
+    // Het geclaimde bestand gaat pas weg als elk item is toegepast of veilig
+    // teruggezet; bij een crash halverwege neemt een latere take het over.
+    $requeueFailed = false;
+    foreach ($claim['items'] as $item) {
         $data = $item['data'];
         try {
             if ($item['type'] === 'invalidate') {
@@ -2176,8 +2189,13 @@ function mimir_pending_apply(PDO $pdo): int
             }
             $applied++;
         } catch (Throwable) {
-            mimir_pending_add($item['type'], $data);
+            if (!mimir_pending_add($item['type'], $data)) {
+                $requeueFailed = true;
+            }
         }
+    }
+    if (!$requeueFailed) {
+        mimir_pending_done($claim['files']);
     }
 
     return $applied;
