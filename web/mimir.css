@@ -195,9 +195,6 @@ th { color: #00529b; font-size: .75rem; }
 code.key { font-size: .78rem; word-break: break-all; }
 tr.revoked { color: var(--kvt-muted); }
 .heatmap-svg { display: block; }
-.heatmap-split { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; }
-.heatmap-part { min-width: 120px; }
-.heatmap-title { margin: 0 0 4px; font-size: .72rem; font-weight: 600; color: var(--kvt-muted); }
 .heatmap-disabled { margin: 0; font-size: .75rem; color: var(--kvt-muted); font-style: italic; max-width: 130px; }
 .key-badge { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 9px; font-size: .68rem; background: #eef2f5; color: var(--kvt-muted); white-space: nowrap; }
 .key-badge-write { background: #fff1dc; color: #9a5b00; font-weight: 600; }
@@ -273,10 +270,28 @@ mark { background: #ffe08a; color: inherit; border-radius: 3px; padding: 0 1px; 
 }
 .site-footer a { color: #0077a3; }
 
-.write-log-button { margin-top: 6px; }
 .write-log-dialog { width: min(1100px, 95vw); max-height: 85vh; border: 1px solid #d5dde3; border-radius: 8px; padding: 16px; }
 .write-log-dialog::backdrop { background: rgba(0, 0, 0, .35); }
 .write-log-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .write-log-head h2 { margin: 0; font-size: 1rem; }
 .write-log-note { color: var(--kvt-muted); font-size: .8rem; }
 #write-log-table td.error { color: #b00020; font-weight: 600; }
+
+.key-label { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.key-badge { margin-left: 0; }
+.key-write-toggle { margin-top: 6px; font-size: .8rem; }
+.key-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+#keys td.heatmap-cell { min-width: 130px; }
+@media (max-width: 900px) {
+    #keys thead { display: none; }
+    #keys, #keys tbody, #keys tr, #keys td { display: block; width: 100%; }
+    #keys tr { border-bottom: 1px solid #d5dde3; padding: 8px 0; }
+    #keys td { border: 0; padding: 4px 0; }
+    #keys td[data-col="key"] code { word-break: break-all; }
+    #keys td[data-col]::before { display: block; font-size: .68rem; font-weight: 600; color: var(--kvt-muted); }
+    #keys td[data-col="avg"]::before { content: "Gem. calls / dag"; }
+    #keys td[data-col="shared"]::before { content: "Waarvan gedeeld"; }
+    #keys td[data-col="read"]::before { content: "Leesacties"; }
+    #keys td[data-col="write"]::before { content: "Schrijfacties"; }
+    #keys td[data-col="created"]::before { content: "Aangemaakt"; }
+}

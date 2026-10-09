@@ -141,8 +141,8 @@ function mimir_h(string $value): string
                             <th>Sleutel</th>
                             <th>Gem. calls / dag</th>
                             <th>Waarvan gedeeld</th>
-                            <th>Laatste weken</th>
-                            <th>Mag schrijven naar BC</th>
+                            <th>Leesacties</th>
+                            <th>Schrijfacties</th>
                             <th>Aangemaakt</th>
                             <th></th>
                         </tr>
@@ -238,6 +238,7 @@ function mimir_h(string $value): string
     <footer class="site-footer">
         <p>API-documentatie: <a href="openapi.yaml">OpenAPI (YAML)</a> · <a href="openapi.json">JSON</a> · Metadata: <a href="api/metadata.php">api/metadata.php</a></p>
     </footer>
+    <script src="mimir_keys_render.js"></script>
     <script src="mimir.js"></script>
 </body>
 </html>
