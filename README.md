@@ -349,3 +349,7 @@ php tests/mimir_table_circuit_test.php
 ```
 
 De tests hebben de PHP-extensie `pdo_sqlite` nodig (Debian: `php-sqlite3`). `mimir_write_test.php` gebruikt een gemockte HTTP-client en belt Business Central nooit.
+
+## Gebruikersbeheer
+
+Vaste admins (`opesket@kvt.nl`, `tfalken@kvt.nl`, `milanscheenloop@kvt.nl`) beheren de allowlist via `admin_users.php`. Die lijst staat in `web/data/access.sqlite`. Zolang die tabel leeg is, geldt `$allowedUsers` uit `auth.php`.

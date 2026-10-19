@@ -1,5 +1,39 @@
 <?php
 
+require_once __DIR__ . '/lib/UserAccess.php';
+require_once __DIR__ . '/lib/AllowedUsersStore.php';
+
+function kvt_managed_allowed_emails(): array
+{
+    try {
+        return (new AllowedUsersStore(__DIR__ . '/data/access.sqlite'))->listAllowedEmails();
+    } catch (Throwable) {
+        return [];
+    }
+}
+
+function kvt_session_email(): string
+{
+    return strtolower(trim((string) ($_SESSION['user']['email'] ?? '')));
+}
+
+/**
+ * true = toegang ok; false = weigeren. null = gebruik de oorspronkelijke auth.php-check.
+ */
+function kvt_access_decision(?array $authAllowedUsers = null): ?bool
+{
+    $email = kvt_session_email();
+    if (kvt_email_is_admin($email)) {
+        return true;
+    }
+    $managed = kvt_managed_allowed_emails();
+    if ($managed !== []) {
+        return in_array($email, $managed, true);
+    }
+
+    return null;
+}
+
 if (!function_exists('array_any')) {
     function array_any(array $array, callable $callback): bool
     {
@@ -46,7 +80,12 @@ if (is_trusted_requester()) {
 if (!is_trusted_requester()) {
     require __DIR__ . "/../login/lib.php";
 
-    if (
+    $kvtDecision = kvt_access_decision(isset($allowedUsers) && is_array($allowedUsers) ? $allowedUsers : null);
+    if ($kvtDecision === false) {
+        require __DIR__ . "/../login/403.php";
+        die();
+    }
+    if ($kvtDecision === null &&
         !array_any($allowedUsers, function ($email) {
             return strtolower((string) $email) === strtolower((string) ($_SESSION['user']['email'] ?? ''));
         })
