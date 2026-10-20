@@ -13,6 +13,40 @@ if (!function_exists('array_any')) {
     }
 }
 
+function mimir_logincheck_request_has_api_key(): bool
+{
+    if (function_exists('mimir_request_api_key')) {
+        return mimir_request_api_key() !== '';
+    }
+
+    $header = trim((string) ($_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? ''));
+    if ($header === '' && function_exists('getallheaders')) {
+        foreach (getallheaders() as $name => $value) {
+            if (strtolower((string) $name) === 'authorization') {
+                $header = trim((string) $value);
+                break;
+            }
+        }
+    }
+    if (preg_match('/^Bearer\s+\S+/i', $header) === 1) {
+        return true;
+    }
+
+    $apiKey = trim((string) ($_SERVER['HTTP_X_API_KEY'] ?? ''));
+    if ($apiKey !== '') {
+        return true;
+    }
+    if (function_exists('getallheaders')) {
+        foreach (getallheaders() as $name => $value) {
+            if (strtolower((string) $name) === 'x-api-key' && trim((string) $value) !== '') {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 function is_trusted_requester(): bool
 {
     $remote = $_SERVER['REMOTE_ADDR'] ?? '';
@@ -55,40 +89,37 @@ if (!is_trusted_requester()) {
         die();
     }
 
-    $analyticsEmail = strtolower(trim((string) ($_SESSION['user']['email'] ?? '')));
-    $analyticsApiKey = trim((string) ($_SESSION['user']['api_key'] ?? ''));
-    $analyticsOid = strtolower(trim((string) ($_SESSION['user']['oid'] ?? '')));
-    if ($analyticsEmail !== '' && $analyticsApiKey !== '' && $analyticsOid !== '') {
-        $httpsFlag = strtolower(trim((string) ($_SERVER['HTTPS'] ?? '')));
-        $requestScheme = strtolower(trim((string) ($_SERVER['REQUEST_SCHEME'] ?? '')));
-        $httpsOn = ($httpsFlag !== '' && $httpsFlag !== 'off')
-            || $requestScheme === 'https'
-            || (string) ($_SERVER['SERVER_PORT'] ?? '') === '443';
-        if (!$httpsOn) {
-            return;
-        }
-        $analyticsScheme = 'https';
-        $analyticsHost = (string) ($_SERVER['HTTP_HOST'] ?? 'localhost');
-        $analyticsBase = rtrim(str_replace('\\', '/', dirname((string) ($_SERVER['SCRIPT_NAME'] ?? '/index.php'))), '/');
-        $analyticsUrl = $analyticsScheme . '://' . $analyticsHost . $analyticsBase . '/analytics/analytics.php?' . http_build_query([
-            'user_email' => $analyticsEmail,
-            'oid' => $analyticsOid,
-        ], '', '&', PHP_QUERY_RFC3986);
+    // Alleen ingelogde browsergebruikers. Een verzoek met Mímir-API-sleutel
+    // (Authorization: Bearer of X-API-Key) slaat deze call over: die mag niet
+    // wachten en niet in analytics gelogd worden. De roterende login-key in de
+    // sessie is geen Mímir-API-sleutel.
+    if (!mimir_logincheck_request_has_api_key()) {
+        $analyticsEmail = strtolower(trim((string) ($_SESSION['user']['email'] ?? '')));
+        $analyticsApiKey = trim((string) ($_SESSION['user']['api_key'] ?? ''));
+        $analyticsOid = strtolower(trim((string) ($_SESSION['user']['oid'] ?? '')));
+        if ($analyticsEmail !== '' && $analyticsApiKey !== '' && $analyticsOid !== '') {
+            $analyticsScheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+            $analyticsHost = (string) ($_SERVER['HTTP_HOST'] ?? 'localhost');
+            $analyticsBase = rtrim(str_replace('\\', '/', dirname((string) ($_SERVER['SCRIPT_NAME'] ?? '/index.php'))), '/');
+            $analyticsUrl = $analyticsScheme . '://' . $analyticsHost . $analyticsBase . '/analytics/analytics.php?' . http_build_query([
+                'user_email' => $analyticsEmail,
+                'api_key' => $analyticsApiKey,
+                'oid' => $analyticsOid,
+            ], '', '&', PHP_QUERY_RFC3986);
 
-        if (function_exists('curl_init')) {
-            $analyticsCurl = curl_init($analyticsUrl);
-            curl_setopt_array($analyticsCurl, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_CONNECTTIMEOUT => 1,
-                CURLOPT_TIMEOUT => 1,
-                CURLOPT_FOLLOWLOCATION => false,
-                CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-                CURLOPT_SSL_VERIFYPEER => true,
-                CURLOPT_SSL_VERIFYHOST => 2,
-                CURLOPT_HTTPHEADER => ['X-API-Key: ' . $analyticsApiKey],
-            ]);
-            curl_exec($analyticsCurl);
-            curl_close($analyticsCurl);
+            if (function_exists('curl_init')) {
+                $analyticsCurl = curl_init($analyticsUrl);
+                curl_setopt_array($analyticsCurl, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_CONNECTTIMEOUT => 1,
+                    CURLOPT_TIMEOUT => 1,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_SSL_VERIFYHOST => 0,
+                    CURLOPT_HTTPHEADER => ['X-API-Key: ' . $analyticsApiKey],
+                ]);
+                curl_exec($analyticsCurl);
+                curl_close($analyticsCurl);
+            }
         }
     }
 }
