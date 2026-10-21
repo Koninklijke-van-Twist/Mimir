@@ -171,6 +171,8 @@ function mimir_h(string $value): string
             <div class="panel-head">
                 <h2>Gebeurtenissen</h2>
                 <p>Circuit <strong><?= mimir_event_escape($mimirCircuit['label']) ?></strong><?php if ($mimirCircuit['since'] !== ''): ?> sinds <?= mimir_event_escape($mimirCircuit['since']) ?><?php endif; ?>. Tijden in Europe/Amsterdam. Het log staat buiten de SQLite-database.</p>
+                <p class="row-actions"><button type="button" id="tunnel-cache-clear">Tunnel-koppelcache legen</button></p>
+                <p id="tunnel-cache-status" class="status" role="status"></p>
             </div>
             <div class="table-wrap">
                 <table id="events">

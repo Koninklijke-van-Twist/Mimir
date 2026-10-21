@@ -1163,6 +1163,11 @@
             "maximum": 10000,
             "default": 100,
             "description": "0 = ongelimiteerd (geen $top naar BC; nextLink + Prefer maxpagesize). Positief = $top-plafond."
+          },
+          "route": {
+            "type": "string",
+            "enum": ["odata", "tunnel"],
+            "description": "Alleen van belang als de Mimir-Tunnel in auth.php staat. Weggelaten: elke read gaat via de tunnel, met terugval op OData na een fout of een open circuit. odata forceert OData. tunnel forceert de tunnel zonder terugval (een fout wordt dan een foutantwoord, ook als het circuit open is). Zonder tunnel-config is tunnel een fout; odata of weglaten blijft alleen OData."
           }
         }
       },
@@ -1178,6 +1183,11 @@
           },
           "max_age": {
             "type": "integer"
+          },
+          "route": {
+            "type": "string",
+            "enum": ["odata", "tunnel"],
+            "description": "Zelfde als bij SingleQuery. Geldt voor child queries die zelf geen route zetten."
           },
           "queries": {
             "type": "array",
@@ -1308,6 +1318,24 @@
               "bc-live"
             ],
             "description": "Aanwezig en gelijk aan bc-live wanneer Mímir de cache heeft overgeslagen (circuit open, of SQLite locked/onleesbaar/readonly/corrupt) en het antwoord rechtstreeks uit Business Central komt, in hetzelfde response-formaat. Afwezig bij normaal cachegedrag."
+          },
+          "route": {
+            "type": "string",
+            "enum": ["tunnel", "odata", "mixed", "cache"],
+            "description": "Alleen als de Mimir-Tunnel in auth.php staat. Welke route dit antwoord echt gebruikte (tunnel of odata), ook als het verzoek de andere forceerde. mixed als één antwoord beide gebruikte; cache als BC niet gebeld werd."
+          },
+          "webservice": {
+            "type": "string",
+            "description": "OData-webservicenaam van de query. Alleen als de tunnel geconfigureerd is."
+          },
+          "page": {
+            "type": "integer",
+            "nullable": true,
+            "description": "BC-pagina-id uit pagina 810, als die koppeling bekend is."
+          },
+          "webservice_warning": {
+            "type": "string",
+            "description": "Waarschuwing als de aangeroepen webservicenaam een nieuwere variant heeft, bijvoorbeeld LVS_Contract_Total_Price terwijl LVS_Contract_Total_Price_2 bestaat."
           }
         }
       },

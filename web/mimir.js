@@ -356,6 +356,13 @@
             source = 'Deels cache (' + meta.from_cache + '), deels live (' + meta.from_live + ') · oudste rij ' + age + '.';
         }
         if (meta.filter_note) source += ' ' + meta.filter_note;
+        if (meta.route) {
+            source += ' Route ' + meta.route;
+            if (meta.webservice) source += ' · ' + meta.webservice;
+            if (meta.page) source += ' · pagina ' + meta.page;
+            source += '.';
+        }
+        if (meta.webservice_warning) source += ' ' + meta.webservice_warning;
         metaEl.textContent = source + ' max_age ' + (meta.max_age ?? 600) + 's.';
 
         const columns = [];
@@ -630,6 +637,30 @@
             keyStatus.classList.add('error');
         }
     });
+
+    const tunnelClearEl = document.getElementById('tunnel-cache-clear');
+    const tunnelStatusEl = document.getElementById('tunnel-cache-status');
+    if (tunnelClearEl) {
+        tunnelClearEl.addEventListener('click', async function () {
+            if (tunnelStatusEl) {
+                tunnelStatusEl.textContent = '';
+                tunnelStatusEl.classList.remove('error');
+            }
+            try {
+                const data = await api('ui_api.php?action=tunnel_cache_clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Mimir-CSRF': csrfToken },
+                    body: '{}',
+                });
+                if (tunnelStatusEl) tunnelStatusEl.textContent = 'Koppelcache geleegd (' + (data.cleared || 0) + ').';
+            } catch (error) {
+                if (tunnelStatusEl) {
+                    tunnelStatusEl.textContent = error.message;
+                    tunnelStatusEl.classList.add('error');
+                }
+            }
+        });
+    }
 
     loadCompanies();
     loadKeys();
