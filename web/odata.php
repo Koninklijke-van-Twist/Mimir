@@ -16,8 +16,8 @@ require_once __DIR__ . '/mimir_reliability.php';
  * $skip+$top als client-paging gebruiken we niet: BC raadt dat af.
  */
 
-const MIMIR_ODATA_PAGE_GUARD = 100;
-const MIMIR_ODATA_PAGE_SIZE = 2000;
+const MIMIR_ODATA_PAGE_GUARD = 400;
+const MIMIR_ODATA_PAGE_SIZE = 500;
 
 function odata_maxpagesize_header(int $pageSize = MIMIR_ODATA_PAGE_SIZE): string
 {

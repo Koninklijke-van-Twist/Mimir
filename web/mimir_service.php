@@ -11,6 +11,20 @@ require_once __DIR__ . '/mimir_metadata.php';
 
 function mimir_json(array $payload, int $status = 200): never
 {
+    if (function_exists('mimir_stream_started') && mimir_stream_started()) {
+        // Streaming-antwoord: status (200) en een deel van de body zijn al verstuurd.
+        if (!empty($payload['@mimir_streamed']) && !empty($GLOBALS['mimir_stream']['open'])) {
+            mimir_stream_finish($payload);
+        } elseif (isset($payload['error']) && is_string($payload['error'])) {
+            mimir_stream_abort($payload['error'], $status >= 400 ? $status : 500);
+        } elseif (!empty($GLOBALS['mimir_stream']['open'])) {
+            mimir_stream_abort('Streaming-antwoord onverwacht afgebroken.', 500);
+        } else {
+            echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        }
+        exit;
+    }
+    unset($payload['@mimir_streamed']);
     http_response_code($status);
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
@@ -580,6 +594,9 @@ function mimir_api_cached_payload(PDO $pdo, array $record, array $parsed, int $n
  */
 function mimir_api_live_payload(array $parsed, int $now, ?array $body, ?int $forceMaxAge = null): array
 {
+    if (function_exists('mimir_stream_opened') && mimir_stream_opened()) {
+        throw new RuntimeException('Streaming-antwoord was al gestart; live-terugval is niet meer mogelijk.');
+    }
     $GLOBALS['mimir_live_bypass'] = true;
     try {
         mimir_prepare_live_globals();
@@ -687,7 +704,11 @@ function mimir_api_register_fatal_handler(): void
         if (strlen($message) > 400) {
             $message = substr($message, 0, 400) . '…';
         }
-        if (!headers_sent()) {
+        if (function_exists('mimir_stream_started') && mimir_stream_started()) {
+            if (empty($GLOBALS['mimir_stream']['done'])) {
+                mimir_stream_abort('FATAL: ' . $message, 500);
+            }
+        } elseif (!headers_sent()) {
             while (ob_get_level() > 0) {
                 @ob_end_clean();
             }
@@ -750,6 +771,11 @@ function mimir_api_main(?string $forcedRoute = null): void
             $body = mimir_read_json_body();
         } catch (MimirUserException $error) {
             mimir_json(['error' => $error->getMessage()], $error->status);
+        }
+        // Volledige fetch van één tabel (top = 0): rijen streamen i.p.v. één grote array.
+        if (is_array($body) && !array_key_exists('queries', $body)
+            && array_key_exists('top', $body) && is_numeric($body['top']) && (int) $body['top'] === 0) {
+            mimir_stream_enable();
         }
     }
 

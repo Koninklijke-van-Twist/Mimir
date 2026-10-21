@@ -9,6 +9,7 @@ require_once __DIR__ . '/mimir_heatmap.php';
 require_once __DIR__ . '/mimir_bc_limit.php';
 require_once __DIR__ . '/mimir_cache_db.php';
 require_once __DIR__ . '/mimir_tunnel.php';
+require_once __DIR__ . '/mimir_stream.php';
 
 const MIMIR_UI_MAX_AGE = 600;
 const MIMIR_DEFAULT_MAX_AGE = 3600;
@@ -1338,7 +1339,71 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
 
     // Ongeparseerde $filter-strings niet uit de gedeelde rijcache serveren:
     // mimir_filter_match kan die niet bewijzen, en latere upserts lekken dan mee.
-    if ($coverage !== null && mimir_filter_coverage_servable($filter)) {
+    $streamed = false;
+    $streamTruncated = false;
+    if (mimir_stream_active() && $top === 0 && $filterBatches === null && mimir_filter_coverage_servable($filter)) {
+        $streamed = true;
+        $usedCoverage = true;
+        $streamSince = null;
+        if ($coverage !== null) {
+            // Alleen uit de store serveren als élke rij in het dekkingsvenster bruikbaar
+            // is; anders volledig opnieuw vullen (geen per-rij refresh in streaming).
+            $streamSince = (int) $coverage['fetched_at'] - 2;
+            foreach (mimir_cache_each($pdo, $environment, $company, $entity) as $stored) {
+                if ($stored['fetched_at'] < $streamSince) {
+                    continue;
+                }
+                if (mimir_row_refresh_reason($stored, $required, $maxAge, $now) !== 'ok') {
+                    $streamSince = null;
+                    break;
+                }
+            }
+        }
+        if ($streamSince === null) {
+            $usedCoverage = false;
+            $live = mimir_fetch_collection(
+                $pdo,
+                $environment,
+                $company,
+                $entity,
+                $prefix,
+                $filter,
+                $types,
+                $keys,
+                $fetchSelect,
+                $pushed,
+                $mode,
+                $fetch,
+                $now,
+                true,
+                $keyId,
+                0,
+                false
+            );
+            $mode = $live['mode'];
+            $pushed = $live['pushed'];
+            $streamTruncated = !empty($live['truncated']);
+            $streamSince = $now;
+        }
+        mimir_stream_begin();
+        foreach (mimir_cache_each($pdo, $environment, $company, $entity) as $stored) {
+            if ($stored['fetched_at'] < $streamSince) {
+                continue;
+            }
+            if (!mimir_filter_match($stored['payload'], $filter, $types)) {
+                continue;
+            }
+            mimir_stream_row(mimir_project_row($stored['payload'], $select));
+            $at = (int) $stored['fetched_at'];
+            $streamMin = isset($streamMin) ? min($streamMin, $at) : $at;
+            $streamMax = isset($streamMax) ? max($streamMax, $at) : $at;
+            if ($usedCoverage) {
+                $fromCache++;
+            } else {
+                $fromLive++;
+            }
+        }
+    } elseif ($coverage !== null && mimir_filter_coverage_servable($filter)) {
         $served = mimir_serve_from_coverage(
             $pdo,
             $environment,
@@ -1362,7 +1427,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
             $fromLive = $served['from_live'];
         }
     }
-    if (!$usedCoverage) {
+    if (!$usedCoverage && !$streamed) {
         $gap = null;
         if ($filterBatches === null && $allowBroad) {
             $gap = mimir_try_range_gap_fill(
@@ -1486,8 +1551,8 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     }
 
     $value = [];
-    $min = null;
-    $max = null;
+    $min = $streamed ? ($streamMin ?? null) : null;
+    $max = $streamed ? ($streamMax ?? null) : null;
     foreach ($kept as $row) {
         $value[] = mimir_project_row($row['payload'], $select);
         $at = (int) $row['fetched_at'];
@@ -1573,6 +1638,19 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $meta['queue_wait_ms'] = $queueWaitMs;
     $meta['bc_slots_max'] = mimir_bc_limit_max_concurrent();
     $meta['bc_slots_used'] = $slotHeld ? mimir_bc_slots_used($environment) : 0;
+
+    if ($streamed) {
+        // Rijen zijn al naar de client gestreamd; mimir_api_main sluit af met meta.
+        $meta['streamed'] = 1;
+        $meta['rows'] = $fromCache + $fromLive;
+        $meta['complete'] = !$streamTruncated;
+
+        return [
+            'value' => [],
+            'meta' => $meta,
+            '@mimir_streamed' => true,
+        ];
+    }
 
     return [
         'value' => $value,
@@ -1987,7 +2065,8 @@ function mimir_fetch_collection(
     int $now,
     bool $writeCoverage = true,
     ?int $keyId = null,
-    int $clientTop = 0
+    int $clientTop = 0,
+    bool $keepRows = true
 ): array {
     // $top alleen bij een eindig plafond van de aanroeper. top=0 (Mercurius: ongelimiteerd)
     // krijgt geen $top: BC laat nextLink dan vaak weg, waardoor de set op één pagina blijft
@@ -2001,8 +2080,9 @@ function mimir_fetch_collection(
     // Pagina's direct per pagina in de store schrijven; de ruwe BC-respons wordt niet
     // als geheel bewaard.
     $stored = [];
+    $storedCount = 0;
     $cacheBroken = false;
-    $onPage = static function (array $pageRows) use (&$stored, &$cacheBroken, $pdo, $environment, $company, $entity, $keys, $now): void {
+    $onPage = static function (array $pageRows) use (&$stored, &$storedCount, &$cacheBroken, $pdo, $environment, $company, $entity, $keys, $now, $keepRows): void {
         foreach ($pageRows as $payload) {
             if (!is_array($payload)) {
                 continue;
@@ -2025,18 +2105,24 @@ function mimir_fetch_collection(
                 try {
                     mimir_cache_upsert($pdo, $environment, $company, $entity, $rowKey, $clean, $now);
                 } catch (Throwable $error) {
-                    if (!mimir_is_storage_failure($error)) {
+                    // Zonder rijen in geheugen (streaming) is de store de enige
+                    // bron: een opslagfout moet dan omhoog (isolated → :memory:).
+                    if (!$keepRows || !mimir_is_storage_failure($error)) {
                         throw $error;
                     }
                     $cacheBroken = true;
                     mimir_cache_storage_failure($pdo, $error, $environment, $entity);
                 }
             }
-            $stored[] = ['payload' => $clean, 'fetched_at' => $now];
+            $storedCount++;
+            if ($keepRows) {
+                $stored[] = ['payload' => $clean, 'fetched_at' => $now];
+            }
         }
     };
-    $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch, $clientTop, $onPage, &$stored): array {
+    $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch, $clientTop, $onPage, &$stored, &$storedCount): array {
         $stored = [];
+        $storedCount = 0;
         $query = [];
         if ($clientTop > 0) {
             $query['$top'] = $clientTop;
@@ -2069,7 +2155,7 @@ function mimir_fetch_collection(
         $filterSig = $pushed ?? '';
         $selectSig = mimir_select_sig($select);
         try {
-            mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, count($stored), $keyId);
+            mimir_coverage_put($pdo, $environment, $company, $entity, $filterSig, $selectSig, $now, $storedCount, $keyId);
         } catch (Throwable $error) {
             if (!mimir_is_storage_failure($error)) {
                 throw $error;
@@ -2078,7 +2164,7 @@ function mimir_fetch_collection(
         }
     }
 
-    return ['rows' => $stored, 'mode' => $mode, 'pushed' => $pushed, 'truncated' => $pages['truncated']];
+    return ['rows' => $stored, 'count' => $storedCount, 'mode' => $mode, 'pushed' => $pushed, 'truncated' => $pages['truncated']];
 }
 
 /**
@@ -2119,6 +2205,7 @@ function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $c
             }
             unset($decoded);
         }
+        mimir_stream_keepalive();
         $guard++;
         if ($next !== '' && $guard >= MIMIR_ODATA_PAGE_GUARD) {
             $truncated = true;
