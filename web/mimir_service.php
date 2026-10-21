@@ -668,14 +668,42 @@ function mimir_authenticate_api_key(string $apiKey, ?PDO &$pdo): ?array
 
 function mimir_api_register_fatal_handler(): void
 {
+    if (!empty($GLOBALS['mimir_fatal_handler_registered'])) {
+        return;
+    }
+    $GLOBALS['mimir_fatal_handler_registered'] = true;
+    // Noodreserve: bij geheugenuitputting draait deze handler binnen hetzelfde limiet
+    // terwijl de stack nog vol zit. Zonder reserve faalt json_encode/header zelf en
+    // blijft de body leeg (vervolgaanroepen in de retest van PR #15).
+    $GLOBALS['mimir_fatal_reserve'] = str_repeat('x', 2 * 1024 * 1024);
     register_shutdown_function(static function (): void {
+        $GLOBALS['mimir_fatal_reserve'] = null;
         $error = error_get_last();
         if (!is_array($error) || !in_array($error['type'] ?? 0, [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_PARSE], true)) {
             return;
         }
+        @ini_set('memory_limit', '-1');
         $message = (string) ($error['message'] ?? '');
         if (strlen($message) > 400) {
             $message = substr($message, 0, 400) . '…';
+        }
+        if (!headers_sent()) {
+            while (ob_get_level() > 0) {
+                @ob_end_clean();
+            }
+            http_response_code(500);
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            $json = json_encode(
+                ['error' => 'FATAL', 'message' => $message],
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
+            );
+            echo is_string($json) ? $json : '{"error":"FATAL","message":"Onbekende fatale fout."}';
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            } else {
+                @flush();
+            }
         }
         if (function_exists('mimir_event_log')) {
             try {
@@ -683,16 +711,6 @@ function mimir_api_register_fatal_handler(): void
             } catch (Throwable) {
             }
         }
-        if (headers_sent()) {
-            return;
-        }
-        while (ob_get_level() > 0) {
-            @ob_end_clean();
-        }
-        http_response_code(500);
-        header('Content-Type: application/json; charset=utf-8');
-        header('Cache-Control: no-store');
-        echo json_encode(['error' => 'FATAL', 'message' => $message], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     });
 }
 
@@ -700,6 +718,7 @@ function mimir_api_main(?string $forcedRoute = null): void
 {
     @set_time_limit(300);
     @ini_set('memory_limit', '512M');
+    @ini_set('display_errors', '0');
     mimir_api_register_fatal_handler();
     $GLOBALS['mimir_stamp_bc_live'] = false;
     $apiKey = mimir_request_api_key();
@@ -1051,6 +1070,9 @@ function mimir_ui_live_payload(string $action, int $now, ?array $body): array
 function mimir_ui_main(): void
 {
     @set_time_limit(300);
+    @ini_set('memory_limit', '512M');
+    @ini_set('display_errors', '0');
+    mimir_api_register_fatal_handler();
     $GLOBALS['mimir_stamp_bc_live'] = false;
     $action = trim((string) ($_GET['action'] ?? ''));
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));

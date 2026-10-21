@@ -842,20 +842,29 @@ function mimir_cache_invalidate_rows(PDO $pdo, string $environment, string $comp
  */
 function mimir_cache_all(PDO $pdo, string $environment, string $company, string $entity): array
 {
+    return iterator_to_array(mimir_cache_each($pdo, $environment, $company, $entity), false);
+}
+
+/**
+ * Zelfde rijen als mimir_cache_all, maar één voor één (geen volledige entiteit in geheugen).
+ *
+ * @return Generator<int, array{row_key: string, payload: array<string, mixed>, fetched_at: int}>
+ */
+function mimir_cache_each(PDO $pdo, string $environment, string $company, string $entity): Generator
+{
     $stmt = $pdo->prepare(
         'SELECT row_key, payload, fetched_at FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity'
     );
     $stmt->execute([':environment' => $environment, ':company' => $company, ':entity' => $entity]);
-    $rows = [];
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $payload = json_decode((string) $row['payload'], true);
-        $rows[] = [
+        yield [
             'row_key' => (string) $row['row_key'],
             'payload' => is_array($payload) ? $payload : [],
             'fetched_at' => (int) $row['fetched_at'],
         ];
     }
-    return $rows;
+    $stmt->closeCursor();
 }
 
 function mimir_coverage_put(
@@ -994,7 +1003,7 @@ function mimir_select_sig_covers(string $stored, string $needed): bool
 function mimir_on_file_columns(PDO $pdo, string $environment, string $company, string $entity): array
 {
     $cols = [];
-    foreach (mimir_cache_all($pdo, $environment, $company, $entity) as $stored) {
+    foreach (mimir_cache_each($pdo, $environment, $company, $entity) as $stored) {
         foreach (array_keys($stored['payload']) as $key) {
             if (!is_string($key) || $key === '' || str_starts_with($key, '@')) {
                 continue;
@@ -1229,6 +1238,12 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     // Age-refresh non-shrink is preserved by omitting (or by mimir_select_for_bc_refresh when used).
     $simpleEq = is_string($filter) ? mimir_filter_parse_simple_eq($filter) : null;
     $fetchSelect = mimir_select_for_bc($select, $onFile, $emptyFilterFetch);
+    // Begrensde koude fetch zonder filter (top > 0, nog niets op file): $select mag mee
+    // naar BC. cache_upsert merget kolommen en de dekking krijgt de smalle select_sig,
+    // dus dit claimt geen volledige kolomdekking. Scheelt veel geheugen bij brede kaarten.
+    if ($emptyFilterFetch && $top > 0 && $onFile === [] && $select !== []) {
+        $fetchSelect = $select;
+    }
     // Cold $select moet het eenvoudige string-veld meenemen, anders kan de lokale
     // hercontrole (Open eq true e.d.) het veld niet zien.
     if ($simpleEq !== null && $fetchSelect !== []) {
@@ -1693,7 +1708,7 @@ function mimir_try_range_gap_fill(
     // Collect fresh cached rows that match the request and have required columns.
     $cached = [];
     $seen = [];
-    foreach (mimir_cache_all($pdo, $environment, $company, $entity) as $stored) {
+    foreach (mimir_cache_each($pdo, $environment, $company, $entity) as $stored) {
         if (($now - (int) $stored['fetched_at']) > $maxAge) {
             continue;
         }
@@ -1829,7 +1844,7 @@ function mimir_serve_from_coverage(
 ): array {
     $window = [];
     $needsRefresh = 0;
-    foreach (mimir_cache_all($pdo, $environment, $company, $entity) as $stored) {
+    foreach (mimir_cache_each($pdo, $environment, $company, $entity) as $stored) {
         if ($stored['fetched_at'] + 2 < $coverageAt) {
             continue;
         }
@@ -1983,7 +1998,45 @@ function mimir_fetch_collection(
     if ($clientTop < 0) {
         $clientTop = 0;
     }
-    $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch, $clientTop): array {
+    // Pagina's direct per pagina in de store schrijven; de ruwe BC-respons wordt niet
+    // als geheel bewaard.
+    $stored = [];
+    $cacheBroken = false;
+    $onPage = static function (array $pageRows) use (&$stored, &$cacheBroken, $pdo, $environment, $company, $entity, $keys, $now): void {
+        foreach ($pageRows as $payload) {
+            if (!is_array($payload)) {
+                continue;
+            }
+            $clean = mimir_strip_odata_noise($payload);
+            if ($keys !== []) {
+                $missingKey = false;
+                foreach ($keys as $key) {
+                    if (!array_key_exists($key, $clean)) {
+                        $missingKey = true;
+                        break;
+                    }
+                }
+                if ($missingKey) {
+                    continue;
+                }
+            }
+            $rowKey = mimir_row_key($clean, $keys);
+            if (!$cacheBroken) {
+                try {
+                    mimir_cache_upsert($pdo, $environment, $company, $entity, $rowKey, $clean, $now);
+                } catch (Throwable $error) {
+                    if (!mimir_is_storage_failure($error)) {
+                        throw $error;
+                    }
+                    $cacheBroken = true;
+                    mimir_cache_storage_failure($pdo, $error, $environment, $entity);
+                }
+            }
+            $stored[] = ['payload' => $clean, 'fetched_at' => $now];
+        }
+    };
+    $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch, $clientTop, $onPage, &$stored): array {
+        $stored = [];
         $query = [];
         if ($clientTop > 0) {
             $query['$top'] = $clientTop;
@@ -1997,7 +2050,7 @@ function mimir_fetch_collection(
             $query['$select'] = implode(',', $columns);
         }
         $url = mimir_collection_url($prefix, $company, $entity, $query);
-        return mimir_follow_pages($url, $prefix, $fetch, $clientTop);
+        return mimir_follow_pages($url, $prefix, $fetch, $clientTop, $onPage);
     };
 
     try {
@@ -2010,37 +2063,6 @@ function mimir_fetch_collection(
         } else {
             throw $error;
         }
-    }
-
-    $stored = [];
-    $cacheBroken = false;
-    foreach ($pages['rows'] as $payload) {
-        $clean = mimir_strip_odata_noise($payload);
-        if ($keys !== []) {
-            $missingKey = false;
-            foreach ($keys as $key) {
-                if (!array_key_exists($key, $clean)) {
-                    $missingKey = true;
-                    break;
-                }
-            }
-            if ($missingKey) {
-                continue;
-            }
-        }
-        $rowKey = mimir_row_key($clean, $keys);
-        if (!$cacheBroken) {
-            try {
-                mimir_cache_upsert($pdo, $environment, $company, $entity, $rowKey, $clean, $now);
-            } catch (Throwable $error) {
-                if (!mimir_is_storage_failure($error)) {
-                    throw $error;
-                }
-                $cacheBroken = true;
-                mimir_cache_storage_failure($pdo, $error, $environment, $entity);
-            }
-        }
-        $stored[] = ['payload' => $clean, 'fetched_at' => $now];
     }
 
     if ($writeCoverage && !$pages['truncated'] && !$cacheBroken) {
@@ -2063,8 +2085,9 @@ function mimir_fetch_collection(
  * @param callable(string): array $fetch
  * @return array{rows: list<array<string, mixed>>, truncated: bool}
  */
-function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $clientTop = 0): array
+function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $clientTop = 0, ?callable $onPage = null): array
 {
+    $count = 0;
     $rows = [];
     $next = $url;
     $guard = 0;
@@ -2080,13 +2103,22 @@ function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $c
         if (!isset($decoded['value']) || !is_array($decoded['value'])) {
             throw new RuntimeException("OData response missing 'value' array");
         }
-        foreach ($decoded['value'] as $row) {
-            if (is_array($row)) {
-                $rows[] = $row;
-            }
-        }
         $link = $decoded['@odata.nextLink'] ?? null;
         $next = is_string($link) ? $link : '';
+        $count += count($decoded['value']);
+        if ($onPage !== null) {
+            $page = $decoded['value'];
+            unset($decoded);
+            $onPage($page);
+            unset($page);
+        } else {
+            foreach ($decoded['value'] as $row) {
+                if (is_array($row)) {
+                    $rows[] = $row;
+                }
+            }
+            unset($decoded);
+        }
         $guard++;
         if ($next !== '' && $guard >= MIMIR_ODATA_PAGE_GUARD) {
             $truncated = true;
@@ -2094,7 +2126,7 @@ function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $c
         }
         // Een gevuld $top-plafond is geen bewijs dat de set op is: BC laat nextLink
         // vaak weg zodra $top gehaald is. Dekking schrijven we dan niet.
-        if ($clientTop > 0 && count($rows) >= $clientTop) {
+        if ($clientTop > 0 && $count >= $clientTop) {
             $truncated = true;
             break;
         }
