@@ -214,10 +214,6 @@ function mimir_query_entity_isolated(PDO $cachePdo, array $job, callable $fetch,
             throw $error;
         }
     }
-    if (function_exists('mimir_stream_opened') && mimir_stream_opened()) {
-        // Rijen zijn al deels gestreamd; opnieuw beginnen zou dubbele/kapotte JSON geven.
-        throw new RuntimeException('Streaming-antwoord onderbroken door een cachefout.');
-    }
     $GLOBALS['mimir_stamp_bc_live'] = true;
 
     return mimir_stamp_bc_live(mimir_query_entity(mimir_db(':memory:'), $job, $fetch, $now));
