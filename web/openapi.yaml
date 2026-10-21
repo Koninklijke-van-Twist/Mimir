@@ -659,6 +659,15 @@ components:
           maximum: 10000
           default: 100
           description: 0 = ongelimiteerd (geen $top naar BC; nextLink + Prefer maxpagesize). Positief = $top-plafond.
+        route:
+          type: string
+          enum: [odata, tunnel]
+          description: >
+            Alleen van belang als de Mimir-Tunnel in auth.php staat. Weggelaten: elke read
+            gaat via de tunnel, met terugval op OData na een fout of een open circuit.
+            odata forceert OData. tunnel forceert de tunnel zonder terugval (een fout wordt
+            dan een foutantwoord, ook als het circuit open is). Zonder tunnel-config is
+            tunnel een fout; odata of weglaten blijft alleen OData.
     MultiQuery:
       type: object
       required: [queries]
@@ -668,6 +677,10 @@ components:
           description: Default company voor child queries
         max_age:
           type: integer
+        route:
+          type: string
+          enum: [odata, tunnel]
+          description: Zelfde als bij SingleQuery. Geldt voor child queries die zelf geen route zetten.
         queries:
           type: array
           minItems: 1
@@ -737,8 +750,9 @@ components:
           type: string
           enum: [tunnel, odata, mixed, cache]
           description: >
-            Alleen als de Mimir-Tunnel in auth.php staat. tunnel of odata is de live
-            route; mixed als één antwoord beide gebruikte; cache als BC niet gebeld werd.
+            Alleen als de Mimir-Tunnel in auth.php staat. Welke route dit antwoord
+            echt gebruikte (tunnel of odata), ook als het verzoek de andere forceerde.
+            mixed als één antwoord beide gebruikte; cache als BC niet gebeld werd.
         webservice:
           type: string
           description: OData-webservicenaam van de query. Alleen als de tunnel geconfigureerd is.

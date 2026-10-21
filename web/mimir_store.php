@@ -1245,6 +1245,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $queueWaitMs = 0;
     $innerFetch = $fetch;
     $metaPdo = ($job['meta_pdo'] ?? null) instanceof PDO ? $job['meta_pdo'] : null;
+    $tunnelRoute = isset($job['route']) && is_string($job['route']) && $job['route'] !== '' ? $job['route'] : null;
     unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page']);
     $fetch = static function (string $url) use (
         $innerFetch,
@@ -1255,10 +1256,11 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         $metaPdo,
         $keyId,
         $now,
+        $tunnelRoute,
         &$slotHeld,
         &$queueWaitMs
     ): array {
-        if (mimir_tunnel_configured()) {
+        if (mimir_tunnel_configured() || $tunnelRoute === 'tunnel') {
             try {
                 $viaTunnel = mimir_tunnel_try($url, [
                     'environment' => $environment,
@@ -1268,10 +1270,16 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                     'pdo' => $metaPdo,
                     'now' => $now,
                     'key_id' => $keyId !== null && $keyId > 0 ? (string) $keyId : null,
+                    'route' => $tunnelRoute,
                 ]);
                 if (is_array($viaTunnel)) {
                     return $viaTunnel;
                 }
+            } catch (MimirTunnelForced $error) {
+                throw new MimirUserException(
+                    'Tunnel geforceerd, geen terugval op OData: ' . $error->getMessage(),
+                    502
+                );
             } catch (MimirTunnelFallback $error) {
                 mimir_event_log(
                     'tunnel',

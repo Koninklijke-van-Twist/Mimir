@@ -324,6 +324,7 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
         'filter' => $spec['filter'] ?? null,
         'max_age' => $maxAge,
         'top' => $spec['top'] ?? MIMIR_DEFAULT_TOP,
+        'route' => mimir_tunnel_normalize_route($spec['route'] ?? null),
         'key_id' => $keyId,
         'meta_pdo' => $pdo,
         'schema' => [
@@ -369,6 +370,9 @@ function mimir_run_request_body(PDO $pdo, array $body, int $now, ?int $forceMaxA
             }
             if (!array_key_exists('max_age', $query) && array_key_exists('max_age', $body)) {
                 $query['max_age'] = $body['max_age'];
+            }
+            if (!array_key_exists('route', $query) && array_key_exists('route', $body)) {
+                $query['route'] = $body['route'];
             }
             $results[$name] = mimir_run_table_query($pdo, $query, $now, $forceMaxAge, $keyId);
         }

@@ -6,22 +6,28 @@ declare(strict_types=1);
  * Mimir-Tunnel: extra route naar de BC-webclient, naast OData.
  *
  * Zonder $mimir_tunnel_url én $mimir_tunnel_token in auth.php doet deze
- * module niets en blijft elke read op OData. De tunnel is voor kleine
- * lijsten (top van 1 t/m de drempel) en kaarten (één rij op sleutel).
- * Ongelimiteerde reads en top boven de drempel blijven OData.
+ * module niets en blijft elke read op OData. Mét config gaan alle reads
+ * (lijst, bulk, kaart) via de tunnel. `route: odata` dwingt OData af;
+ * `route: tunnel` dwingt de tunnel af en valt niet terug op OData.
  *
  * Schrijven (etag, schrijflog) blijft OData: een mislukte tunnel-mutatie
  * mag niet daarna nog eens via OData, want de wijziging kan al in BC staan.
  */
 
 const MIMIR_TUNNEL_PAGE_TTL = 86400;
-const MIMIR_TUNNEL_TOP_MAX = 200;
+/** top=0: de bridge leest in stukken van 50 en kapt zelf af (truncated). */
+const MIMIR_TUNNEL_UNBOUNDED_TOP = 10000;
 const MIMIR_TUNNEL_COOLDOWN = 120;
 const MIMIR_TUNNEL_FAIL_LIMIT = 3;
 const MIMIR_TUNNEL_WEB_SERVICES_PAGE = 810;
 const MIMIR_TUNNEL_STALE_LOG_SECONDS = 3600;
 
 class MimirTunnelFallback extends RuntimeException
+{
+}
+
+/** Geforceerde tunnel (`route: tunnel`): de aanroeper mag niet op OData terugvallen. */
+class MimirTunnelForced extends RuntimeException
 {
 }
 
@@ -38,16 +44,12 @@ class MimirTunnelUnknownColumn extends RuntimeException
 }
 
 /**
- * @return array{enabled: bool, url: string, token: string, top_max: int, cooldown: int}
+ * @return array{enabled: bool, url: string, token: string, cooldown: int}
  */
 function mimir_tunnel_config(): array
 {
     $url = trim((string) ($GLOBALS['mimir_tunnel_url'] ?? ''));
     $token = trim((string) ($GLOBALS['mimir_tunnel_token'] ?? ''));
-    $topMax = (int) ($GLOBALS['mimir_tunnel_top_max'] ?? MIMIR_TUNNEL_TOP_MAX);
-    if ($topMax < 0) {
-        $topMax = 0;
-    }
     $cooldown = (int) ($GLOBALS['mimir_tunnel_cooldown'] ?? MIMIR_TUNNEL_COOLDOWN);
     if ($cooldown < 1) {
         $cooldown = 1;
@@ -57,7 +59,6 @@ function mimir_tunnel_config(): array
         'enabled' => $url !== '' && $token !== '',
         'url' => rtrim($url, '/'),
         'token' => $token,
-        'top_max' => $topMax,
         'cooldown' => $cooldown,
     ];
 }
@@ -82,25 +83,44 @@ function mimir_tunnel_cache_key(string $environment): string
 }
 
 /**
- * Kleine lijst, kaart of actie → tunnel. Bulk (top 0 of boven de drempel) → odata.
+ * Elke read (lijst, bulk, kaart) gaat via de tunnel zodra die geconfigureerd is.
  * `action` zit in de keuze zodat een latere aanroep dezelfde regel volgt;
  * write.php gebruikt hem niet (etag, geen dubbele mutatie).
+ *
+ * @param ?string $prefer null = automatisch, `odata` of `tunnel` uit het verzoek
  */
-function mimir_tunnel_route_for(string $kind, int $top): string
+function mimir_tunnel_route_for(string $kind, ?string $prefer = null): string
 {
-    if (!mimir_tunnel_configured()) {
+    if ($prefer === 'odata' || !mimir_tunnel_configured()) {
         return 'odata';
     }
-    if ($kind === 'list') {
-        $max = mimir_tunnel_config()['top_max'];
-
-        return ($top >= 1 && $top <= $max) ? 'tunnel' : 'odata';
-    }
-    if ($kind === 'card' || $kind === 'action') {
+    if ($kind === 'list' || $kind === 'bulk' || $kind === 'card' || $kind === 'action') {
         return 'tunnel';
     }
 
     return 'odata';
+}
+
+/**
+ * `route` op een query. null = automatisch (tunnel als die geconfigureerd is).
+ */
+function mimir_tunnel_normalize_route(mixed $route): ?string
+{
+    if ($route === null || $route === '') {
+        return null;
+    }
+    if (!is_string($route)) {
+        throw new MimirUserException('route moet "odata" of "tunnel" zijn.');
+    }
+    $value = strtolower(trim($route));
+    if ($value !== 'odata' && $value !== 'tunnel') {
+        throw new MimirUserException('route moet "odata" of "tunnel" zijn.');
+    }
+    if ($value === 'tunnel' && !mimir_tunnel_configured()) {
+        throw new MimirUserException('route "tunnel" kan niet: de Mimir-Tunnel is niet geconfigureerd.');
+    }
+
+    return $value;
 }
 
 function mimir_bc_route_remember(string $route, ?int $page = null): void
@@ -155,23 +175,47 @@ function mimir_tunnel_inspect_url(string $url, string $entity): array
 }
 
 /**
- * @param array{environment: string, company: string, entity: string, types: array<string, string>, pdo: ?PDO, now: int, key_id: ?string} $ctx
+ * @param array{environment: string, company: string, entity: string, types: array<string, string>, pdo: ?PDO, now: int, key_id: ?string, route: ?string} $ctx
  * @return array<string, mixed>|null null = deze URL hoort op OData
  */
 function mimir_tunnel_try(string $url, array $ctx): ?array
 {
-    if (!mimir_tunnel_configured() || mimir_tunnel_circuit_open()) {
+    $prefer = isset($ctx['route']) && is_string($ctx['route']) ? $ctx['route'] : null;
+    $forced = $prefer === 'tunnel';
+    if (!mimir_tunnel_configured()) {
+        if ($forced) {
+            throw new MimirTunnelForced('de tunnel is niet geconfigureerd');
+        }
+
+        return null;
+    }
+    if ($prefer === 'odata') {
+        return null;
+    }
+    if (!$forced && mimir_tunnel_circuit_open()) {
         return null;
     }
     $inspected = mimir_tunnel_inspect_url($url, (string) $ctx['entity']);
-    if (mimir_tunnel_route_for($inspected['kind'], (int) $inspected['top']) !== 'tunnel') {
+    if (mimir_tunnel_route_for($inspected['kind'], $prefer) !== 'tunnel') {
+        if ($forced) {
+            throw new MimirTunnelForced('deze aanroep is niet via de tunnel te lezen');
+        }
+
         return null;
     }
     try {
         $result = mimir_tunnel_read($inspected, $ctx);
     } catch (MimirTunnelOutage $error) {
         mimir_tunnel_circuit_fail((string) $ctx['environment'], (string) $ctx['entity'], $error->getMessage());
+        if ($forced) {
+            throw new MimirTunnelForced($error->getMessage(), 0, $error);
+        }
         throw new MimirTunnelFallback($error->getMessage(), 0, $error);
+    } catch (MimirTunnelFallback $error) {
+        if ($forced) {
+            throw new MimirTunnelForced($error->getMessage(), 0, $error);
+        }
+        throw $error;
     }
     mimir_tunnel_circuit_success();
     mimir_bc_route_remember('tunnel', (int) $result['page_id']);
@@ -204,7 +248,10 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
                 }
                 throw new MimirTunnelFallback('filter niet naar de tunnel te vertalen');
             }
-            $top = $inspected['kind'] === 'card' ? 5 : max(1, (int) $inspected['top']);
+            $top = $inspected['kind'] === 'card' ? 5 : (int) $inspected['top'];
+            if ($top < 1) {
+                $top = MIMIR_TUNNEL_UNBOUNDED_TOP;
+            }
             $body = mimir_tunnel_get_page((int) $page['page_id'], (string) $ctx['company'], $filters, $top, $ctx['key_id'] ?? null);
             $page = mimir_tunnel_remember_captions($page, $body, $ctx);
             $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types']);

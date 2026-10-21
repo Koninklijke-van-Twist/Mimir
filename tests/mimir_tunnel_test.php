@@ -32,7 +32,6 @@ function mimir_tn_reset_config(): void
     unset(
         $GLOBALS['mimir_tunnel_url'],
         $GLOBALS['mimir_tunnel_token'],
-        $GLOBALS['mimir_tunnel_top_max'],
         $GLOBALS['mimir_tunnel_cooldown'],
         $GLOBALS['mimir_tunnel_transport'],
         $GLOBALS['mimir_bc_route'],
@@ -44,7 +43,6 @@ function mimir_tn_enable(): void
 {
     $GLOBALS['mimir_tunnel_url'] = 'http://127.0.0.1:8787';
     $GLOBALS['mimir_tunnel_token'] = 'super-secret-token-value';
-    $GLOBALS['mimir_tunnel_top_max'] = 200;
     $GLOBALS['mimir_tunnel_cooldown'] = 120;
 }
 
@@ -108,17 +106,34 @@ function mimir_tn_log(): string
 
 mimir_tn_reset_config();
 mimir_tn_same(mimir_tunnel_configured(), false, 'tunnel off without config');
-mimir_tn_same(mimir_tunnel_route_for('list', 50), 'odata', 'unconfigured list stays odata');
-mimir_tn_same(mimir_tunnel_route_for('card', 1), 'odata', 'unconfigured card stays odata');
-mimir_tn_same(mimir_tunnel_route_for('action', 0), 'odata', 'unconfigured action stays odata');
+mimir_tn_same(mimir_tunnel_route_for('list'), 'odata', 'unconfigured list stays odata');
+mimir_tn_same(mimir_tunnel_route_for('bulk'), 'odata', 'unconfigured bulk stays odata');
+mimir_tn_same(mimir_tunnel_route_for('card'), 'odata', 'unconfigured card stays odata');
+mimir_tn_same(mimir_tunnel_route_for('action'), 'odata', 'unconfigured action stays odata');
+mimir_tn_same(mimir_tunnel_normalize_route(null), null, 'missing route is automatic');
+mimir_tn_same(mimir_tunnel_normalize_route('odata'), 'odata', 'odata is allowed without a tunnel');
+$rejected = false;
+try {
+    mimir_tunnel_normalize_route('tunnel');
+} catch (MimirUserException $error) {
+    $rejected = $error->status === 400;
+}
+mimir_tn_same($rejected, true, 'forcing the tunnel without config is an error');
 
 mimir_tn_enable();
-mimir_tn_same(mimir_tunnel_route_for('list', 1), 'tunnel', 'top 1 is a small list');
-mimir_tn_same(mimir_tunnel_route_for('list', 200), 'tunnel', 'top at the threshold uses the tunnel');
-mimir_tn_same(mimir_tunnel_route_for('list', 201), 'odata', 'top above the threshold stays odata');
-mimir_tn_same(mimir_tunnel_route_for('bulk', 0), 'odata', 'bulk stays odata');
-mimir_tn_same(mimir_tunnel_route_for('card', 1), 'tunnel', 'card uses the tunnel');
-mimir_tn_same(mimir_tunnel_route_for('action', 0), 'tunnel', 'action uses the tunnel when configured');
+mimir_tn_same(mimir_tunnel_route_for('list'), 'tunnel', 'a list uses the tunnel');
+mimir_tn_same(mimir_tunnel_route_for('bulk'), 'tunnel', 'bulk uses the tunnel');
+mimir_tn_same(mimir_tunnel_route_for('card'), 'tunnel', 'card uses the tunnel');
+mimir_tn_same(mimir_tunnel_route_for('action'), 'tunnel', 'action uses the tunnel when configured');
+mimir_tn_same(mimir_tunnel_route_for('list', 'odata'), 'odata', 'odata preference wins');
+mimir_tn_same(mimir_tunnel_normalize_route(' Tunnel '), 'tunnel', 'route is trimmed and lowercased');
+$badRoute = false;
+try {
+    mimir_tunnel_normalize_route('bc');
+} catch (MimirUserException $error) {
+    $badRoute = true;
+}
+mimir_tn_same($badRoute, true, 'an unknown route is rejected');
 
 mimir_tn_same(mimir_tunnel_caption_to_odata('No.'), 'No', 'No. becomes No');
 mimir_tn_same(mimir_tunnel_caption_to_odata('Vendor No.'), 'Vendor_No', 'caption with space and dot');
@@ -305,7 +320,7 @@ mimir_tn_same(
     'the same stale warning is not logged again within the hour'
 );
 
-// Bulk blijft OData. De koppeling is al warm, dus de tunnel wordt niet gebeld.
+// Bulk (top 0) gaat ook via de tunnel. De koppeling is al warm.
 $tunnelBefore = count($tunnelCalls);
 $odataCalls = [];
 $bulk = mimir_query_entity($pdo, mimir_tn_job($pdo, ['top' => 0, 'max_age' => 0]), static function (string $url) use (&$odataCalls): array {
@@ -313,10 +328,30 @@ $bulk = mimir_query_entity($pdo, mimir_tn_job($pdo, ['top' => 0, 'max_age' => 0]
 
     return ['value' => [['No' => 'B', 'Description' => 'bulk']]];
 }, $now + 10);
-mimir_tn_same(count($odataCalls) >= 1, true, 'unlimited read calls OData');
-mimir_tn_same(count($tunnelCalls), $tunnelBefore, 'unlimited read does not call the tunnel when the map is warm');
-mimir_tn_same($bulk['meta']['route'] ?? null, 'odata', 'bulk meta says odata');
-mimir_tn_same($bulk['value'][0]['Description'] ?? null, 'bulk', 'bulk row came from OData');
+mimir_tn_same($odataCalls, [], 'unlimited read does not call OData');
+mimir_tn_same(count($tunnelCalls) > $tunnelBefore, true, 'unlimited read calls the tunnel');
+$bulkUrl = $tunnelCalls[count($tunnelCalls) - 1];
+mimir_tn_same(str_contains($bulkUrl, '/page/31'), true, 'unlimited read uses the mapped page');
+mimir_tn_same(str_contains($bulkUrl, 'top=' . MIMIR_TUNNEL_UNBOUNDED_TOP), true, 'unlimited read asks the bridge for its window');
+mimir_tn_same($bulk['meta']['route'] ?? null, 'tunnel', 'bulk meta says tunnel');
+mimir_tn_same($bulk['value'][0]['Description'] ?? null, 'Pomp', 'bulk row came from the tunnel');
+
+// route=odata forceert OData, ook voor een kleine lijst.
+$tunnelBefore = count($tunnelCalls);
+$odataCalls = [];
+$forcedOdata = mimir_query_entity($pdo, mimir_tn_job($pdo, [
+    'top' => 20,
+    'max_age' => 0,
+    'route' => 'odata',
+]), static function (string $url) use (&$odataCalls): array {
+    $odataCalls[] = $url;
+
+    return ['value' => [['No' => 'O', 'Description' => 'gedwongen odata']]];
+}, $now + 11);
+mimir_tn_same(count($tunnelCalls), $tunnelBefore, 'route odata does not call the tunnel');
+mimir_tn_same(count($odataCalls) >= 1, true, 'route odata calls OData');
+mimir_tn_same($forcedOdata['meta']['route'] ?? null, 'odata', 'forced OData is named in meta');
+mimir_tn_same($forcedOdata['value'][0]['Description'] ?? null, 'gedwongen odata', 'forced OData row is returned');
 
 // Circuit: 3 storingen, daarna OData tot de cooldown voorbij is.
 mimir_tn_clear_circuit();
@@ -518,6 +553,77 @@ $cleared = mimir_tunnel_clear_page_cache($cardPdo);
 mimir_tn_same($cleared, 1, 'one page map was deleted');
 mimir_tn_same(mimir_meta_get($cardPdo, mimir_tunnel_cache_key('kvtmdlive_aad'), MIMIR_TUNNEL_PAGE_TTL, $clock), null, 'page map is gone');
 mimir_tn_same(mimir_meta_get($cardPdo, 'metadata:keep', 3600, $clock) !== null, true, 'other meta stays');
+
+// route=tunnel valt niet terug op OData, ook niet als het circuit open is.
+mimir_tn_enable();
+mimir_tn_clear_circuit();
+$clock = 1_700_000_000;
+$forcePdo = mimir_db(':memory:');
+mimir_meta_put($forcePdo, mimir_tunnel_cache_key('kvtmdlive_aad'), [
+    'services' => [
+        'ItemList' => ['page_id' => 31, 'object_type' => 'Page', 'captions' => ['No' => 'No.'], 'published' => true],
+    ],
+    'service_caption' => 'Service Name',
+    'stale_logged' => [],
+], $clock);
+$odataCalls = [];
+$tunnelCalls = [];
+$GLOBALS['mimir_tunnel_transport'] = static function (string $method, string $url, array $headers) use (&$tunnelCalls): array {
+    unset($method, $headers);
+    $tunnelCalls[] = $url;
+
+    return ['status' => 503, 'body' => '{"ok":false,"error":"Geen vrije BC-sessie","code":"QUEUE_TIMEOUT"}'];
+};
+$forcedError = null;
+try {
+    mimir_query_entity($forcePdo, mimir_tn_job($forcePdo, [
+        'top' => 5,
+        'max_age' => 0,
+        'route' => 'tunnel',
+    ]), static function (string $url) use (&$odataCalls): array {
+        $odataCalls[] = $url;
+
+        return ['value' => [['No' => 'Z', 'Description' => 'uit odata']]];
+    }, $clock);
+} catch (MimirUserException $error) {
+    $forcedError = $error;
+}
+mimir_tn_same($forcedError instanceof MimirUserException, true, 'forced tunnel failure is an error');
+mimir_tn_same($forcedError?->status, 502, 'forced tunnel failure is HTTP 502');
+mimir_tn_same($odataCalls, [], 'forced tunnel failure does not call OData');
+mimir_tn_same(str_contains($forcedError?->getMessage() ?? '', 'geen terugval'), true, 'the error says there is no OData fallback');
+for ($i = 0; $i < 2; $i++) {
+    try {
+        mimir_query_entity($forcePdo, mimir_tn_job($forcePdo, [
+            'top' => 5,
+            'max_age' => 0,
+            'route' => 'tunnel',
+        ]), static function (string $url): array {
+            unset($url);
+
+            return ['value' => []];
+        }, $clock + 10 + $i);
+    } catch (MimirUserException) {
+    }
+}
+mimir_tn_same(mimir_tunnel_circuit_open(), true, 'forced outages still open the circuit');
+$callsBeforeBypass = count($tunnelCalls);
+$bypassed = null;
+try {
+    $bypassed = mimir_query_entity($forcePdo, mimir_tn_job($forcePdo, [
+        'top' => 5,
+        'max_age' => 0,
+        'route' => 'tunnel',
+    ]), static function (string $url) use (&$odataCalls): array {
+        $odataCalls[] = $url;
+
+        return ['value' => [['No' => 'Z', 'Description' => 'uit odata']]];
+    }, $clock + 40);
+} catch (MimirUserException) {
+}
+mimir_tn_same(count($tunnelCalls) > $callsBeforeBypass, true, 'forced tunnel still calls the bridge while the circuit is open');
+mimir_tn_same($odataCalls, [], 'an open circuit does not add an OData call when the tunnel is forced');
+mimir_tn_same($bypassed, null, 'the forced call while the circuit is open still fails');
 
 // Zonder config is het antwoord zoals voorheen: geen route-veld.
 mimir_tn_reset_config();
