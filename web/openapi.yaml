@@ -733,6 +733,24 @@ components:
             (circuit open, of SQLite locked/onleesbaar/readonly/corrupt) en het antwoord
             rechtstreeks uit Business Central komt, in hetzelfde response-formaat.
             Afwezig bij normaal cachegedrag.
+        route:
+          type: string
+          enum: [tunnel, odata, mixed, cache]
+          description: >
+            Alleen als de Mimir-Tunnel in auth.php staat. tunnel of odata is de live
+            route; mixed als één antwoord beide gebruikte; cache als BC niet gebeld werd.
+        webservice:
+          type: string
+          description: OData-webservicenaam van de query. Alleen als de tunnel geconfigureerd is.
+        page:
+          type: integer
+          nullable: true
+          description: BC-pagina-id uit pagina 810, als die koppeling bekend is.
+        webservice_warning:
+          type: string
+          description: >
+            Waarschuwing als de aangeroepen webservicenaam een nieuwere variant heeft,
+            bijvoorbeeld LVS_Contract_Total_Price terwijl LVS_Contract_Total_Price_2 bestaat.
     MetadataCatalog:
       type: object
       required: [environment, environments, total, matched, entity_sets]

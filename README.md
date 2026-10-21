@@ -51,6 +51,15 @@ $auth_list = [
 $allowedUsers = [
     'tim@kvt.nl',
 ];
+
+// Optioneel. Zonder url of token blijft Mímir alleen op OData.
+$mimir_tunnel_url = 'http://127.0.0.1:8787';
+$mimir_tunnel_token = '...'; // bearer van de tunnel, niet in git
+// Optioneel, standaard 200: tunnel bij top 1 t/m deze drempel.
+// top 0 (ongelimiteerd) en alles daarboven blijft OData.
+$mimir_tunnel_top_max = 200;
+// Optioneel, standaard 120 seconden cooldown na 3 mislukte tunnelpogingen.
+$mimir_tunnel_cooldown = 120;
 ```
 
 Een aanroep noemt het **bedrijf**, niet het environment. `auth_get_environment_for_company` zoekt het bedrijf in alle actieve environments en kiest daarbij de credentials. De URL wordt:
@@ -168,6 +177,19 @@ Komt er toch een 501 terug, dan haalt Mímir dezelfde set opnieuw op zonder `$fi
 Grote same-field OR-lijsten (JSON of eenvoudige `$filter`-string) batcht Mímir automatisch (40 per keer, korter bij te lange URL), zodat clients één query kunnen sturen.
 
 Paginering volgt `@odata.nextLink` tot de set klaar is (plafond 100 pagina's). Een ongelimiteerde fetch (`top: 0`) stuurt **geen** `$top` naar BC: `$top` is daar een totaalplafond en onderdrukt `nextLink`, waardoor grote sets (debiteuren, crediteuren) op 2000 rijen bleven steken. De pagina-grootte is `Prefer: odata.maxpagesize=2000` op de HTTP-client. Wijst BC die header af, dan dezelfde URL zonder Prefer; zonder `$top` pagineert BC alsnog via `nextLink` op de eigen Max Page Size. `$skip` gebruiken we niet. Een eindige `top` gaat wél als `$top` mee en telt niet als volledige dekking wanneer dat plafond vol is. Alleen een afgeronde set wordt als dekking bewaard.
+
+## Mimir-Tunnel
+
+Naast OData kan Mímir kleine reads via de [Mimir-Tunnel](https://github.com/Koninklijke-van-Twist/Mimir-Tunnel) doen: een Node-bridge op dezelfde machine naar de BC-webclient. De bridge luistert op loopback (`Authorization: Bearer`), `GET /page/{id}` leest een pagina en `GET /health` is de healthcheck.
+
+Zet `$mimir_tunnel_url` en `$mimir_tunnel_token` in `auth.php` (zie boven). Ontbreekt één van de twee, dan is het gedrag hetzelfde als nu: alleen OData, geen extra velden in `meta`.
+
+- **Kleine lijst** (`top` van 1 t/m `$mimir_tunnel_top_max`, standaard 200) en **kaart** (één rij op de sleutel, bijvoorbeeld een verversing van een ontbrekende kolom) gaan via `GET /page/{id}`. De webservicenaam wordt een pagina-id via pagina 810 (Web Services). Die koppeling staat in `meta_cache` onder `tunnel-pages:<environment>`, 24 uur.
+- **Bulk** (`top: 0` of groter dan de drempel) blijft OData. De rijcache en `max_age` veranderen niet.
+- **Schrijven** (`api/write.php`) blijft OData, inclusief etag en het schrijflogboek. Een tunnel-mutatie die misschien al in BC staat, wordt niet daarna nog eens via OData herhaald.
+- Na **3 mislukte tunnelpogingen** (verbinding, 401, 404, 5xx) gaat alles terug naar OData tot de cooldown (standaard 120 seconden). Dat staat in het gebeurtenislog. Een verkeerde pagina ververst alleen die ene koppeling en telt niet mee als storing. Een filter dat niet naar de tunnel te vertalen is, valt voor dat verzoek terug op OData zonder de teller te verhogen.
+- Het antwoord krijgt, alleen als de tunnel geconfigureerd is, `meta.route` (`tunnel`, `odata`, `mixed` of `cache`), `meta.webservice` en zo mogelijk `meta.page`. Een verouderde webservicenaam (er bestaat een hogere `_2`-variant, zoals `LVS_Contract_Total_Price` naast `LVS_Contract_Total_Price_2`) geeft `meta.webservice_warning` en hooguit één logregel per uur.
+- Op de pagina, bij Gebeurtenissen: **Tunnel-koppelcache legen**. Die wist alleen de pagina-koppeling, niet de rijcache.
 
 ## API-sleutels
 
@@ -346,6 +368,7 @@ php tests/mimir_migrate_test.php
 node tests/mimir_keys_render_test.js
 php tests/mimir_split_test.php
 php tests/mimir_table_circuit_test.php
+php tests/mimir_tunnel_test.php
 ```
 
 De tests hebben de PHP-extensie `pdo_sqlite` nodig (Debian: `php-sqlite3`). `mimir_write_test.php` gebruikt een gemockte HTTP-client en belt Business Central nooit.

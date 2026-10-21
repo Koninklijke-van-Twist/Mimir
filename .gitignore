@@ -11,6 +11,7 @@ web/data/*.jsonl
 web/data/*.jsonl.*
 web/data/mimir-circuit.json
 web/data/mimir-circuit.json.tmp.*
+web/data/mimir-tunnel-circuit.json
 web/data/mimir-key-mirror.json
 web/data/mimir-company-map.json
 web/data/mimir-metadata-*.json

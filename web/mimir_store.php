@@ -8,6 +8,7 @@ require_once __DIR__ . '/odata.php';
 require_once __DIR__ . '/mimir_heatmap.php';
 require_once __DIR__ . '/mimir_bc_limit.php';
 require_once __DIR__ . '/mimir_cache_db.php';
+require_once __DIR__ . '/mimir_tunnel.php';
 
 const MIMIR_UI_MAX_AGE = 600;
 const MIMIR_DEFAULT_MAX_AGE = 3600;
@@ -1243,10 +1244,50 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $slotHeld = false;
     $queueWaitMs = 0;
     $innerFetch = $fetch;
-    $fetch = static function (string $url) use ($innerFetch, $environment, &$slotHeld, &$queueWaitMs): array {
+    $metaPdo = ($job['meta_pdo'] ?? null) instanceof PDO ? $job['meta_pdo'] : null;
+    unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page']);
+    $fetch = static function (string $url) use (
+        $innerFetch,
+        $environment,
+        $company,
+        $entity,
+        $types,
+        $metaPdo,
+        $keyId,
+        $now,
+        &$slotHeld,
+        &$queueWaitMs
+    ): array {
+        if (mimir_tunnel_configured()) {
+            try {
+                $viaTunnel = mimir_tunnel_try($url, [
+                    'environment' => $environment,
+                    'company' => $company,
+                    'entity' => $entity,
+                    'types' => $types,
+                    'pdo' => $metaPdo,
+                    'now' => $now,
+                    'key_id' => $keyId !== null && $keyId > 0 ? (string) $keyId : null,
+                ]);
+                if (is_array($viaTunnel)) {
+                    return $viaTunnel;
+                }
+            } catch (MimirTunnelFallback $error) {
+                mimir_event_log(
+                    'tunnel',
+                    'Tunnel mislukt, terugval op OData: ' . $error->getMessage(),
+                    $environment,
+                    $entity,
+                    'tunnel-fallback'
+                );
+            }
+        }
         if (!$slotHeld) {
             $queueWaitMs = mimir_bc_slot_acquire($environment);
             $slotHeld = true;
+        }
+        if (mimir_tunnel_configured()) {
+            mimir_bc_route_remember('odata', null);
         }
 
         return $innerFetch($url);
@@ -1477,6 +1518,34 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         $meta['source'] = 'bc-live';
         $meta['bc_hit'] = 1;
         $meta['shared'] = 0;
+    }
+    if (mimir_tunnel_configured()) {
+        $route = $GLOBALS['mimir_bc_route'] ?? null;
+        $meta['route'] = is_string($route) && $route !== '' ? $route : 'cache';
+        $meta['webservice'] = $entity;
+        if ($metaPdo instanceof PDO) {
+            $warning = mimir_tunnel_stale_warning($metaPdo, $environment, $entity, $now);
+            if ($warning !== null) {
+                $meta['webservice_warning'] = $warning;
+            }
+            $knownPage = mimir_tunnel_cached_page_id($metaPdo, $environment, $entity, $now);
+            if ($knownPage !== null) {
+                $meta['page'] = $knownPage;
+            }
+        }
+        if (!empty($GLOBALS['mimir_bc_route_page'])) {
+            $meta['page'] = (int) $GLOBALS['mimir_bc_route_page'];
+        }
+        if ($meta['route'] !== 'cache') {
+            $pageNote = isset($meta['page']) ? ' page=' . $meta['page'] : '';
+            mimir_event_log(
+                'route',
+                'route=' . $meta['route'] . ' webservice=' . $entity . $pageNote,
+                $environment,
+                $entity,
+                (string) $meta['route']
+            );
+        }
     }
     $meta['queue_wait_ms'] = $queueWaitMs;
     $meta['bc_slots_max'] = mimir_bc_limit_max_concurrent();
@@ -1997,6 +2066,9 @@ function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $c
             throw new RuntimeException('OData nextLink wijst naar een andere host.');
         }
         $decoded = $fetch($next);
+        if (!empty($decoded['@mimir.truncated'])) {
+            $truncated = true;
+        }
         if (!isset($decoded['value']) || !is_array($decoded['value'])) {
             throw new RuntimeException("OData response missing 'value' array");
         }

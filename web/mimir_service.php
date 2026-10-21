@@ -325,6 +325,7 @@ function mimir_run_table_query(PDO $pdo, array $spec, int $now, ?int $forceMaxAg
         'max_age' => $maxAge,
         'top' => $spec['top'] ?? MIMIR_DEFAULT_TOP,
         'key_id' => $keyId,
+        'meta_pdo' => $pdo,
         'schema' => [
             'keys' => $schema['keys'],
             'properties' => $schema['properties'],
@@ -856,7 +857,7 @@ function mimir_request_csrf_token(): string
  */
 function mimir_ui_require_csrf(string $action): void
 {
-    if (!in_array($action, ['keys_create', 'keys_revoke', 'keys_set_write'], true)) {
+    if (!in_array($action, ['keys_create', 'keys_revoke', 'keys_set_write', 'tunnel_cache_clear'], true)) {
         return;
     }
     if (!mimir_csrf_valid(mimir_request_csrf_token())) {
@@ -937,6 +938,9 @@ function mimir_ui_cached_payload(PDO $pdo, string $action, string $email, int $n
 
         return ['ok' => true, 'id' => (int) $body['id'], 'can_write' => $body['can_write']];
     }
+    if ($action === 'tunnel_cache_clear') {
+        return ['ok' => true, 'cleared' => mimir_tunnel_clear_page_cache($pdo)];
+    }
     if ($action === 'keys_revoke') {
         if (!is_array($body)) {
             throw new MimirUserException('JSON-body ontbreekt.');
@@ -1015,7 +1019,7 @@ function mimir_ui_main(): void
     $action = trim((string) ($_GET['action'] ?? ''));
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     $now = time();
-    $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST', 'keys_set_write' => 'POST', 'keys_write_log' => 'GET'];
+    $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST', 'keys_set_write' => 'POST', 'keys_write_log' => 'GET', 'tunnel_cache_clear' => 'POST'];
     $dataActions = ['companies' => 'GET', 'tables' => 'GET', 'schema' => 'GET', 'query' => 'POST'];
     $metadataActions = ['metadata' => 'GET', 'metadata_refresh' => 'POST'];
 

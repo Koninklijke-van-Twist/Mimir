@@ -39,7 +39,8 @@ function mimir_auth_candidates(): array
 
 function mimir_load_auth(bool $jsonErrors = false): void
 {
-    global $baseUrl, $allowedUsers, $auth_list, $environment, $auth, $primaryEnvironment;
+    global $baseUrl, $allowedUsers, $auth_list, $environment, $auth, $primaryEnvironment,
+        $mimir_tunnel_url, $mimir_tunnel_token, $mimir_tunnel_top_max, $mimir_tunnel_cooldown;
 
     if (isset($baseUrl) && is_string($baseUrl) && $baseUrl !== '') {
         return;
@@ -50,7 +51,7 @@ function mimir_load_auth(bool $jsonErrors = false): void
             require_once $path;
             // require binnen een functie houdt losse assignments lokaal tenzij
             // we ze terugzetten op $GLOBALS (en de global-aliassen).
-            foreach (['baseUrl', 'allowedUsers', 'auth_list', 'environment', 'auth', 'primaryEnvironment'] as $name) {
+            foreach (['baseUrl', 'allowedUsers', 'auth_list', 'environment', 'auth', 'primaryEnvironment', 'mimir_tunnel_url', 'mimir_tunnel_token', 'mimir_tunnel_top_max', 'mimir_tunnel_cooldown'] as $name) {
                 if (array_key_exists($name, get_defined_vars())) {
                     $GLOBALS[$name] = $$name;
                 }

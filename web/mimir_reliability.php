@@ -202,7 +202,7 @@ function mimir_key_hash_prefix(string $plain): string
 
 function mimir_event_logs_caller(string $action): bool
 {
-    return in_array($action, ['bc-failed', 'bypassed-to-BC', 'failed', 'fallback-one-slot'], true);
+    return in_array($action, ['bc-failed', 'bypassed-to-BC', 'failed', 'fallback-one-slot', 'tunnel-fallback', 'stale-webservice'], true);
 }
 
 function mimir_caller_log_value(): string
