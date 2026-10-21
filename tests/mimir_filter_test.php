@@ -137,7 +137,7 @@ mimir_test_same(mimir_filter_match(['Open' => false], 'Open eq true', ['Open' =>
 mimir_test_same(mimir_filter_match(['Open' => false], '(Open eq false)', ['Open' => 'Edm.Boolean']), true, 'parenthesised Open eq false');
 mimir_test_same(mimir_filter_match(['Open' => 'true'], 'Open eq true'), true, 'boolean literal without schema type');
 mimir_test_same(mimir_filter_match(['Name' => 'x'], 'Open eq true'), false, 'missing Open is not Open eq true');
-mimir_test_same(odata_maxpagesize_header(), 'Prefer: odata.maxpagesize=2000', 'prefer maxpagesize header');
+mimir_test_same(odata_maxpagesize_header(), 'Prefer: odata.maxpagesize=500', 'prefer maxpagesize header');
 mimir_test_same(odata_prefer_rejected(new RuntimeException('HTTP 400 from OData: Prefer maxpagesize rejected')), true, 'prefer rejection is retried');
 mimir_test_same(odata_prefer_rejected(new RuntimeException('HTTP 400 from OData: filter invalid')), false, 'other 400 is not a prefer rejection');
 mimir_test_same(odata_prefer_rejected(new RuntimeException('HTTP 501 from OData: nope')), false, '501 is not a prefer rejection');
