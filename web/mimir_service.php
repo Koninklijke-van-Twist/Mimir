@@ -666,9 +666,41 @@ function mimir_authenticate_api_key(string $apiKey, ?PDO &$pdo): ?array
     return mimir_key_mirror_lookup($apiKey);
 }
 
+function mimir_api_register_fatal_handler(): void
+{
+    register_shutdown_function(static function (): void {
+        $error = error_get_last();
+        if (!is_array($error) || !in_array($error['type'] ?? 0, [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_PARSE], true)) {
+            return;
+        }
+        $message = (string) ($error['message'] ?? '');
+        if (strlen($message) > 400) {
+            $message = substr($message, 0, 400) . '…';
+        }
+        if (function_exists('mimir_event_log')) {
+            try {
+                mimir_event_log('error', 'Fatale fout in API: ' . $message);
+            } catch (Throwable) {
+            }
+        }
+        if (headers_sent()) {
+            return;
+        }
+        while (ob_get_level() > 0) {
+            @ob_end_clean();
+        }
+        http_response_code(500);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store');
+        echo json_encode(['error' => 'FATAL', 'message' => $message], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    });
+}
+
 function mimir_api_main(?string $forcedRoute = null): void
 {
     @set_time_limit(300);
+    @ini_set('memory_limit', '512M');
+    mimir_api_register_fatal_handler();
     $GLOBALS['mimir_stamp_bc_live'] = false;
     $apiKey = mimir_request_api_key();
     if ($apiKey === '') {
