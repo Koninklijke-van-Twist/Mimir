@@ -1306,7 +1306,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $innerFetch = $fetch;
     $metaPdo = ($job['meta_pdo'] ?? null) instanceof PDO ? $job['meta_pdo'] : null;
     $tunnelRoute = isset($job['route']) && is_string($job['route']) && $job['route'] !== '' ? $job['route'] : null;
-    unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page'], $GLOBALS['mimir_tunnel_columns_learned']);
+    unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page'], $GLOBALS['mimir_tunnel_columns_learned'], $GLOBALS['mimir_tunnel_key_by']);
     $stayOnOdata = false;
     $fetch = static function (string $url) use (
         $innerFetch,
@@ -1621,6 +1621,10 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         $route = $GLOBALS['mimir_bc_route'] ?? null;
         $meta['route'] = is_string($route) && $route !== '' ? $route : 'cache';
         $meta['webservice'] = $entity;
+        if (($meta['route'] ?? '') === 'tunnel' && isset($GLOBALS['mimir_tunnel_key_by']) && is_string($GLOBALS['mimir_tunnel_key_by'])) {
+            // designName = bridge gaf DesignName-sleutels; caption = oudere bridge/terugval.
+            $meta['tunnel_key_by'] = $GLOBALS['mimir_tunnel_key_by'];
+        }
         if ($metaPdo instanceof PDO) {
             $warning = mimir_tunnel_stale_warning($metaPdo, $environment, $entity, $now);
             if ($warning !== null) {

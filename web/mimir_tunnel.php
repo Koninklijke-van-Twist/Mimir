@@ -280,12 +280,13 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
             }
             $skip = $inspected['kind'] === 'card' ? 0 : max(0, (int) ($inspected['skip'] ?? 0));
             $pageTop = mimir_tunnel_page_top($inspected);
-            $body = mimir_tunnel_get_page((int) $page['page_id'], (string) $ctx['company'], $filters, $pageTop, $ctx['key_id'] ?? null, $skip);
+            $body = mimir_tunnel_get_page((int) $page['page_id'], (string) $ctx['company'], $filters, $pageTop, $ctx['key_id'] ?? null, $skip, MIMIR_TUNNEL_KEY_BY);
+            mimir_tunnel_note_key_by($body);
             $page = mimir_tunnel_remember_captions($page, $body, $ctx);
             $learnCtx = $ctx;
             $learnCtx['_unfiltered_first_page'] = $inspected['kind'] !== 'card' && $filters === [] && $skip === 0;
             $page = mimir_tunnel_ensure_columns($page, $body, $learnCtx);
-            $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_columns_map($page));
+            $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_effective_columns($page, $body, $ctx['types']));
             if ($inspected['kind'] !== 'card') {
                 try {
                     mimir_tunnel_assert_usable($inspected, $body, $odata, $ctx);
@@ -296,7 +297,7 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
                         throw $unusable;
                     }
                     $page = $relearned;
-                    $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_columns_map($page));
+                    $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_effective_columns($page, $body, $ctx['types']));
                     mimir_tunnel_assert_usable($inspected, $body, $odata, $ctx);
                 }
                 $odata = mimir_tunnel_add_next_link($inspected, $odata, $body, $pageTop);
@@ -1236,9 +1237,14 @@ function mimir_tunnel_unwrap(string $text): string
  * @param list<string> $filters
  * @return array<string, mixed>
  */
-function mimir_tunnel_get_page(int $pageId, string $company, array $filters, int $top, ?string $keyId, int $skip = 0): array
+function mimir_tunnel_get_page(int $pageId, string $company, array $filters, int $top, ?string $keyId, int $skip = 0, ?string $keyBy = null): array
 {
     $query = ['company' => $company, 'top' => (string) max(1, $top)];
+    if ($keyBy !== null && $keyBy !== '') {
+        // Bridge met business-central-mcp-fork: cellen op DesignName (taalonafhankelijk).
+        // Een oudere bridge negeert deze parameter en geeft gewoon captions.
+        $query['keyBy'] = $keyBy;
+    }
     if ($skip > 0) {
         $query['skip'] = (string) $skip;
     }

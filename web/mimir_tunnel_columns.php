@@ -26,6 +26,101 @@ const MIMIR_TUNNEL_COLUMNS_SAMPLE = 20;
 const MIMIR_TUNNEL_COLUMNS_MIN_SCORE = 0.8;
 /** Na een mislukte leerpoging (geen OData-steekproef) niet elke request opnieuw. */
 const MIMIR_TUNNEL_COLUMNS_RETRY = 300;
+/** Mímir vraagt de bridge om cellen op DesignName; een bridge zonder keyBy geeft captions. */
+const MIMIR_TUNNEL_KEY_BY = 'designName';
+
+/**
+ * Antwoordt de bridge met DesignName-sleutels? Alleen als hij dat zelf meldt
+ * (`keyBy: "designName"`); een oudere bridge stuurt geen keyBy en dus captions.
+ *
+ * @param array<string, mixed> $body
+ */
+function mimir_tunnel_body_is_design_keyed(array $body): bool
+{
+    return ($body['keyBy'] ?? null) === 'designName';
+}
+
+/** Onthoudt per request welke sleutels de tunnel gaf (voor meta.tunnel_key_by). */
+function mimir_tunnel_note_key_by(array $body): void
+{
+    $GLOBALS['mimir_tunnel_key_by'] = mimir_tunnel_body_is_design_keyed($body) ? 'designName' : 'caption';
+}
+
+/**
+ * DesignName of OData-naam vergelijkbaar maken: niet-alfanumeriek -> '_',
+ * trailing '_' weg, kleine letters ("No." -> "no", "Balance (LCY)" -> "balance__lcy").
+ */
+function mimir_tunnel_design_norm(string $name): string
+{
+    return strtolower(rtrim((string) preg_replace('/[^A-Za-z0-9]/', '_', $name), '_'));
+}
+
+/**
+ * DesignName -> OData-veld via $metadata (de types van de entity).
+ * Eerst exact genormaliseerd, daarna met samengevoegde '_' (BC maakt van
+ * "Balance (LCY)" Balance_LCY). Elk veld hoogstens één keer.
+ *
+ * @param list<string> $designNames
+ * @param array<string, string> $types
+ * @return array<string, string>
+ */
+function mimir_tunnel_design_columns(array $designNames, array $types): array
+{
+    $fields = array_values(array_filter(array_keys($types), 'is_string'));
+    $collapse = static fn (string $norm): string => (string) preg_replace('/_+/', '_', $norm);
+    $map = [];
+    $used = [];
+    foreach ([false, true] as $loose) {
+        $index = [];
+        foreach ($fields as $field) {
+            $norm = mimir_tunnel_design_norm($field);
+            $norm = $loose ? $collapse($norm) : $norm;
+            $index[$norm] ??= $field;
+        }
+        foreach ($designNames as $name) {
+            if (!is_string($name) || $name === '' || isset($map[$name]) || preg_match('/#\d+$/', $name) === 1) {
+                continue;
+            }
+            $norm = mimir_tunnel_design_norm($name);
+            $norm = $loose ? $collapse($norm) : $norm;
+            $field = $index[$norm] ?? null;
+            if ($field !== null && !isset($used[$field])) {
+                $map[$name] = $field;
+                $used[$field] = true;
+            }
+        }
+    }
+
+    return $map;
+}
+
+/**
+ * Koppeling sleutel -> OData-veld voor dit antwoord: bij DesignName-sleutels
+ * eerst de $metadata-koppeling, daarna de geleerde caption/waarde-koppeling
+ * voor wat overblijft. Bij captions alleen de geleerde koppeling (oude gedrag).
+ *
+ * @param array<string, mixed> $entry
+ * @param array<string, mixed> $body
+ * @param array<string, string> $types
+ * @return array<string, string>
+ */
+function mimir_tunnel_effective_columns(array $entry, array $body, array $types): array
+{
+    $learned = mimir_tunnel_columns_map($entry);
+    if (!mimir_tunnel_body_is_design_keyed($body)) {
+        return $learned;
+    }
+    $design = mimir_tunnel_design_columns(mimir_tunnel_body_captions($body), $types);
+    $used = array_flip(array_values($design));
+    foreach ($learned as $key => $field) {
+        if (!isset($design[$key]) && !isset($used[$field])) {
+            $design[$key] = $field;
+            $used[$field] = true;
+        }
+    }
+
+    return $design;
+}
 
 /**
  * Captions in een tunnel-antwoord, in kolomvolgorde.
@@ -163,6 +258,35 @@ function mimir_tunnel_ensure_columns(array $entry, array $body, array $ctx, bool
     $types = is_array($ctx['types'] ?? null) ? $ctx['types'] : [];
     $keys = is_array($ctx['keys'] ?? null) ? array_values(array_filter($ctx['keys'], 'is_string')) : [];
     $tunnelRows = mimir_tunnel_body_cell_rows($body);
+    $designKeyed = mimir_tunnel_body_is_design_keyed($body);
+    if ($designKeyed) {
+        // DesignName-sleutels: koppeling direct uit $metadata. Alleen als dat niet
+        // alles dekt (of de sleutelvelden mist) valt het terug op de waardevergelijking.
+        $design = mimir_tunnel_design_columns($captions, $types);
+        $unmapped = array_values(array_diff($captions, array_keys($design)));
+        if ($unmapped === [] && array_diff($keys, array_values($design)) === []) {
+            $entry['columns'] = [
+                'map' => $design,
+                'seen' => $captions,
+                'learned_at' => $now,
+                'complete' => true,
+                'method' => array_fill_keys(array_keys($design), 'designName'),
+                'key_by' => 'designName',
+            ];
+            // Filters gaan ook op DesignName (de bridge accepteert DesignName of caption).
+            $fieldToKey = is_array($entry['captions'] ?? null) ? $entry['captions'] : [];
+            foreach ($design as $name => $field) {
+                $fieldToKey[$field] = $name;
+            }
+            $entry['captions'] = $fieldToKey;
+            $pdo = $ctx['pdo'] ?? null;
+            if ($pdo instanceof PDO) {
+                mimir_tunnel_save_entry($pdo, (string) ($ctx['environment'] ?? ''), (string) ($ctx['entity'] ?? ''), $entry, $now);
+            }
+
+            return $entry;
+        }
+    }
     // Alles al op naam te koppelen (Engelse captions): geen OData-steekproef nodig.
     $byName = mimir_tunnel_learn_columns($captions, $tunnelRows, [], $types, $keys);
     $keysByName = array_diff($keys, array_values($byName['map'])) === [];
@@ -186,7 +310,7 @@ function mimir_tunnel_ensure_columns(array $entry, array $body, array $ctx, bool
     $error = null;
     try {
         if (!$sampleFromBody) {
-            $probe = mimir_tunnel_get_page((int) $entry['page_id'], (string) $ctx['company'], [], MIMIR_TUNNEL_COLUMNS_SAMPLE, $ctx['key_id'] ?? null);
+            $probe = mimir_tunnel_get_page((int) $entry['page_id'], (string) $ctx['company'], [], MIMIR_TUNNEL_COLUMNS_SAMPLE, $ctx['key_id'] ?? null, 0, $designKeyed ? MIMIR_TUNNEL_KEY_BY : null);
             $tunnelRows = mimir_tunnel_body_cell_rows($probe);
             $captions = array_values(array_unique(array_merge($captions, mimir_tunnel_body_captions($probe))));
         }
