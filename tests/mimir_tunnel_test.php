@@ -709,6 +709,56 @@ try {
 unset($GLOBALS['mimir_deadline_at']);
 mimir_tn_same($dlStatus, 504, 'deadline after the first page gives 504');
 
+// Nederlandse captions in page 810.
+$nl = mimir_tunnel_parse_services(['rows' => [
+    ['cells' => ['Objecttype' => 'Pagina', 'Object-id' => '26', 'Servicenaam' => 'AppVendors', 'Gepubliceerd' => 'Ja']],
+]]);
+mimir_tn_same($nl['services']['AppVendors']['page_id'] ?? null, 26, 'Dutch captions map AppVendors to page 26');
+mimir_tn_same($nl['service_caption'] ?? null, 'Servicenaam', 'Dutch service caption is remembered');
+
+// Lege koppeling: gericht zoeken op de servicenaam, korte TTL, diagnose in de fout.
+mimir_tn_reset_config();
+mimir_tn_clear_circuit();
+mimir_tn_enable();
+$emptyPdo = mimir_db(':memory:');
+$lookups = [];
+$GLOBALS['mimir_tunnel_transport'] = static function (string $method, string $url, array $headers) use (&$lookups): array {
+    unset($method, $headers);
+    if (str_contains($url, '/page/810')) {
+        $lookups[] = $url;
+        if (str_contains($url, 'filter=')) {
+            return ['status' => 200, 'body' => json_encode(['rows' => [['cells' => ['Servicenaam' => 'ItemList', 'Object-id' => '31', 'Objecttype' => 'Pagina']]]])];
+        }
+
+        return ['status' => 200, 'body' => json_encode(['rows' => [], 'totalRowCount' => 0])];
+    }
+
+    return ['status' => 200, 'body' => json_encode(['rows' => [['bookmark' => 'x', 'cells' => ['No.' => 'A', 'Description' => 'gevonden']]]])];
+};
+$found = mimir_query_entity($emptyPdo, mimir_tn_job($emptyPdo, ['top' => 5, 'max_age' => 0, 'route' => 'tunnel']), static function (string $url): array {
+    unset($url);
+
+    return ['value' => []];
+}, $clock);
+mimir_tn_same($found['meta']['route'] ?? null, 'tunnel', 'missing name is found via a filtered lookup');
+mimir_tn_same(count($lookups), 2, 'full read then one filtered lookup');
+mimir_tn_same(str_contains($lookups[1], 'Servicenaam') || str_contains($lookups[1], 'Service'), true, 'lookup filters on the service name');
+$cachedMap = mimir_meta_get_raw($emptyPdo, mimir_tunnel_cache_key('kvtmdlive_aad'));
+mimir_tn_same(mimir_tunnel_map_incomplete(['services' => [], 'diag' => ['truncated' => false]]), true, 'empty map is incomplete');
+mimir_tn_same(is_array($cachedMap['diag'] ?? null), true, 'diag is stored with the map');
+$diagError = null;
+try {
+    mimir_query_entity($emptyPdo, mimir_tn_job($emptyPdo, ['entity' => 'Nope', 'top' => 5, 'max_age' => 0, 'route' => 'tunnel']), static function (string $url): array {
+        unset($url);
+
+        return ['value' => []];
+    }, $clock);
+} catch (MimirUserException $error) {
+    $diagError = $error->getMessage();
+}
+mimir_tn_same(is_string($diagError) && str_contains($diagError, 'page 810: 0 rijen'), true, 'error shows the page 810 diagnosis: ' . var_export($diagError, true));
+mimir_tn_clear_circuit();
+
 // Zonder config is het antwoord zoals voorheen: geen route-veld.
 mimir_tn_reset_config();
 mimir_tn_clear_circuit();
