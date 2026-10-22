@@ -759,6 +759,30 @@ try {
 mimir_tn_same(is_string($diagError) && str_contains($diagError, 'page 810: 0 rijen'), true, 'error shows the page 810 diagnosis: ' . var_export($diagError, true));
 mimir_tn_clear_circuit();
 
+// Captions die niet op OData-velden passen (bijv. "Nr."): terugval op OData, geen 200 met 0 rijen.
+mimir_tn_reset_config();
+mimir_tn_clear_circuit();
+mimir_tn_enable();
+$capPdo = mimir_db(':memory:');
+$GLOBALS['mimir_tunnel_transport'] = static function (string $method, string $url, array $headers): array {
+    unset($method, $headers);
+    if (str_contains($url, '/page/810')) {
+        return ['status' => 200, 'body' => json_encode(mimir_tn_services_body())];
+    }
+
+    return ['status' => 200, 'body' => json_encode(['rows' => [['bookmark' => 'x', 'cells' => ['Nr.' => 'A', 'Omschrijving' => 'Pomp']]]])];
+};
+$capOdata = [];
+$capResult = mimir_query_entity($capPdo, mimir_tn_job($capPdo, ['top' => 0, 'max_age' => 0]), static function (string $url) use (&$capOdata): array {
+    $capOdata[] = $url;
+
+    return ['value' => [['No' => 'A', 'Description' => 'uit odata']]];
+}, $clock);
+mimir_tn_same(count($capOdata) >= 1, true, 'unmappable captions fall back to OData');
+mimir_tn_same($capResult['value'][0]['Description'] ?? null, 'uit odata', 'OData rows are returned');
+mimir_tn_same(str_contains(mimir_tn_log(), 'Nr.'), true, 'fallback log names the captions');
+mimir_tn_clear_circuit();
+
 // Zonder config is het antwoord zoals voorheen: geen route-veld.
 mimir_tn_reset_config();
 mimir_tn_clear_circuit();
