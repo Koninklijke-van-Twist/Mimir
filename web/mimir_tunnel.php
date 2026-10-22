@@ -44,6 +44,15 @@ class MimirTunnelMidPage extends RuntimeException
 {
 }
 
+/**
+ * Geen leesbare BC-pagina voor deze service (geen rij in page 810, of een Query/
+ * Codeunit). Direct OData, geen tunnelpoging; alleen de eerste keer loggen.
+ */
+class MimirTunnelNoPage extends MimirTunnelFallback
+{
+    public bool $alreadyLogged = false;
+}
+
 class MimirTunnelOutage extends RuntimeException
 {
 }
@@ -515,6 +524,10 @@ function mimir_tunnel_resolve_page(array $ctx): array
     $entity = (string) $ctx['entity'];
     $entry = $map['services'][$entity] ?? null;
     if (!is_array($entry)) {
+        // Servicenamen zijn in BC niet hoofdlettergevoelig; de filter op page 810 wel.
+        $entry = mimir_tunnel_find_service_ci($map['services'] ?? [], $entity);
+    }
+    if (!is_array($entry)) {
         // Niet in de (mogelijk afgekapte) koppeling: gericht zoeken op de servicenaam.
         $lookupError = null;
         try {
@@ -523,7 +536,8 @@ function mimir_tunnel_resolve_page(array $ctx): array
             $refreshed = null;
             $lookupError = $error->getMessage();
         }
-        if (is_array($refreshed) && (int) ($refreshed['page_id'] ?? 0) > 0) {
+        if (is_array($refreshed)) {
+            // Ook zonder page_id: de controle hieronder geeft dan een duidelijke diagnose.
             $entry = $refreshed;
         } else {
             throw new MimirTunnelFallback(
@@ -535,13 +549,44 @@ function mimir_tunnel_resolve_page(array $ctx): array
     $pageId = (int) ($entry['page_id'] ?? 0);
     $type = trim((string) ($entry['object_type'] ?? ''));
     if ($pageId < 1 || ($type !== '' && !mimir_tunnel_is_page_type($type))) {
-        throw new MimirTunnelFallback(
-            'geen BC-pagina voor ' . $entity . ' (objecttype: ' . ($type === '' ? '?' : $type) . '; '
-            . mimir_tunnel_diag_text($map['diag'] ?? null) . ')'
-        );
+        if ($type !== '' && !mimir_tunnel_is_page_type($type)) {
+            $objectId = (int) ($entry['object_id'] ?? 0);
+            $reason = 'objecttype ' . $type . ($objectId > 0 ? ' ' . $objectId : '') . ' is geen pagina; direct OData';
+        } else {
+            $reason = 'geen rij in page 810 met servicenaam ' . $entity . '; direct OData';
+        }
+        $diagText = mimir_tunnel_diag_text($map['diag'] ?? null);
+        if (is_array($entry['diag'] ?? null)) {
+            $diagText .= '; gericht zoeken: ' . mimir_tunnel_diag_text($entry['diag']);
+        }
+        $error = new MimirTunnelNoPage('geen BC-pagina voor ' . $entity . ' (' . $reason . '; ' . $diagText . ')');
+        $error->alreadyLogged = !empty($entry['no_page_logged']);
+        if (!$error->alreadyLogged) {
+            $entry['no_page_logged'] = (int) $ctx['now'];
+            $pdo = $ctx['pdo'] ?? null;
+            if ($pdo instanceof PDO) {
+                mimir_tunnel_save_entry($pdo, (string) $ctx['environment'], $entity, $entry, (int) $ctx['now']);
+            }
+        }
+        throw $error;
     }
 
     return $entry;
+}
+
+/**
+ * @param array<string, mixed> $services
+ * @return array<string, mixed>|null
+ */
+function mimir_tunnel_find_service_ci(array $services, string $entity): ?array
+{
+    foreach ($services as $name => $entry) {
+        if (is_string($name) && is_array($entry) && strcasecmp($name, $entity) === 0) {
+            return $entry;
+        }
+    }
+
+    return null;
 }
 
 /**
@@ -710,11 +755,14 @@ function mimir_tunnel_refresh_one(array $ctx): ?array
         throw new MimirTunnelFallback('pagina 810 onleesbaar bij verversen (' . mimir_tunnel_diag_text(mimir_tunnel_page_diag($body)) . ')');
     }
     $old = is_array($services[$entity] ?? null) ? $services[$entity] : [];
-    $fresh = $parsed['services'][$entity] ?? [
-        'page_id' => null,
-        'object_type' => '',
-        'captions' => [],
-    ];
+    $fresh = $parsed['services'][$entity]
+        ?? mimir_tunnel_find_service_ci($parsed['services'], $entity)
+        ?? [
+            'page_id' => null,
+            'object_type' => '',
+            'captions' => [],
+        ];
+    $fresh['diag'] = mimir_tunnel_page_diag($body);
     if (!is_array($fresh['captions'] ?? null) || $fresh['captions'] === []) {
         $fresh['captions'] = is_array($old['captions'] ?? null) ? $old['captions'] : [];
     }
@@ -832,6 +880,7 @@ function mimir_tunnel_parse_services(array $body): ?array
         $candidate = [
             'page_id' => ($isPage && $id > 0) ? $id : null,
             'object_type' => $type,
+            'object_id' => $id,
             'captions' => [],
             'published' => $published,
         ];
