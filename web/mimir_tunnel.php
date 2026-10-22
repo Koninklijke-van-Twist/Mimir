@@ -15,6 +15,8 @@ declare(strict_types=1);
  */
 
 const MIMIR_TUNNEL_PAGE_TTL = 86400;
+/** Lege of afgekapte page 810-koppeling: kort cachen. */
+const MIMIR_TUNNEL_PAGE_TTL_INCOMPLETE = 300;
 /** Pagina-grootte richting de bridge (40 × 50 rijen = één volle bridge-transactie). */
 const MIMIR_TUNNEL_PAGE_ROWS = 2000;
 const MIMIR_TUNNEL_COOLDOWN = 120;
@@ -439,12 +441,30 @@ function mimir_tunnel_resolve_page(array $ctx): array
     $entity = (string) $ctx['entity'];
     $entry = $map['services'][$entity] ?? null;
     if (!is_array($entry)) {
-        throw new MimirTunnelFallback('geen BC-pagina voor ' . $entity);
+        // Niet in de (mogelijk afgekapte) koppeling: gericht zoeken op de servicenaam.
+        $lookupError = null;
+        try {
+            $refreshed = mimir_tunnel_refresh_one($ctx);
+        } catch (MimirTunnelFallback $error) {
+            $refreshed = null;
+            $lookupError = $error->getMessage();
+        }
+        if (is_array($refreshed) && (int) ($refreshed['page_id'] ?? 0) > 0) {
+            $entry = $refreshed;
+        } else {
+            throw new MimirTunnelFallback(
+                'geen BC-pagina voor ' . $entity . ' (' . mimir_tunnel_diag_text($map['diag'] ?? null)
+                . ($lookupError !== null ? '; gericht zoeken: ' . $lookupError : '') . ')'
+            );
+        }
     }
     $pageId = (int) ($entry['page_id'] ?? 0);
     $type = trim((string) ($entry['object_type'] ?? ''));
     if ($pageId < 1 || ($type !== '' && !mimir_tunnel_is_page_type($type))) {
-        throw new MimirTunnelFallback('geen BC-pagina voor ' . $entity);
+        throw new MimirTunnelFallback(
+            'geen BC-pagina voor ' . $entity . ' (objecttype: ' . ($type === '' ? '?' : $type) . '; '
+            . mimir_tunnel_diag_text($map['diag'] ?? null) . ')'
+        );
     }
 
     return $entry;
@@ -463,7 +483,11 @@ function mimir_tunnel_page_map(array $ctx): array
     $key = mimir_tunnel_cache_key((string) $ctx['environment']);
     $cached = mimir_meta_get($pdo, $key, MIMIR_TUNNEL_PAGE_TTL, (int) $ctx['now']);
     if (is_array($cached) && isset($cached['services']) && is_array($cached['services'])) {
-        return $cached;
+        $fresh = !mimir_tunnel_map_incomplete($cached)
+            || mimir_meta_get($pdo, $key, MIMIR_TUNNEL_PAGE_TTL_INCOMPLETE, (int) $ctx['now']) !== null;
+        if ($fresh) {
+            return $cached;
+        }
     }
     try {
         $body = mimir_tunnel_get_page(
@@ -478,9 +502,10 @@ function mimir_tunnel_page_map(array $ctx): array
     } catch (Throwable $error) {
         throw new MimirTunnelOutage($error->getMessage(), 0, $error);
     }
+    $diag = mimir_tunnel_page_diag($body);
     $parsed = mimir_tunnel_parse_services($body);
     if ($parsed === null) {
-        throw new MimirTunnelOutage('pagina 810 onleesbaar');
+        throw new MimirTunnelOutage('pagina 810 onleesbaar (' . mimir_tunnel_diag_text($diag) . ')');
     }
     if (!empty($body['truncated'])) {
         mimir_event_log('tunnel', 'Pagina 810 afgekapt; koppeling mogelijk incompleet.', (string) $ctx['environment'], 'Web Services', 'truncated');
@@ -497,10 +522,65 @@ function mimir_tunnel_page_map(array $ctx): array
         'services' => $parsed['services'],
         'service_caption' => $parsed['service_caption'],
         'stale_logged' => is_array($previous['stale_logged'] ?? null) ? $previous['stale_logged'] : [],
+        'diag' => $diag,
     ];
     mimir_meta_put($pdo, $key, $payload, (int) $ctx['now']);
 
     return $payload;
+}
+
+/**
+ * Wat page 810 teruggaf: aantal rijen, kolomcaptions, afgekapt, sleutels van het antwoord.
+ *
+ * @param array<string, mixed> $body
+ * @return array{rows: int, captions: list<string>, truncated: bool, keys: list<string>}
+ */
+function mimir_tunnel_page_diag(array $body): array
+{
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    $captions = [];
+    foreach ($rows as $row) {
+        if (is_array($row) && is_array($row['cells'] ?? null)) {
+            foreach (array_keys($row['cells']) as $caption) {
+                if (is_string($caption) && !in_array($caption, $captions, true) && count($captions) < 20) {
+                    $captions[] = $caption;
+                }
+            }
+        }
+    }
+    $keys = array_values(array_filter(array_keys($body), 'is_string'));
+
+    return [
+        'rows' => count($rows),
+        'captions' => $captions,
+        'truncated' => !empty($body['truncated']),
+        'keys' => array_slice($keys, 0, 12),
+    ];
+}
+
+function mimir_tunnel_diag_text(mixed $diag): string
+{
+    if (!is_array($diag)) {
+        return 'page 810: geen diagnose';
+    }
+    $captions = is_array($diag['captions'] ?? null) ? $diag['captions'] : [];
+    $keys = is_array($diag['keys'] ?? null) ? $diag['keys'] : [];
+    $text = 'page 810: ' . (int) ($diag['rows'] ?? 0) . ' rijen'
+        . ', kolommen: ' . ($captions === [] ? '-' : implode(', ', $captions))
+        . (!empty($diag['truncated']) ? ', afgekapt' : '')
+        . ', antwoordvelden: ' . ($keys === [] ? '-' : implode(', ', $keys));
+
+    return strlen($text) > 400 ? substr($text, 0, 400) : $text;
+}
+
+/** Leeg of afgekapt: korte TTL (MIMIR_TUNNEL_PAGE_TTL_INCOMPLETE). */
+function mimir_tunnel_map_incomplete(array $map): bool
+{
+    if (!is_array($map['services'] ?? null) || $map['services'] === []) {
+        return true;
+    }
+
+    return is_array($map['diag'] ?? null) && !empty($map['diag']['truncated']);
 }
 
 /**
@@ -522,7 +602,7 @@ function mimir_tunnel_refresh_one(array $ctx): ?array
     $entity = (string) $ctx['entity'];
     $preferred = trim((string) ($raw['service_caption'] ?? ''));
     $captions = [];
-    foreach ([$preferred, 'Service Name', 'Servicenaam'] as $caption) {
+    foreach ([$preferred, 'Service Name', 'Servicenaam', 'Service-naam', 'Naam service'] as $caption) {
         if ($caption !== '' && !in_array($caption, $captions, true)) {
             $captions[] = $caption;
         }
@@ -553,7 +633,7 @@ function mimir_tunnel_refresh_one(array $ctx): ?array
     }
     $parsed = mimir_tunnel_parse_services($body);
     if ($parsed === null) {
-        throw new MimirTunnelFallback('pagina 810 onleesbaar bij verversen');
+        throw new MimirTunnelFallback('pagina 810 onleesbaar bij verversen (' . mimir_tunnel_diag_text(mimir_tunnel_page_diag($body)) . ')');
     }
     $old = is_array($services[$entity] ?? null) ? $services[$entity] : [];
     $fresh = $parsed['services'][$entity] ?? [
@@ -700,14 +780,15 @@ function mimir_tunnel_parse_services(array $body): ?array
 function mimir_tunnel_match_column(array $captions, string $role): ?string
 {
     $aliases = [
-        'service' => ['service_name', 'servicename', 'servicenaam'],
-        'object_id' => ['object_id', 'objectid', 'object_nr', 'objectnr'],
-        'object_type' => ['object_type', 'objecttype', 'objectsoort'],
+        'service' => ['servicename', 'servicenaam', 'naamservice'],
+        'object_id' => ['objectid', 'objectnr', 'objectno', 'objectnummer'],
+        'object_type' => ['objecttype', 'objectsoort'],
         'published' => ['published', 'gepubliceerd'],
     ];
     $normalized = [];
     foreach ($captions as $caption) {
-        $normalized[$caption] = strtolower(mimir_tunnel_caption_to_odata($caption));
+        // Alleen letters/cijfers: "Object-id", "Object ID", "Object_ID" en "Objecttype" matchen allemaal.
+        $normalized[$caption] = strtolower((string) preg_replace('/[^A-Za-z0-9]/', '', $caption));
     }
     foreach ($aliases[$role] ?? [] as $alias) {
         foreach ($normalized as $caption => $name) {
