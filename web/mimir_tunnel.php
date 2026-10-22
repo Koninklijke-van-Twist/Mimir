@@ -282,6 +282,7 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
             $page = mimir_tunnel_remember_captions($page, $body, $ctx);
             $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types']);
             if ($inspected['kind'] !== 'card') {
+                mimir_tunnel_assert_usable($inspected, $body, $odata, $ctx);
                 $odata = mimir_tunnel_add_next_link($inspected, $odata, $body, $pageTop);
             }
 
@@ -307,6 +308,62 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
     }
 
     throw new MimirTunnelFallback('tunnel gaf geen leesbaar antwoord');
+}
+
+/**
+ * Veiligheidsnet: de tunnel mag geen 200 met lege of sleutelloze rijen geven
+ * waar OData wél data heeft. Gebeurt dat, dan terugval op OData met de captions
+ * in de melding (meestal: BC-captions in een andere taal dan de OData-veldnamen).
+ *
+ * @param array<string, mixed> $inspected
+ * @param array<string, mixed> $body
+ * @param array<string, mixed> $odata
+ * @param array<string, mixed> $ctx
+ */
+function mimir_tunnel_assert_usable(array $inspected, array $body, array $odata, array $ctx): void
+{
+    $rows = is_array($body['rows'] ?? null) ? count($body['rows']) : 0;
+    $records = is_array($odata['value'] ?? null) ? $odata['value'] : [];
+    $unfiltered = ($inspected['filter'] ?? null) === null && (int) ($inspected['skip'] ?? 0) === 0;
+    if ($rows === 0) {
+        if ($unfiltered) {
+            throw new MimirTunnelFallback('tunnel gaf 0 rijen voor een ongefilterde lijst (' . mimir_tunnel_rows_diag($body) . ')');
+        }
+
+        return;
+    }
+    $keys = is_array($ctx['keys'] ?? null) ? array_values(array_filter($ctx['keys'], 'is_string')) : [];
+    $usable = 0;
+    foreach ($records as $record) {
+        if (!is_array($record) || $record === []) {
+            continue;
+        }
+        $complete = true;
+        foreach ($keys as $key) {
+            if (!array_key_exists($key, $record)) {
+                $complete = false;
+                break;
+            }
+        }
+        if ($complete) {
+            $usable++;
+        }
+    }
+    if ($usable === 0) {
+        throw new MimirTunnelFallback(
+            'tunnel-kolommen niet te koppelen aan OData-velden' . ($keys !== [] ? ' (sleutel: ' . implode(', ', $keys) . ')' : '')
+            . ' (' . mimir_tunnel_rows_diag($body) . ')'
+        );
+    }
+}
+
+/** @param array<string, mixed> $body */
+function mimir_tunnel_rows_diag(array $body): string
+{
+    $diag = mimir_tunnel_page_diag($body);
+    $text = (int) $diag['rows'] . ' rijen, kolommen: ' . ($diag['captions'] === [] ? '-' : implode(', ', $diag['captions']));
+
+    return strlen($text) > 300 ? substr($text, 0, 300) : $text;
 }
 
 /**
