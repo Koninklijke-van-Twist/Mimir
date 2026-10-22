@@ -127,6 +127,11 @@ mimir_tfs_same(count($res['value']), 1, '0 tunnel rows on a filter is rechecked 
 mimir_tfs_same(count($odataCalls), 1, 'exactly one OData call');
 mimir_tfs_same(str_contains(mimir_event_log_path() !== '' && is_file(mimir_event_log_path()) ? (string) file_get_contents(mimir_event_log_path()) : '', 'controle via OData'), true, 'fallback is logged');
 
+// Daarna uit de cache: niet leeg (het lege tunnelantwoord is niet opgeslagen).
+$odataCalls = [];
+$cached = mimir_query_entity($pdo, mimir_tfs_job($pdo, ['max_age' => 600, 'filter' => ['field' => 'Vendor_No', 'op' => 'eq', 'value' => 'V1']]), $odataFetch, $clock + 5);
+mimir_tfs_same(count($cached['value']), 1, 'cached result after the recheck is not empty');
+
 // Lege-string-operator: geen tunnelaanroep met filter, direct OData.
 $odataCalls = [];
 $tunnelCalls = [];
