@@ -145,7 +145,7 @@ $odataCalls = [];
 $pdo = mimir_tfs_pdo($clock);
 $res = mimir_query_entity($pdo, mimir_tfs_job($pdo), $odataFetch, $clock);
 mimir_tfs_same($res['meta']['route'] ?? null, 'tunnel', 'unfiltered stays on the tunnel');
-mimir_tfs_same($odataCalls, [], 'unfiltered needs no OData');
+mimir_tfs_same(array_values(array_filter($odataCalls, static fn ($u): bool => !preg_match('/\?\$top=\d+$/', (string) $u))), [], 'unfiltered needs no OData (behalve eenmalige formaat-steekproef)');
 
 // Gefilterd met rijen blijft tunnel.
 $GLOBALS['mimir_tunnel_transport'] = static function (string $method, string $url, array $headers): array {
@@ -157,6 +157,6 @@ $odataCalls = [];
 $pdo = mimir_tfs_pdo($clock);
 $res = mimir_query_entity($pdo, mimir_tfs_job($pdo, ['filter' => ['field' => 'Vendor_No', 'op' => 'eq', 'value' => 'V1']]), $odataFetch, $clock);
 mimir_tfs_same($res['meta']['route'] ?? null, 'tunnel', 'working filter stays on the tunnel');
-mimir_tfs_same($odataCalls, [], 'working filter needs no OData');
+mimir_tfs_same(array_values(array_filter($odataCalls, static fn ($u): bool => !preg_match('/\?\$top=\d+$/', (string) $u))), [], 'working filter needs no OData (behalve eenmalige formaat-steekproef)');
 
 echo "mimir_tunnel_filter_safety_test: ok\n";

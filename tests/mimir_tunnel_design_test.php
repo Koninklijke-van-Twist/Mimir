@@ -128,7 +128,7 @@ mimir_tc_same($result['meta']['route'] ?? null, 'tunnel', 'DesignName-antwoord g
 mimir_tc_same($result['meta']['tunnel_key_by'] ?? null, 'designName', 'meta.tunnel_key_by = designName');
 mimir_tc_same($result['value'][0]['Balance_LCY'] ?? null, 1234.5, 'Balance (LCY) -> Balance_LCY via $metadata');
 mimir_tc_same($result['value'][1]['No'] ?? null, 'K002', 'No -> No');
-mimir_tc_same($odataCalls, [], 'geen OData-steekproef nodig met DesignNames');
+mimir_tc_same(array_values(array_filter($odataCalls, static fn ($u): bool => !preg_match('/\?\$top=\d+$/', (string) $u))), [], 'geen OData-steekproef nodig met DesignNames (behalve eenmalige formaat-steekproef)');
 $asked = false;
 foreach ($tunnelCalls as $call) {
     if (str_contains($call, '/page/22') && str_contains($call, 'keyBy=designName')) {
@@ -146,7 +146,7 @@ mimir_tc_same($entry['captions']['No'] ?? null, 'No', 'filter gebruikt de Design
 $tunnelCalls = [];
 $result = mimir_query_entity($pdo, mimir_tc_job($pdo, ['top' => 10, 'filter' => ['field' => 'No', 'op' => 'eq', 'value' => 'K002']]), $odata, $clock + 60);
 mimir_tc_same($result['value'][0]['Name'] ?? null, 'Kranen NV', 'gefilterde rij via DesignName-filter');
-mimir_tc_same($odataCalls, [], 'gefilterd lezen zonder OData');
+mimir_tc_same(array_values(array_filter($odataCalls, static fn ($u): bool => !preg_match('/\?\$top=\d+$/', (string) $u))), [], 'gefilterd lezen zonder OData (behalve eenmalige formaat-steekproef)');
 
 // DesignName die niet in $metadata staat (en geen naam lijkt): terugval op waardevergelijking.
 $designRows = [['No' => 'K001', 'Name' => 'Pompen BV', 'BalanceLCYCtrl' => '1.234,50'], ['No' => 'K002', 'Name' => 'Kranen NV', 'BalanceLCYCtrl' => '0,00']];

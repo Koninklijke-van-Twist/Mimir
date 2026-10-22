@@ -15,6 +15,7 @@ declare(strict_types=1);
  */
 
 require_once __DIR__ . '/mimir_tunnel_columns.php';
+require_once __DIR__ . '/mimir_tunnel_values.php';
 
 const MIMIR_TUNNEL_PAGE_TTL = 86400;
 /** Lege of afgekapte page 810-koppeling: kort cachen. */
@@ -27,6 +28,13 @@ const MIMIR_TUNNEL_WEB_SERVICES_PAGE = 810;
 const MIMIR_TUNNEL_STALE_LOG_SECONDS = 3600;
 
 class MimirTunnelFallback extends RuntimeException
+{
+    /** De aanroeper hoeft deze terugval niet (nogmaals) te loggen. */
+    public bool $alreadyLogged = false;
+}
+
+/** Gevraagde velden komen niet betrouwbaar uit de tunnel: deze query via OData. */
+class MimirTunnelFieldFallback extends MimirTunnelFallback
 {
 }
 
@@ -50,7 +58,6 @@ class MimirTunnelMidPage extends RuntimeException
  */
 class MimirTunnelNoPage extends MimirTunnelFallback
 {
-    public bool $alreadyLogged = false;
 }
 
 class MimirTunnelOutage extends RuntimeException
@@ -192,8 +199,18 @@ function mimir_tunnel_inspect_url(string $url, string $entity): array
         $skip = (int) $query['$skip'];
     }
     $filter = isset($query['$filter']) && $query['$filter'] !== '' ? $query['$filter'] : null;
+    $select = [];
+    if (isset($query['$select']) && trim($query['$select']) !== '') {
+        foreach (explode(',', $query['$select']) as $column) {
+            $column = trim($column);
+            if ($column !== '') {
+                $select[] = $column;
+            }
+        }
+    }
     return [
         'kind' => $top >= 1 ? 'list' : 'bulk',
+        'select' => $select,
         'top' => $top,
         'skip' => $skip,
         'url' => $url,
@@ -299,7 +316,8 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
             $learnCtx = $ctx;
             $learnCtx['_unfiltered_first_page'] = $inspected['kind'] !== 'card' && $filters === [] && $skip === 0;
             $page = mimir_tunnel_ensure_columns($page, $body, $learnCtx);
-            $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_effective_columns($page, $body, $ctx['types']));
+            mimir_tunnel_assert_reliable_fields($inspected, $page, $ctx);
+            $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_effective_columns($page, $body, $ctx['types']), mimir_tunnel_entry_profile($page));
             if ($inspected['kind'] !== 'card') {
                 mimir_tunnel_assert_filtered_rows($inspected, $body, $ctx);
                 try {
@@ -311,7 +329,7 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
                         throw $unusable;
                     }
                     $page = $relearned;
-                    $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_effective_columns($page, $body, $ctx['types']));
+                    $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_effective_columns($page, $body, $ctx['types']), mimir_tunnel_entry_profile($page));
                     mimir_tunnel_assert_usable($inspected, $body, $odata, $ctx);
                 }
                 $odata = mimir_tunnel_add_next_link($inspected, $odata, $body, $pageTop);
@@ -339,6 +357,88 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
     }
 
     throw new MimirTunnelFallback('tunnel gaf geen leesbaar antwoord');
+}
+
+/**
+ * Vraagt deze query velden die de tunnel niet betrouwbaar geeft (verborgen kolom,
+ * DateTime in lokale tijd zonder seconden, ontbrekende kolom)? Dan deze query
+ * naar OData. Gelogd hoogstens eens per entity per MIMIR_TUNNEL_COLUMNS_TTL.
+ *
+ * @param array<string, mixed> $inspected
+ * @param array<string, mixed> $entry
+ * @param array<string, mixed> $ctx
+ */
+function mimir_tunnel_assert_reliable_fields(array $inspected, array $entry, array $ctx): void
+{
+    if (($ctx['route'] ?? null) === 'tunnel') {
+        // Geforceerde tunnel: uitvoer zoals de tunnel hem kan geven, geen terugval.
+        return;
+    }
+    $types = is_array($ctx['types'] ?? null) ? $ctx['types'] : [];
+    $select = is_array($inspected['select'] ?? null) ? $inspected['select'] : [];
+    $bad = mimir_tunnel_unreliable_requested(mimir_tunnel_entry_profile($entry), $select, $types);
+    if ($bad === []) {
+        return;
+    }
+    $parts = [];
+    foreach (array_slice($bad, 0, 8, true) as $field => $reason) {
+        $parts[] = $field . ': ' . $reason;
+    }
+    $error = new MimirTunnelFieldFallback('velden niet betrouwbaar via de tunnel, OData voor deze query ('
+        . implode('; ', $parts) . (count($bad) > 8 ? '; +' . (count($bad) - 8) : '') . ')');
+    $error->alreadyLogged = !mimir_tunnel_log_once('fields:' . (string) ($ctx['environment'] ?? '') . ':' . strtolower((string) ($ctx['entity'] ?? '')) . ':' . implode(',', array_keys($bad)));
+    throw $error;
+}
+
+/**
+ * true = deze melding is de eerste in MIMIR_TUNNEL_COLUMNS_TTL (dus loggen).
+ * Bijgehouden in runtime/mimir-tunnel-logged.json; zonder bestand altijd loggen.
+ */
+function mimir_tunnel_log_once(string $sig): bool
+{
+    $now = mimir_tunnel_now();
+    $dir = mimir_runtime_dir();
+    if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+        return true;
+    }
+    $path = $dir . '/mimir-tunnel-logged.json';
+    $handle = @fopen($path, 'c+');
+    if ($handle === false) {
+        return true;
+    }
+    try {
+        if (!flock($handle, LOCK_EX)) {
+            return true;
+        }
+        $raw = stream_get_contents($handle);
+        $seen = is_string($raw) && trim($raw) !== '' ? json_decode($raw, true) : [];
+        $seen = is_array($seen) ? $seen : [];
+        foreach ($seen as $key => $at) {
+            if ($now - (int) $at > MIMIR_TUNNEL_COLUMNS_TTL) {
+                unset($seen[$key]);
+            }
+        }
+        $hash = sha1($sig);
+        $first = !isset($seen[$hash]);
+        if ($first) {
+            $seen[$hash] = $now;
+            $encoded = json_encode($seen);
+            if ($encoded !== false) {
+                rewind($handle);
+                ftruncate($handle, 0);
+                fwrite($handle, $encoded);
+                fflush($handle);
+            }
+        }
+
+        return $first;
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        if (is_file($path)) {
+            @chmod($path, 0666);
+        }
+    }
 }
 
 /**
@@ -1608,9 +1708,9 @@ function mimir_tunnel_key_header(?string $keyId): string
  * @param array<string, string> $types
  * @return array<string, mixed>
  */
-function mimir_tunnel_odata_shape(array $inspected, array $body, array $types, array $columns = []): array
+function mimir_tunnel_odata_shape(array $inspected, array $body, array $types, array $columns = [], ?array $profile = null): array
 {
-    $records = mimir_tunnel_records($body, $types, $columns);
+    $records = mimir_tunnel_records($body, $types, $columns, $profile);
     if ($inspected['kind'] === 'card') {
         if ($records === []) {
             throw new MimirTunnelFallback('lege kaart');
@@ -1631,22 +1731,22 @@ function mimir_tunnel_odata_shape(array $inspected, array $body, array $types, a
  * @param array<string, string> $types
  * @return list<array<string, mixed>>
  */
-function mimir_tunnel_records(array $body, array $types, array $columns = []): array
+function mimir_tunnel_records(array $body, array $types, array $columns = [], ?array $profile = null): array
 {
-    $records = [];
+    $raw = [];
     $rows = $body['rows'] ?? null;
     if (is_array($rows)) {
         foreach ($rows as $row) {
             if (!is_array($row) || !is_array($row['cells'] ?? null) || $row['cells'] === []) {
                 continue;
             }
-            $record = mimir_tunnel_cells_to_record($row['cells'], $types, $columns);
+            $record = mimir_tunnel_cells_to_raw($row['cells'], $types, $columns);
             if ($record !== []) {
-                $records[] = $record;
+                $raw[] = $record;
             }
         }
     }
-    if ($records === [] && is_array($body['fields'] ?? null)) {
+    if ($raw === [] && is_array($body['fields'] ?? null)) {
         $cells = [];
         foreach ($body['fields'] as $field) {
             if (!is_array($field) || !isset($field['name']) || !is_string($field['name'])) {
@@ -1655,11 +1755,37 @@ function mimir_tunnel_records(array $body, array $types, array $columns = []): a
             $cells[$field['name']] = $field['value'] ?? null;
         }
         if ($cells !== []) {
-            $records[] = mimir_tunnel_cells_to_record($cells, $types, $columns);
+            $raw[] = mimir_tunnel_cells_to_raw($cells, $types, $columns);
         }
+    }
+    // Datumvolgorde: geleerd (profiel), anders uit dit antwoord; anders alleen eenduidige datums.
+    $order = is_array($profile) && is_string($profile['date_order'] ?? null) ? $profile['date_order'] : null;
+    $order ??= mimir_tunnel_infer_date_order($raw, $types, $profile);
+    $records = [];
+    foreach ($raw as $record) {
+        $records[] = mimir_tunnel_convert_record($record, $types, $profile, $order);
     }
 
     return $records;
+}
+
+/**
+ * @param array<string, mixed> $raw veld => ruwe tunnelwaarde
+ * @param array<string, string> $types
+ * @return array<string, mixed>
+ */
+function mimir_tunnel_convert_record(array $raw, array $types, ?array $profile, ?string $order): array
+{
+    $out = [];
+    foreach ($raw as $field => $value) {
+        try {
+            $out[$field] = mimir_tunnel_output_value((string) $field, $value, (string) ($types[$field] ?? 'Edm.String'), $profile, $order);
+        } catch (MimirTunnelValueError $error) {
+            throw new MimirTunnelFieldFallback('tunnelwaarde niet eenduidig naar OData-formaat: ' . $error->getMessage(), 0, $error);
+        }
+    }
+
+    return $out;
 }
 
 /**
@@ -1667,13 +1793,27 @@ function mimir_tunnel_records(array $body, array $types, array $columns = []): a
  * @param array<string, string> $types
  * @return array<string, mixed>
  */
-function mimir_tunnel_cells_to_record(array $cells, array $types, array $columns = []): array
+function mimir_tunnel_cells_to_record(array $cells, array $types, array $columns = [], ?array $profile = null): array
+{
+    $raw = mimir_tunnel_cells_to_raw($cells, $types, $columns);
+
+    return mimir_tunnel_convert_record($raw, $types, $profile, $profile['date_order'] ?? mimir_tunnel_infer_date_order([$raw], $types, $profile));
+}
+
+/**
+ * Cellen -> veld => ruwe tunnelwaarde (nog niet omgezet).
+ *
+ * @param array<string, mixed> $cells
+ * @param array<string, string> $types
+ * @return array<string, mixed>
+ */
+function mimir_tunnel_cells_to_raw(array $cells, array $types, array $columns = []): array
 {
     $record = [];
     // Eerst de uit BC geleerde koppeling (caption -> OData-veld), taalonafhankelijk.
     foreach ($columns as $caption => $field) {
         if (is_string($caption) && is_string($field) && array_key_exists($caption, $cells) && isset($types[$field])) {
-            $record[$field] = mimir_tunnel_coerce($cells[$caption], (string) $types[$field]);
+            $record[$field] = $cells[$caption];
         }
     }
     $byNorm = [];
@@ -1694,7 +1834,7 @@ function mimir_tunnel_cells_to_record(array $cells, array $types, array $columns
         if (!array_key_exists($norm, $byNorm)) {
             continue;
         }
-        $record[$name] = mimir_tunnel_coerce($byNorm[$norm], (string) $type);
+        $record[$name] = $byNorm[$norm];
     }
 
     return $record;
