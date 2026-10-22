@@ -1306,7 +1306,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $innerFetch = $fetch;
     $metaPdo = ($job['meta_pdo'] ?? null) instanceof PDO ? $job['meta_pdo'] : null;
     $tunnelRoute = isset($job['route']) && is_string($job['route']) && $job['route'] !== '' ? $job['route'] : null;
-    unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page']);
+    unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page'], $GLOBALS['mimir_tunnel_columns_learned']);
     $stayOnOdata = false;
     $fetch = static function (string $url) use (
         $innerFetch,
@@ -1340,6 +1340,21 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                     'now' => $now,
                     'key_id' => $keyId !== null && $keyId > 0 ? (string) $keyId : null,
                     'route' => $tunnelRoute,
+                    // Kleine OData-steekproef ($top=N, zelfde pagina) om tunnel-captions
+                    // taalonafhankelijk aan OData-velden te koppelen.
+                    'odata_sample' => static function (int $top) use ($innerFetch, $url, $entity, $environment, &$slotHeld, &$queueWaitMs): array {
+                        $sampleUrl = mimir_tunnel_sample_url($url, $entity, $top);
+                        if ($sampleUrl === null) {
+                            return [];
+                        }
+                        if (!$slotHeld) {
+                            $queueWaitMs = mimir_bc_slot_acquire($environment);
+                            $slotHeld = true;
+                        }
+                        $payload = $innerFetch($sampleUrl);
+
+                        return is_array($payload['value'] ?? null) ? array_values($payload['value']) : [];
+                    },
                 ]);
                 if (is_array($viaTunnel)) {
                     return $viaTunnel;

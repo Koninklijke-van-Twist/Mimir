@@ -770,7 +770,8 @@ $GLOBALS['mimir_tunnel_transport'] = static function (string $method, string $ur
         return ['status' => 200, 'body' => json_encode(mimir_tn_services_body())];
     }
 
-    return ['status' => 200, 'body' => json_encode(['rows' => [['bookmark' => 'x', 'cells' => ['Nr.' => 'A', 'Omschrijving' => 'Pomp']]]])];
+    // Waarden die ook niet op de OData-steekproef passen: niets te koppelen.
+    return ['status' => 200, 'body' => json_encode(['rows' => [['bookmark' => 'x', 'cells' => ['Nr.' => 'Q', 'Omschrijving' => 'Pomp']]]])];
 };
 $capOdata = [];
 $capResult = mimir_query_entity($capPdo, mimir_tn_job($capPdo, ['top' => 0, 'max_age' => 0]), static function (string $url) use (&$capOdata): array {

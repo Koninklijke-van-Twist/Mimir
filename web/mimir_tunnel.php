@@ -14,6 +14,8 @@ declare(strict_types=1);
  * mag niet daarna nog eens via OData, want de wijziging kan al in BC staan.
  */
 
+require_once __DIR__ . '/mimir_tunnel_columns.php';
+
 const MIMIR_TUNNEL_PAGE_TTL = 86400;
 /** Lege of afgekapte page 810-koppeling: kort cachen. */
 const MIMIR_TUNNEL_PAGE_TTL_INCOMPLETE = 300;
@@ -280,9 +282,23 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
             $pageTop = mimir_tunnel_page_top($inspected);
             $body = mimir_tunnel_get_page((int) $page['page_id'], (string) $ctx['company'], $filters, $pageTop, $ctx['key_id'] ?? null, $skip);
             $page = mimir_tunnel_remember_captions($page, $body, $ctx);
-            $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types']);
+            $learnCtx = $ctx;
+            $learnCtx['_unfiltered_first_page'] = $inspected['kind'] !== 'card' && $filters === [] && $skip === 0;
+            $page = mimir_tunnel_ensure_columns($page, $body, $learnCtx);
+            $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_columns_map($page));
             if ($inspected['kind'] !== 'card') {
-                mimir_tunnel_assert_usable($inspected, $body, $odata, $ctx);
+                try {
+                    mimir_tunnel_assert_usable($inspected, $body, $odata, $ctx);
+                } catch (MimirTunnelFallback $unusable) {
+                    // Koppeling klopt niet (meer): één keer opnieuw leren en hetzelfde antwoord herlezen.
+                    $relearned = mimir_tunnel_relearn_columns($page, $body, $learnCtx);
+                    if ($relearned === null) {
+                        throw $unusable;
+                    }
+                    $page = $relearned;
+                    $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_columns_map($page));
+                    mimir_tunnel_assert_usable($inspected, $body, $odata, $ctx);
+                }
                 $odata = mimir_tunnel_add_next_link($inspected, $odata, $body, $pageTop);
             }
 
@@ -719,8 +735,11 @@ function mimir_tunnel_refresh_one(array $ctx): ?array
 function mimir_tunnel_probe_captions(array $entry, array $ctx): array
 {
     $body = mimir_tunnel_get_page((int) $entry['page_id'], (string) $ctx['company'], [], 1, $ctx['key_id'] ?? null);
+    $entry = mimir_tunnel_remember_captions($entry, $body, $ctx);
+    // Filterkolom onbekend: meestal captions in een andere taal. Koppeling opnieuw leren.
+    $relearned = mimir_tunnel_relearn_columns($entry, $body, $ctx);
 
-    return mimir_tunnel_remember_captions($entry, $body, $ctx);
+    return $relearned ?? $entry;
 }
 
 /**
@@ -1433,9 +1452,9 @@ function mimir_tunnel_key_header(?string $keyId): string
  * @param array<string, string> $types
  * @return array<string, mixed>
  */
-function mimir_tunnel_odata_shape(array $inspected, array $body, array $types): array
+function mimir_tunnel_odata_shape(array $inspected, array $body, array $types, array $columns = []): array
 {
-    $records = mimir_tunnel_records($body, $types);
+    $records = mimir_tunnel_records($body, $types, $columns);
     if ($inspected['kind'] === 'card') {
         if ($records === []) {
             throw new MimirTunnelFallback('lege kaart');
@@ -1456,7 +1475,7 @@ function mimir_tunnel_odata_shape(array $inspected, array $body, array $types): 
  * @param array<string, string> $types
  * @return list<array<string, mixed>>
  */
-function mimir_tunnel_records(array $body, array $types): array
+function mimir_tunnel_records(array $body, array $types, array $columns = []): array
 {
     $records = [];
     $rows = $body['rows'] ?? null;
@@ -1465,7 +1484,7 @@ function mimir_tunnel_records(array $body, array $types): array
             if (!is_array($row) || !is_array($row['cells'] ?? null) || $row['cells'] === []) {
                 continue;
             }
-            $record = mimir_tunnel_cells_to_record($row['cells'], $types);
+            $record = mimir_tunnel_cells_to_record($row['cells'], $types, $columns);
             if ($record !== []) {
                 $records[] = $record;
             }
@@ -1480,7 +1499,7 @@ function mimir_tunnel_records(array $body, array $types): array
             $cells[$field['name']] = $field['value'] ?? null;
         }
         if ($cells !== []) {
-            $records[] = mimir_tunnel_cells_to_record($cells, $types);
+            $records[] = mimir_tunnel_cells_to_record($cells, $types, $columns);
         }
     }
 
@@ -1492,18 +1511,24 @@ function mimir_tunnel_records(array $body, array $types): array
  * @param array<string, string> $types
  * @return array<string, mixed>
  */
-function mimir_tunnel_cells_to_record(array $cells, array $types): array
+function mimir_tunnel_cells_to_record(array $cells, array $types, array $columns = []): array
 {
+    $record = [];
+    // Eerst de uit BC geleerde koppeling (caption -> OData-veld), taalonafhankelijk.
+    foreach ($columns as $caption => $field) {
+        if (is_string($caption) && is_string($field) && array_key_exists($caption, $cells) && isset($types[$field])) {
+            $record[$field] = mimir_tunnel_coerce($cells[$caption], (string) $types[$field]);
+        }
+    }
     $byNorm = [];
     foreach ($cells as $caption => $value) {
-        if (!is_string($caption) || $caption === '') {
+        if (!is_string($caption) || $caption === '' || isset($columns[$caption])) {
             continue;
         }
         $byNorm[strtolower(mimir_tunnel_caption_to_odata($caption))] = $value;
     }
-    $record = [];
     foreach ($types as $name => $type) {
-        if (!is_string($name)) {
+        if (!is_string($name) || array_key_exists($name, $record)) {
             continue;
         }
         $norm = strtolower(mimir_tunnel_caption_to_odata($name));
@@ -1606,6 +1631,17 @@ function mimir_tunnel_coerce(mixed $value, string $type): mixed
         return $value;
     }
     $text = trim($value);
+    // Duizendtallen in de webclientnotatie, alleen als die eenduidig is ("1.234,50", "1,234.50", "1.234.567").
+    if (preg_match('/^-?\d{1,3}(\.\d{3})+,\d+$/', $text) === 1 || preg_match('/^-?\d{1,3}(\.\d{3}){2,}$/', $text) === 1) {
+        $plain = str_replace(['.', ','], ['', '.'], $text);
+
+        return $integer && !str_contains($plain, '.') ? (int) $plain : (float) $plain;
+    }
+    if (preg_match('/^-?\d{1,3}(,\d{3})+\.\d+$/', $text) === 1 || preg_match('/^-?\d{1,3}(,\d{3}){2,}$/', $text) === 1) {
+        $plain = str_replace(',', '', $text);
+
+        return $integer && !str_contains($plain, '.') ? (int) $plain : (float) $plain;
+    }
     if (preg_match('/^-?\d+$/', $text) === 1) {
         return $integer ? (int) $text : (float) $text;
     }
