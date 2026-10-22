@@ -1371,13 +1371,16 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                 );
             } catch (MimirTunnelFallback $error) {
                 $stayOnOdata = true;
-                mimir_event_log(
-                    'tunnel',
-                    'Tunnel mislukt, terugval op OData: ' . $error->getMessage(),
-                    $environment,
-                    $entity,
-                    'tunnel-fallback'
-                );
+                // Geen pagina voor deze service (MimirTunnelNoPage): maar één keer loggen.
+                if (!($error instanceof MimirTunnelNoPage && $error->alreadyLogged)) {
+                    mimir_event_log(
+                        'tunnel',
+                        'Tunnel mislukt, terugval op OData: ' . $error->getMessage(),
+                        $environment,
+                        $entity,
+                        'tunnel-fallback'
+                    );
+                }
             }
         }
         if (!$slotHeld) {

@@ -784,6 +784,41 @@ mimir_tn_same($capResult['value'][0]['Description'] ?? null, 'uit odata', 'OData
 mimir_tn_same(str_contains(mimir_tn_log(), 'Nr.'), true, 'fallback log names the captions');
 mimir_tn_clear_circuit();
 
+// Query/Codeunit in page 810 of geen rij: direct OData, geen tunnel-leespoging, één keer loggen.
+mimir_tn_reset_config();
+mimir_tn_clear_circuit();
+mimir_tn_enable();
+$qPdo = mimir_db(':memory:');
+$qCalls = [];
+$GLOBALS['mimir_tunnel_transport'] = static function (string $method, string $url, array $headers) use (&$qCalls): array {
+    unset($method, $headers);
+    $qCalls[] = $url;
+    if (str_contains($url, '/page/810')) {
+        return ['status' => 200, 'body' => json_encode(['rows' => [
+            ['cells' => ['Object Type' => 'Query', 'Object ID' => '50123', 'Service Name' => 'WerkordersLines', 'Published' => 'Yes']],
+            ['cells' => ['Object Type' => 'Page', 'Object ID' => '31', 'Service Name' => 'itemlist', 'Published' => 'Yes']],
+        ]])];
+    }
+
+    return ['status' => 200, 'body' => json_encode(['rows' => [['bookmark' => 'x', 'cells' => ['No.' => 'A', 'Description' => 'tunnel']]]])];
+};
+$qLogBefore = substr_count(mimir_tn_log(), 'terugval op OData: geen BC-pagina voor WerkordersLines');
+for ($i = 0; $i < 3; $i++) {
+    $qResult = mimir_query_entity($qPdo, mimir_tn_job($qPdo, ['entity' => 'WerkordersLines', 'top' => 5, 'max_age' => 0]), static function (string $url): array {
+        unset($url);
+
+        return ['value' => [['No' => 'Q', 'Description' => 'odata']]];
+    }, $clock);
+    mimir_tn_same($qResult['value'][0]['Description'] ?? null, 'odata', 'query service is read via OData');
+}
+$qPageCalls = array_values(array_filter($qCalls, static fn (string $u): bool => !str_contains($u, '/page/810')));
+mimir_tn_same($qPageCalls, [], 'no tunnel page read for a query service');
+$qLog = mimir_tn_log();
+mimir_tn_same(substr_count($qLog, 'terugval op OData: geen BC-pagina voor WerkordersLines') - $qLogBefore, 1, 'no-page fallback is logged once');
+mimir_tn_same(str_contains($qLog, 'objecttype Query 50123 is geen pagina'), true, 'log names the object type and id');
+mimir_tn_same(mimir_tunnel_find_service_ci(['itemlist' => ['page_id' => 31]], 'ItemList'), ['page_id' => 31], 'service name match ignores case');
+mimir_tn_clear_circuit();
+
 // Zonder config is het antwoord zoals voorheen: geen route-veld.
 mimir_tn_reset_config();
 mimir_tn_clear_circuit();
