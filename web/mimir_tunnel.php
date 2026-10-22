@@ -280,12 +280,16 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
         try {
             $filters = mimir_tunnel_filters_for($inspected, $page);
             if ($filters === null) {
+                if (mimir_tunnel_filters_for($inspected, []) === null) {
+                    // Operator/waarde zelf niet te vertalen (ne '', null, jokers): geen probe, direct OData.
+                    throw new MimirTunnelFallback('filter niet naar de tunnel te vertalen (operator/waarde)');
+                }
                 if (!$triedColumn && mimir_tunnel_inspect_has_filter($inspected)) {
                     $triedColumn = true;
                     $page = mimir_tunnel_recover_page($page, $ctx, $triedWrong);
                     continue;
                 }
-                throw new MimirTunnelFallback('filter niet naar de tunnel te vertalen');
+                throw new MimirTunnelFallback('filter niet naar de tunnel te vertalen (kolom onbekend na caption/DesignName-koppeling)');
             }
             $skip = $inspected['kind'] === 'card' ? 0 : max(0, (int) ($inspected['skip'] ?? 0));
             $pageTop = mimir_tunnel_page_top($inspected);
@@ -297,6 +301,7 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
             $page = mimir_tunnel_ensure_columns($page, $body, $learnCtx);
             $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_effective_columns($page, $body, $ctx['types']));
             if ($inspected['kind'] !== 'card') {
+                mimir_tunnel_assert_filtered_rows($inspected, $body, $ctx);
                 try {
                     mimir_tunnel_assert_usable($inspected, $body, $odata, $ctx);
                 } catch (MimirTunnelFallback $unusable) {
@@ -355,7 +360,6 @@ function mimir_tunnel_assert_usable(array $inspected, array $body, array $odata,
         if ($unfiltered) {
             throw new MimirTunnelFallback('tunnel gaf 0 rijen voor een ongefilterde lijst (' . mimir_tunnel_rows_diag($body) . ')');
         }
-
         return;
     }
     $keys = is_array($ctx['keys'] ?? null) ? array_values(array_filter($ctx['keys'], 'is_string')) : [];
@@ -381,6 +385,29 @@ function mimir_tunnel_assert_usable(array $inspected, array $body, array $odata,
             . ' (' . mimir_tunnel_rows_diag($body) . ')'
         );
     }
+}
+
+/**
+ * Veiligheidsnet: 0 rijen op een gefilterde eerste pagina kan een verkeerd vertaald
+ * filter zijn (BC geeft dan geen fout, alleen niets). Dan één keer via OData; de
+ * aanroeper logt de terugval (tunnel-fallback). Met route=tunnel blijft het bij de tunnel.
+ *
+ * @param array<string, mixed> $inspected
+ * @param array<string, mixed> $body
+ * @param array<string, mixed> $ctx
+ */
+function mimir_tunnel_assert_filtered_rows(array $inspected, array $body, array $ctx): void
+{
+    $rows = is_array($body['rows'] ?? null) ? count($body['rows']) : 0;
+    if ($rows > 0 || ($ctx['route'] ?? null) === 'tunnel' || (int) ($inspected['skip'] ?? 0) !== 0) {
+        return;
+    }
+    $filter = trim((string) ($inspected['filter'] ?? ''));
+    if ($filter === '') {
+        return;
+    }
+    throw new MimirTunnelFallback('tunnel gaf 0 rijen voor gefilterd ' . (string) ($ctx['entity'] ?? '')
+        . ' (' . (strlen($filter) > 200 ? substr($filter, 0, 200) : $filter) . '), controle via OData');
 }
 
 /** @param array<string, mixed> $body */
@@ -990,16 +1017,72 @@ function mimir_tunnel_guess_caption(string $field): string
 }
 
 /**
+ * Tunnelkolom voor een OData-veld, of null als die niet betrouwbaar te bepalen is.
+ *
+ * Is er een geleerde kolomkoppeling (columns.seen), dan telt alleen een kolom die
+ * de bridge nu echt teruggeeft: eerst de geleerde koppeling zelf, dan een eerder
+ * onthouden caption of de gok uit de veldnaam, mits die in `seen` staat. Een oude
+ * caption uit een andere taal (bijv. Nederlands van vóór een taalwissel) of een
+ * gok die niet bestaat gaat zo niet meer naar BC (daar gaf dat stil 0 rijen);
+ * de aanroeper valt dan terug op OData. Zonder geleerde koppeling: oude gedrag.
+ *
  * @param array<string, mixed> $entry
  */
-function mimir_tunnel_caption_for(string $field, array $entry): string
+function mimir_tunnel_caption_for(string $field, array $entry): ?string
 {
     $known = $entry['captions'] ?? null;
-    if (is_array($known) && isset($known[$field]) && is_string($known[$field]) && $known[$field] !== '') {
-        return $known[$field];
+    $knownCaption = is_array($known) && isset($known[$field]) && is_string($known[$field]) && $known[$field] !== '' ? $known[$field] : null;
+    $seen = $entry['columns']['seen'] ?? null;
+    if (!is_array($seen) || $seen === []) {
+        return $knownCaption ?? mimir_tunnel_guess_caption($field);
+    }
+    $seenSet = [];
+    foreach ($seen as $caption) {
+        if (is_string($caption) && $caption !== '') {
+            $seenSet[$caption] = true;
+        }
+    }
+    $fromMap = [];
+    foreach (mimir_tunnel_columns_map($entry) as $caption => $mapped) {
+        if ($mapped === $field) {
+            $fromMap[] = (string) $caption;
+        }
+    }
+    if (count($fromMap) === 1) {
+        $caption = $fromMap[0];
+        // "Naam#2" = dubbele caption: filter zou op de verkeerde kolom kunnen landen.
+        if (preg_match('/#\d+$/', $caption) === 1) {
+            return null;
+        }
+
+        return isset($seenSet[$caption]) ? $caption : null;
+    }
+    if (count($fromMap) > 1) {
+        return null;
+    }
+    if (mimir_tunnel_caption_mapped_elsewhere($knownCaption, $field, $entry)) {
+        $knownCaption = null;
+    }
+    if ($knownCaption !== null && isset($seenSet[$knownCaption])) {
+        return $knownCaption;
+    }
+    $guess = mimir_tunnel_guess_caption($field);
+    if (isset($seenSet[$guess]) && !mimir_tunnel_caption_mapped_elsewhere($guess, $field, $entry)) {
+        return $guess;
     }
 
-    return mimir_tunnel_guess_caption($field);
+    return null;
+}
+
+/** @param array<string, mixed> $entry */
+function mimir_tunnel_caption_mapped_elsewhere(?string $caption, string $field, array $entry): bool
+{
+    if ($caption === null) {
+        return false;
+    }
+    $map = mimir_tunnel_columns_map($entry);
+
+    return isset($map[$caption]) && $map[$caption] !== $field;
 }
 
 /**
@@ -1062,7 +1145,11 @@ function mimir_tunnel_odata_to_filters(string $odata, array $entry): ?array
                 }
                 $values[] = $text;
             }
-            $out[] = mimir_tunnel_caption_for($field, $entry) . '=' . implode('|', $values);
+            $caption = mimir_tunnel_caption_for($field, $entry);
+            if ($caption === null) {
+                return null;
+            }
+            $out[] = $caption . '=' . implode('|', $values);
             continue;
         }
         $leaf = $leaves[0];
@@ -1073,7 +1160,11 @@ function mimir_tunnel_odata_to_filters(string $odata, array $entry): ?array
         if ($encoded === null) {
             return null;
         }
-        $out[] = mimir_tunnel_caption_for((string) $leaf['field'], $entry) . '=' . $encoded;
+        $caption = mimir_tunnel_caption_for((string) $leaf['field'], $entry);
+        if ($caption === null) {
+            return null;
+        }
+        $out[] = $caption . '=' . $encoded;
     }
 
     return $out;
@@ -1107,7 +1198,11 @@ function mimir_tunnel_predicate_to_filters(string $predicate, array $entry): ?ar
         if ($value === null || $value === '' || str_contains($value, '|')) {
             return null;
         }
-        $out[] = mimir_tunnel_caption_for($field, $entry) . '=' . $value;
+        $caption = mimir_tunnel_caption_for($field, $entry);
+        if ($caption === null) {
+            return null;
+        }
+        $out[] = $caption . '=' . $value;
     }
 
     return $out === [] ? null : $out;
@@ -1166,7 +1261,13 @@ function mimir_tunnel_filter_value(string $op, string $value): ?string
     if (str_contains($value, '|')) {
         return null;
     }
-    if ($op === 'eq' && ($value === '' || preg_match('/^(<>|>=|<=|>|<)/', $value) === 1)) {
+    // Lege string: BC kent `<>` / `>` zonder waarde niet als "niet leeg" en gaf
+    // stil 0 rijen (Contract_No ne ''). Zulke filters gaan naar OData.
+    if ($value === '') {
+        return null;
+    }
+    // Waarde die zelf met een BC-operator of joker begint zou anders gelezen worden.
+    if (preg_match('/^(<>|>=|<=|>|<|=|@)/', $value) === 1 || preg_match('/[*?&()]|\.\./', $value) === 1) {
         return null;
     }
 
