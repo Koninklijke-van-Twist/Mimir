@@ -17,6 +17,43 @@ require_once __DIR__ . '/mimir_reliability.php';
  */
 
 const MIMIR_ODATA_PAGE_GUARD = 100;
+/** Harde deadline voor één API-verzoek (seconden), ruim onder set_time_limit(300). */
+const MIMIR_REQUEST_DEADLINE_SECONDS = 240;
+
+/** Start de verzoek-deadline (API en UI). */
+function mimir_deadline_start(int $seconds = MIMIR_REQUEST_DEADLINE_SECONDS): void
+{
+    $GLOBALS['mimir_deadline_at'] = microtime(true) + max(1, $seconds);
+}
+
+/** Resterende seconden tot de deadline; null als er geen deadline loopt. */
+function mimir_deadline_remaining(): ?float
+{
+    $at = $GLOBALS['mimir_deadline_at'] ?? null;
+    if (!is_float($at) && !is_int($at)) {
+        return null;
+    }
+
+    return (float) $at - microtime(true);
+}
+
+function mimir_deadline_passed(): bool
+{
+    $left = mimir_deadline_remaining();
+
+    return $left !== null && $left <= 0;
+}
+
+/** cURL-timeout begrensd door de deadline (minstens 1 s). */
+function mimir_deadline_curl_timeout(int $default): int
+{
+    $left = mimir_deadline_remaining();
+    if ($left === null) {
+        return $default;
+    }
+
+    return max(1, min($default, (int) ceil($left)));
+}
 const MIMIR_ODATA_PAGE_SIZE = 2000;
 
 function odata_maxpagesize_header(int $pageSize = MIMIR_ODATA_PAGE_SIZE): string
@@ -52,7 +89,7 @@ function odata_init_curl(array $auth, string $accept = 'application/json', array
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_CONNECTTIMEOUT => 30,
-        CURLOPT_TIMEOUT => 300,
+        CURLOPT_TIMEOUT => mimir_deadline_curl_timeout(300),
         CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
         CURLOPT_USERAGENT => 'Mimir-ODataClient/1.0 (nl-NL)',
         CURLOPT_ENCODING => '',

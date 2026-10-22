@@ -332,7 +332,7 @@ mimir_tn_same($odataCalls, [], 'unlimited read does not call OData');
 mimir_tn_same(count($tunnelCalls) > $tunnelBefore, true, 'unlimited read calls the tunnel');
 $bulkUrl = $tunnelCalls[count($tunnelCalls) - 1];
 mimir_tn_same(str_contains($bulkUrl, '/page/31'), true, 'unlimited read uses the mapped page');
-mimir_tn_same(str_contains($bulkUrl, 'top=' . MIMIR_TUNNEL_UNBOUNDED_TOP), true, 'unlimited read asks the bridge for its window');
+mimir_tn_same(str_contains($bulkUrl, 'top=' . MIMIR_TUNNEL_PAGE_ROWS), true, 'unlimited read asks the bridge for its window');
 mimir_tn_same($bulk['meta']['route'] ?? null, 'tunnel', 'bulk meta says tunnel');
 mimir_tn_same($bulk['value'][0]['Description'] ?? null, 'Pomp', 'bulk row came from the tunnel');
 
@@ -624,6 +624,90 @@ try {
 mimir_tn_same(count($tunnelCalls) > $callsBeforeBypass, true, 'forced tunnel still calls the bridge while the circuit is open');
 mimir_tn_same($odataCalls, [], 'an open circuit does not add an OData call when the tunnel is forced');
 mimir_tn_same($bypassed, null, 'the forced call while the circuit is open still fails');
+
+// Top 0 via de tunnel: pagina's van MIMIR_TUNNEL_PAGE_ROWS met skip, tot een korte pagina.
+mimir_tn_reset_config();
+mimir_tn_clear_circuit();
+mimir_tn_enable();
+$pagePdo = mimir_db(':memory:');
+$pageCalls = [];
+$GLOBALS['mimir_tunnel_transport'] = static function (string $method, string $url, array $headers) use (&$pageCalls): array {
+    unset($method, $headers);
+    if (str_contains($url, '/page/810')) {
+        return ['status' => 200, 'body' => json_encode(mimir_tn_services_body())];
+    }
+    $pageCalls[] = $url;
+    parse_str((string) parse_url($url, PHP_URL_QUERY), $q);
+    $skip = (int) ($q['skip'] ?? 0);
+    $top = (int) ($q['top'] ?? 0);
+    $total = 2 * MIMIR_TUNNEL_PAGE_ROWS + 7;
+    $rows = [];
+    for ($i = $skip; $i < min($total, $skip + $top); $i++) {
+        $rows[] = ['bookmark' => 'b' . $i, 'cells' => ['No.' => 'N' . $i, 'Description' => 'r' . $i]];
+    }
+
+    return ['status' => 200, 'body' => json_encode(['rows' => $rows, 'truncated' => count($rows) === $top])];
+};
+$odataCalls = [];
+$paged = mimir_query_entity($pagePdo, mimir_tn_job($pagePdo, ['top' => 0, 'max_age' => 0]), static function (string $url) use (&$odataCalls): array {
+    $odataCalls[] = $url;
+
+    return ['value' => []];
+}, $clock);
+mimir_tn_same($odataCalls, [], 'paged top 0 does not call OData');
+mimir_tn_same(count($pageCalls), 3, 'paged top 0 reads three bridge pages');
+mimir_tn_same(str_contains($pageCalls[1], 'skip=' . MIMIR_TUNNEL_PAGE_ROWS), true, 'second page skips one page');
+mimir_tn_same(count($paged['value']), 2 * MIMIR_TUNNEL_PAGE_ROWS + 7, 'paged top 0 returns every row');
+mimir_tn_same(mimir_tunnel_page_top(['kind' => 'list', 'top' => 50]), 50, 'small list asks for its top');
+mimir_tn_same(mimir_tunnel_page_top(['kind' => 'list', 'top' => 5000]), MIMIR_TUNNEL_PAGE_ROWS, 'large list is paged');
+
+// Tunnel valt weg na de eerste pagina: nette fout, geen OData met tunnel-skip.
+$pageCalls = [];
+$GLOBALS['mimir_tunnel_transport'] = static function (string $method, string $url, array $headers) use (&$pageCalls): array {
+    unset($method, $headers);
+    if (str_contains($url, '/page/810')) {
+        return ['status' => 200, 'body' => json_encode(mimir_tn_services_body())];
+    }
+    $pageCalls[] = $url;
+    if (str_contains($url, 'skip=')) {
+        return ['status' => 503, 'body' => json_encode(['ok' => false, 'error' => 'dood', 'code' => 'SESSION_DEAD'])];
+    }
+    $rows = [];
+    for ($i = 0; $i < MIMIR_TUNNEL_PAGE_ROWS; $i++) {
+        $rows[] = ['bookmark' => 'b' . $i, 'cells' => ['No.' => 'M' . $i, 'Description' => 'm']];
+    }
+
+    return ['status' => 200, 'body' => json_encode(['rows' => $rows])];
+};
+$midPdo = mimir_db(':memory:');
+$odataCalls = [];
+$midStatus = null;
+try {
+    mimir_query_entity($midPdo, mimir_tn_job($midPdo, ['top' => 0, 'max_age' => 0]), static function (string $url) use (&$odataCalls): array {
+        $odataCalls[] = $url;
+
+        return ['value' => []];
+    }, $clock);
+} catch (MimirUserException $error) {
+    $midStatus = $error->status;
+}
+mimir_tn_same($midStatus, 502, 'tunnel loss mid-pagination is a 502 user error');
+mimir_tn_same($odataCalls, [], 'no OData call with a tunnel skip');
+mimir_tn_clear_circuit();
+
+// Deadline: na de eerste pagina verlopen = 504.
+$GLOBALS['mimir_deadline_at'] = microtime(true) - 1;
+$dlPdo = mimir_db(':memory:');
+$dlStatus = null;
+try {
+    mimir_query_entity($dlPdo, mimir_tn_job($dlPdo, ['top' => 0, 'max_age' => 0, 'route' => 'odata']), static function (string $url): array {
+        return ['value' => [['No' => 'D' . strlen($url), 'Description' => 'd']], '@odata.nextLink' => 'https://bc.test/env/ODataV4/Company(\'KVT\')/ItemList?$skiptoken=x' . strlen($url)];
+    }, $clock);
+} catch (MimirUserException $error) {
+    $dlStatus = $error->status;
+}
+unset($GLOBALS['mimir_deadline_at']);
+mimir_tn_same($dlStatus, 504, 'deadline after the first page gives 504');
 
 // Zonder config is het antwoord zoals voorheen: geen route-veld.
 mimir_tn_reset_config();

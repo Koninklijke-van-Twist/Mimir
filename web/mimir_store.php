@@ -731,44 +731,16 @@ function mimir_cache_merge_payload(array $old, array $new): array
  */
 function mimir_cache_upsert(PDO $pdo, string $environment, string $company, string $entity, string $rowKey, array $payload, int $fetchedAt): void
 {
+    if ($pdo->inTransaction()) {
+        // Binnen mimir_cache_upsert_many: de buitenste transactie commit/rollt terug.
+        mimir_cache_upsert_row($pdo, $environment, $company, $entity, $rowKey, $payload, $fetchedAt);
+
+        return;
+    }
     mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $rowKey, $payload, $fetchedAt): void {
         $pdo->beginTransaction();
         try {
-            $select = $pdo->prepare(
-                'SELECT payload FROM cache_rows
-                 WHERE environment = :environment AND company = :company AND entity = :entity AND row_key = :row_key'
-            );
-            $select->execute([
-                ':environment' => $environment,
-                ':company' => $company,
-                ':entity' => $entity,
-                ':row_key' => $rowKey,
-            ]);
-            $existing = $select->fetchColumn();
-            $merged = $payload;
-            if (is_string($existing) && $existing !== '') {
-                $old = json_decode($existing, true);
-                if (is_array($old)) {
-                    $merged = mimir_cache_merge_payload($old, $payload);
-                }
-            }
-            $json = json_encode($merged, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            if ($json === false) {
-                throw new RuntimeException('Rij kon niet worden gecachet.');
-            }
-            $stmt = $pdo->prepare(
-                'INSERT INTO cache_rows (environment, company, entity, row_key, payload, fetched_at)
-                 VALUES (:environment, :company, :entity, :row_key, :payload, :at)
-                 ON CONFLICT(environment, company, entity, row_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
-            );
-            $stmt->execute([
-                ':environment' => $environment,
-                ':company' => $company,
-                ':entity' => $entity,
-                ':row_key' => $rowKey,
-                ':payload' => $json,
-                ':at' => $fetchedAt,
-            ]);
+            mimir_cache_upsert_row($pdo, $environment, $company, $entity, $rowKey, $payload, $fetchedAt);
             $pdo->commit();
         } catch (Throwable $error) {
             if ($pdo->inTransaction()) {
@@ -777,6 +749,79 @@ function mimir_cache_upsert(PDO $pdo, string $environment, string $company, stri
             throw $error;
         }
     });
+}
+
+/**
+ * Een hele pagina rijen in één transactie.
+ *
+ * @param list<array{0: string, 1: array<string, mixed>}> $rows [row_key, payload]
+ */
+function mimir_cache_upsert_many(PDO $pdo, string $environment, string $company, string $entity, array $rows, int $fetchedAt): void
+{
+    if ($rows === []) {
+        return;
+    }
+    mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $rows, $fetchedAt): void {
+        $own = !$pdo->inTransaction();
+        if ($own) {
+            $pdo->beginTransaction();
+        }
+        try {
+            foreach ($rows as [$rowKey, $payload]) {
+                mimir_cache_upsert_row($pdo, $environment, $company, $entity, (string) $rowKey, $payload, $fetchedAt);
+            }
+            if ($own) {
+                $pdo->commit();
+            }
+        } catch (Throwable $error) {
+            if ($own && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $error;
+        }
+    });
+}
+
+/**
+ * @param array<string, mixed> $payload
+ */
+function mimir_cache_upsert_row(PDO $pdo, string $environment, string $company, string $entity, string $rowKey, array $payload, int $fetchedAt): void
+{
+    $select = $pdo->prepare(
+        'SELECT payload FROM cache_rows
+         WHERE environment = :environment AND company = :company AND entity = :entity AND row_key = :row_key'
+    );
+    $select->execute([
+        ':environment' => $environment,
+        ':company' => $company,
+        ':entity' => $entity,
+        ':row_key' => $rowKey,
+    ]);
+    $existing = $select->fetchColumn();
+    $merged = $payload;
+    if (is_string($existing) && $existing !== '') {
+        $old = json_decode($existing, true);
+        if (is_array($old)) {
+            $merged = mimir_cache_merge_payload($old, $payload);
+        }
+    }
+    $json = json_encode($merged, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    if ($json === false) {
+        throw new RuntimeException('Rij kon niet worden gecachet.');
+    }
+    $stmt = $pdo->prepare(
+        'INSERT INTO cache_rows (environment, company, entity, row_key, payload, fetched_at)
+         VALUES (:environment, :company, :entity, :row_key, :payload, :at)
+         ON CONFLICT(environment, company, entity, row_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at'
+    );
+    $stmt->execute([
+        ':environment' => $environment,
+        ':company' => $company,
+        ':entity' => $entity,
+        ':row_key' => $rowKey,
+        ':payload' => $json,
+        ':at' => $fetchedAt,
+    ]);
 }
 
 function mimir_cache_delete(PDO $pdo, string $environment, string $company, string $entity, string $rowKey): void
@@ -1262,6 +1307,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $metaPdo = ($job['meta_pdo'] ?? null) instanceof PDO ? $job['meta_pdo'] : null;
     $tunnelRoute = isset($job['route']) && is_string($job['route']) && $job['route'] !== '' ? $job['route'] : null;
     unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page']);
+    $stayOnOdata = false;
     $fetch = static function (string $url) use (
         $innerFetch,
         $environment,
@@ -1273,9 +1319,15 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         $now,
         $tunnelRoute,
         &$slotHeld,
-        &$queueWaitMs
+        &$queueWaitMs,
+        &$stayOnOdata
     ): array {
-        if (mimir_tunnel_configured() || $tunnelRoute === 'tunnel') {
+        // Een OData-vervolgpagina ($skiptoken) of een eerdere terugval in dit verzoek
+        // blijft op OData: niet halverwege een set van route wisselen.
+        if ($tunnelRoute !== 'tunnel' && str_contains($url, '$skiptoken')) {
+            $stayOnOdata = true;
+        }
+        if (!$stayOnOdata && (mimir_tunnel_configured() || $tunnelRoute === 'tunnel')) {
             try {
                 $viaTunnel = mimir_tunnel_try($url, [
                     'environment' => $environment,
@@ -1295,7 +1347,13 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                     'Tunnel geforceerd, geen terugval op OData: ' . $error->getMessage(),
                     502
                 );
+            } catch (MimirTunnelMidPage $error) {
+                throw new MimirUserException(
+                    'Tunnel viel weg tijdens het ophalen; probeer opnieuw: ' . $error->getMessage(),
+                    502
+                );
             } catch (MimirTunnelFallback $error) {
+                $stayOnOdata = true;
                 mimir_event_log(
                     'tunnel',
                     'Tunnel mislukt, terugval op OData: ' . $error->getMessage(),
@@ -2003,6 +2061,7 @@ function mimir_fetch_collection(
     $stored = [];
     $cacheBroken = false;
     $onPage = static function (array $pageRows) use (&$stored, &$cacheBroken, $pdo, $environment, $company, $entity, $keys, $now): void {
+        $batch = [];
         foreach ($pageRows as $payload) {
             if (!is_array($payload)) {
                 continue;
@@ -2020,19 +2079,21 @@ function mimir_fetch_collection(
                     continue;
                 }
             }
-            $rowKey = mimir_row_key($clean, $keys);
-            if (!$cacheBroken) {
-                try {
-                    mimir_cache_upsert($pdo, $environment, $company, $entity, $rowKey, $clean, $now);
-                } catch (Throwable $error) {
-                    if (!mimir_is_storage_failure($error)) {
-                        throw $error;
-                    }
-                    $cacheBroken = true;
-                    mimir_cache_storage_failure($pdo, $error, $environment, $entity);
-                }
-            }
+            $batch[] = [mimir_row_key($clean, $keys), $clean];
             $stored[] = ['payload' => $clean, 'fetched_at' => $now];
+        }
+        if ($cacheBroken || $batch === []) {
+            return;
+        }
+        // Eén transactie per BC-pagina (max. 2000 rijen) i.p.v. één per rij.
+        try {
+            mimir_cache_upsert_many($pdo, $environment, $company, $entity, $batch, $now);
+        } catch (Throwable $error) {
+            if (!mimir_is_storage_failure($error)) {
+                throw $error;
+            }
+            $cacheBroken = true;
+            mimir_cache_storage_failure($pdo, $error, $environment, $entity);
         }
     };
     $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch, $clientTop, $onPage, &$stored): array {
@@ -2096,7 +2157,19 @@ function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $c
         if (!mimir_same_odata_origin($next, $prefix)) {
             throw new RuntimeException('OData nextLink wijst naar een andere host.');
         }
-        $decoded = $fetch($next);
+        if ($guard > 0 && mimir_deadline_passed()) {
+            throw mimir_deadline_error($count);
+        }
+        try {
+            $decoded = $fetch($next);
+        } catch (MimirUserException $error) {
+            throw $error;
+        } catch (Throwable $error) {
+            if (mimir_deadline_passed()) {
+                throw mimir_deadline_error($count);
+            }
+            throw $error;
+        }
         if (!empty($decoded['@mimir.truncated'])) {
             $truncated = true;
         }
@@ -2132,6 +2205,15 @@ function mimir_follow_pages(string $url, string $prefix, callable $fetch, int $c
         }
     }
     return ['rows' => $rows, 'truncated' => $truncated];
+}
+
+function mimir_deadline_error(int $rowsSoFar): MimirUserException
+{
+    return new MimirUserException(
+        'Time-out: BC leverde niet alle rijen binnen ' . MIMIR_REQUEST_DEADLINE_SECONDS
+        . ' s (' . $rowsSoFar . ' rijen binnen). Probeer opnieuw (wat binnen is staat in de cache) of gebruik een filter of top.',
+        504
+    );
 }
 
 function mimir_exception_status(Throwable $error): ?int
