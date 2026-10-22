@@ -146,7 +146,14 @@ function mimir_sqlite_columns(PDO $pdo, string $table): array
  * Schemaversie in PRAGMA user_version. Verhoog bij elke schemawijziging.
  * Een database op deze versie slaat de DDL helemaal over: geen locks per request.
  */
-const MIMIR_SCHEMA_VERSION = 3;
+const MIMIR_SCHEMA_VERSION = 4;
+/**
+ * Vanaf deze versie levert de tunnel OData-formaat (Y-m-d, HH:MM:SS, ISO-UTC).
+ * Oudere cache bevat mogelijk tunnelrijen met '20-7-2026' en lege tijden; rijen
+ * hebben geen route-kenmerk, dus bij de upgrade gaat de hele rij-cache weg
+ * (wordt gewoon opnieuw opgehaald).
+ */
+const MIMIR_SCHEMA_PURGE_TUNNEL_ROWS = 4;
 
 /**
  * Migratie in één BEGIN IMMEDIATE-transactie. Na een deploy openen meerdere
@@ -163,8 +170,13 @@ function mimir_migrate(PDO $pdo): void
     }
     $pdo->exec('BEGIN IMMEDIATE');
     try {
-        if (mimir_schema_version($pdo) < MIMIR_SCHEMA_VERSION) {
+        $from = mimir_schema_version($pdo);
+        if ($from < MIMIR_SCHEMA_VERSION) {
             mimir_migrate_schema($pdo);
+            if ($from > 0 && $from < MIMIR_SCHEMA_PURGE_TUNNEL_ROWS) {
+                $pdo->exec('DELETE FROM cache_rows');
+                $pdo->exec('DELETE FROM cache_coverage');
+            }
             $pdo->exec('PRAGMA user_version = ' . MIMIR_SCHEMA_VERSION);
         }
         $pdo->exec('COMMIT');
@@ -1372,7 +1384,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
             } catch (MimirTunnelFallback $error) {
                 $stayOnOdata = true;
                 // Geen pagina voor deze service (MimirTunnelNoPage): maar één keer loggen.
-                if (!($error instanceof MimirTunnelNoPage && $error->alreadyLogged)) {
+                if (!$error->alreadyLogged) {
                     mimir_event_log(
                         'tunnel',
                         'Tunnel mislukt, terugval op OData: ' . $error->getMessage(),

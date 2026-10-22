@@ -374,6 +374,7 @@ php tests/mimir_table_circuit_test.php
 php tests/mimir_tunnel_test.php
 php tests/mimir_tunnel_columns_test.php
 php tests/mimir_tunnel_design_test.php
+php tests/mimir_tunnel_values_test.php
 ```
 
 De tests hebben de PHP-extensie `pdo_sqlite` nodig (Debian: `php-sqlite3`). `mimir_write_test.php` gebruikt een gemockte HTTP-client en belt Business Central nooit.

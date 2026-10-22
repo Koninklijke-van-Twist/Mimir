@@ -195,6 +195,10 @@ function mimir_tunnel_columns_stale(array $entry, array $captions, int $now): bo
     if ($now - $learnedAt > $ttl) {
         return true;
     }
+    if ($ok && (int) ($columns['output_version'] ?? 0) !== MIMIR_TUNNEL_OUTPUT_VERSION) {
+        // Koppeling van vóór de uitvoeromzetting (of zonder steekproef): opnieuw, met profiel.
+        return true;
+    }
     $known = is_array($columns['seen'] ?? null) ? $columns['seen'] : [];
     foreach ($captions as $caption) {
         if (!in_array($caption, $known, true)) {
@@ -246,7 +250,8 @@ function mimir_tunnel_ensure_columns(array $entry, array $body, array $ctx, bool
     }
     $now = (int) ($ctx['now'] ?? time());
     $captions = mimir_tunnel_body_captions($body);
-    if (!$force && ($captions === [] || !mimir_tunnel_columns_stale($entry, $captions, $now))) {
+    $stale = mimir_tunnel_columns_stale($entry, $captions, $now);
+    if (!$force && ($captions === [] || !$stale)) {
         return $entry;
     }
     if (!empty($GLOBALS['mimir_tunnel_columns_learned'][(string) ($ctx['entity'] ?? '')])) {
@@ -272,6 +277,8 @@ function mimir_tunnel_ensure_columns(array $entry, array $body, array $ctx, bool
                 'complete' => true,
                 'method' => array_fill_keys(array_keys($design), 'designName'),
                 'key_by' => 'designName',
+                'output_version' => MIMIR_TUNNEL_OUTPUT_VERSION,
+                'profile' => mimir_tunnel_sample_profile($entry, $design, $tunnelRows, $ctx, true, !empty($ctx['_unfiltered_first_page'])),
             ];
             // Filters gaan ook op DesignName (de bridge accepteert DesignName of caption).
             $fieldToKey = is_array($entry['captions'] ?? null) ? $entry['captions'] : [];
@@ -297,6 +304,8 @@ function mimir_tunnel_ensure_columns(array $entry, array $body, array $ctx, bool
             'learned_at' => $now,
             'complete' => true,
             'method' => $byName['method'],
+            'output_version' => MIMIR_TUNNEL_OUTPUT_VERSION,
+                'profile' => mimir_tunnel_sample_profile($entry, $byName['map'], $tunnelRows, $ctx, $designKeyed, !$force && !empty($ctx['_unfiltered_first_page'])),
         ];
         $pdo = $ctx['pdo'] ?? null;
         if ($pdo instanceof PDO) {
@@ -340,6 +349,8 @@ function mimir_tunnel_ensure_columns(array $entry, array $body, array $ctx, bool
         'learned_at' => $now,
         'complete' => $error === null && $odataRows !== [] && $keyMapped,
         'method' => $result['method'],
+        'output_version' => MIMIR_TUNNEL_OUTPUT_VERSION,
+        'profile' => $error === null && $odataRows !== [] ? mimir_tunnel_build_profile($result['map'], $tunnelRows, $odataRows, $types, $keys) : null,
     ];
     $fieldToCaption = is_array($entry['captions'] ?? null) ? $entry['captions'] : [];
     foreach ($result['map'] as $caption => $field) {
