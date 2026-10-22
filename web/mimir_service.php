@@ -718,6 +718,7 @@ function mimir_api_main(?string $forcedRoute = null): void
 {
     @set_time_limit(300);
     @ini_set('memory_limit', '512M');
+    mimir_deadline_start();
     @ini_set('display_errors', '0');
     mimir_api_register_fatal_handler();
     $GLOBALS['mimir_stamp_bc_live'] = false;
@@ -1071,6 +1072,7 @@ function mimir_ui_main(): void
 {
     @set_time_limit(300);
     @ini_set('memory_limit', '512M');
+    mimir_deadline_start();
     @ini_set('display_errors', '0');
     mimir_api_register_fatal_handler();
     $GLOBALS['mimir_stamp_bc_live'] = false;

@@ -15,8 +15,8 @@ declare(strict_types=1);
  */
 
 const MIMIR_TUNNEL_PAGE_TTL = 86400;
-/** top=0: de bridge leest in stukken van 50 en kapt zelf af (truncated). */
-const MIMIR_TUNNEL_UNBOUNDED_TOP = 10000;
+/** Pagina-grootte richting de bridge (40 × 50 rijen = één volle bridge-transactie). */
+const MIMIR_TUNNEL_PAGE_ROWS = 2000;
 const MIMIR_TUNNEL_COOLDOWN = 120;
 const MIMIR_TUNNEL_FAIL_LIMIT = 3;
 const MIMIR_TUNNEL_WEB_SERVICES_PAGE = 810;
@@ -28,6 +28,15 @@ class MimirTunnelFallback extends RuntimeException
 
 /** Geforceerde tunnel (`route: tunnel`): de aanroeper mag niet op OData terugvallen. */
 class MimirTunnelForced extends RuntimeException
+{
+}
+
+/**
+ * Tunnel valt weg ná de eerste pagina van een gepagineerde read. Geen OData-terugval
+ * met een tunnel-$skip: het verzoek faalt als geheel (JSON-fout), de volgende
+ * poging begint opnieuw (en valt dan normaal terug als de tunnel uit staat).
+ */
+class MimirTunnelMidPage extends RuntimeException
 {
 }
 
@@ -143,7 +152,7 @@ function mimir_tunnel_inspect_url(string $url, string $entity): array
 {
     $parts = parse_url($url);
     if (!is_array($parts)) {
-        return ['kind' => 'bulk', 'top' => 0, 'filter' => null, 'predicate' => null];
+        return ['kind' => 'bulk', 'top' => 0, 'skip' => 0, 'filter' => null, 'predicate' => null, 'url' => $url];
     }
     $path = rawurldecode((string) ($parts['path'] ?? ''));
     $query = [];
@@ -159,16 +168,22 @@ function mimir_tunnel_inspect_url(string $url, string $entity): array
     }
     $quoted = preg_quote($entity, '#');
     if (preg_match('#/' . $quoted . '\((.*)\)\s*$#', $path, $match) === 1) {
-        return ['kind' => 'card', 'top' => 1, 'filter' => null, 'predicate' => $match[1]];
+        return ['kind' => 'card', 'top' => 1, 'skip' => 0, 'filter' => null, 'predicate' => $match[1], 'url' => $url];
     }
     $top = 0;
     if (isset($query['$top']) && is_numeric($query['$top'])) {
         $top = (int) $query['$top'];
     }
+    $skip = 0;
+    if (isset($query['$skip']) && ctype_digit((string) $query['$skip'])) {
+        $skip = (int) $query['$skip'];
+    }
     $filter = isset($query['$filter']) && $query['$filter'] !== '' ? $query['$filter'] : null;
     return [
         'kind' => $top >= 1 ? 'list' : 'bulk',
         'top' => $top,
+        'skip' => $skip,
+        'url' => $url,
         'filter' => $filter,
         'predicate' => null,
     ];
@@ -192,10 +207,15 @@ function mimir_tunnel_try(string $url, array $ctx): ?array
     if ($prefer === 'odata') {
         return null;
     }
+    $inspected = mimir_tunnel_inspect_url($url, (string) $ctx['entity']);
+    $midPage = (int) ($inspected['skip'] ?? 0) > 0;
     if (!$forced && mimir_tunnel_circuit_open()) {
+        if ($midPage) {
+            throw new MimirTunnelMidPage('tunnel uitgeschakeld tijdens het pagineren');
+        }
+
         return null;
     }
-    $inspected = mimir_tunnel_inspect_url($url, (string) $ctx['entity']);
     if (mimir_tunnel_route_for($inspected['kind'], $prefer) !== 'tunnel') {
         if ($forced) {
             throw new MimirTunnelForced('deze aanroep is niet via de tunnel te lezen');
@@ -207,6 +227,9 @@ function mimir_tunnel_try(string $url, array $ctx): ?array
         $result = mimir_tunnel_read($inspected, $ctx);
     } catch (MimirTunnelOutage $error) {
         mimir_tunnel_circuit_fail((string) $ctx['environment'], (string) $ctx['entity'], $error->getMessage());
+        if ($midPage && !$forced) {
+            throw new MimirTunnelMidPage('tunnel viel weg na ' . (int) $inspected['skip'] . ' rijen: ' . $error->getMessage(), 0, $error);
+        }
         if ($forced) {
             throw new MimirTunnelForced($error->getMessage(), 0, $error);
         }
@@ -214,6 +237,9 @@ function mimir_tunnel_try(string $url, array $ctx): ?array
     } catch (MimirTunnelFallback $error) {
         if ($forced) {
             throw new MimirTunnelForced($error->getMessage(), 0, $error);
+        }
+        if ($midPage) {
+            throw new MimirTunnelMidPage('tunnel faalde na ' . (int) $inspected['skip'] . ' rijen: ' . $error->getMessage(), 0, $error);
         }
         throw $error;
     }
@@ -248,13 +274,14 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
                 }
                 throw new MimirTunnelFallback('filter niet naar de tunnel te vertalen');
             }
-            $top = $inspected['kind'] === 'card' ? 5 : (int) $inspected['top'];
-            if ($top < 1) {
-                $top = MIMIR_TUNNEL_UNBOUNDED_TOP;
-            }
-            $body = mimir_tunnel_get_page((int) $page['page_id'], (string) $ctx['company'], $filters, $top, $ctx['key_id'] ?? null);
+            $skip = $inspected['kind'] === 'card' ? 0 : max(0, (int) ($inspected['skip'] ?? 0));
+            $pageTop = mimir_tunnel_page_top($inspected);
+            $body = mimir_tunnel_get_page((int) $page['page_id'], (string) $ctx['company'], $filters, $pageTop, $ctx['key_id'] ?? null, $skip);
             $page = mimir_tunnel_remember_captions($page, $body, $ctx);
             $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types']);
+            if ($inspected['kind'] !== 'card') {
+                $odata = mimir_tunnel_add_next_link($inspected, $odata, $body, $pageTop);
+            }
 
             return ['page_id' => (int) $page['page_id'], 'odata' => $odata];
         } catch (MimirTunnelWrongPage $error) {
@@ -278,6 +305,90 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
     }
 
     throw new MimirTunnelFallback('tunnel gaf geen leesbaar antwoord');
+}
+
+/**
+ * Rijen voor deze bridge-aanroep: hoogstens MIMIR_TUNNEL_PAGE_ROWS, en bij een
+ * eindige top niet meer dan er nog nodig is.
+ *
+ * @param array<string, mixed> $inspected
+ */
+function mimir_tunnel_page_top(array $inspected): int
+{
+    if (($inspected['kind'] ?? '') === 'card') {
+        return 5;
+    }
+    $top = (int) ($inspected['top'] ?? 0);
+    if ($top < 1) {
+        return MIMIR_TUNNEL_PAGE_ROWS;
+    }
+
+    return max(1, min(MIMIR_TUNNEL_PAGE_ROWS, $top));
+}
+
+/**
+ * Volle pagina = er kan meer zijn: geef een OData-achtige nextLink terug met
+ * $skip, zodat mimir_follow_pages pagina voor pagina ophaalt en opslaat.
+ * Bij een eindige top krimpt $top per pagina mee (resterend aantal).
+ *
+ * @param array<string, mixed> $inspected
+ * @param array<string, mixed> $odata
+ * @param array<string, mixed> $body
+ * @return array<string, mixed>
+ */
+function mimir_tunnel_add_next_link(array $inspected, array $odata, array $body, int $pageTop): array
+{
+    $count = is_array($odata['value'] ?? null) ? count($odata['value']) : 0;
+    $rowsRead = is_array($body['rows'] ?? null) ? count($body['rows']) : $count;
+    if ($rowsRead < $pageTop || $rowsRead < 1) {
+        return $odata;
+    }
+    $top = (int) ($inspected['top'] ?? 0);
+    $nextSkip = (int) ($inspected['skip'] ?? 0) + $rowsRead;
+    $set = ['$skip' => (string) $nextSkip];
+    if ($top >= 1) {
+        $remaining = $top - $rowsRead;
+        if ($remaining < 1) {
+            return $odata;
+        }
+        $set['$top'] = (string) $remaining;
+    }
+    // Volle pagina: de bridge-vlag 'truncated' betekent hier alleen "er komt meer".
+    unset($odata['@mimir.truncated']);
+    $odata['@odata.nextLink'] = mimir_tunnel_url_with((string) ($inspected['url'] ?? ''), $set);
+
+    return $odata;
+}
+
+/**
+ * @param array<string, string> $set
+ */
+function mimir_tunnel_url_with(string $url, array $set): string
+{
+    $hash = strpos($url, '#');
+    if ($hash !== false) {
+        $url = substr($url, 0, $hash);
+    }
+    $q = strpos($url, '?');
+    $base = $q === false ? $url : substr($url, 0, $q);
+    $pairs = [];
+    if ($q !== false) {
+        foreach (explode('&', substr($url, $q + 1)) as $pair) {
+            if ($pair === '') {
+                continue;
+            }
+            $name = rawurldecode(explode('=', $pair, 2)[0]);
+            if (array_key_exists($name, $set)) {
+                continue;
+            }
+            $pairs[] = $pair;
+        }
+    }
+    foreach ($set as $name => $value) {
+        $pairs[] = rawurlencode($name) . '=' . rawurlencode($value);
+    }
+
+    return $base . '?' . implode('&', $pairs);
 }
 
 /**
@@ -968,9 +1079,12 @@ function mimir_tunnel_unwrap(string $text): string
  * @param list<string> $filters
  * @return array<string, mixed>
  */
-function mimir_tunnel_get_page(int $pageId, string $company, array $filters, int $top, ?string $keyId): array
+function mimir_tunnel_get_page(int $pageId, string $company, array $filters, int $top, ?string $keyId, int $skip = 0): array
 {
     $query = ['company' => $company, 'top' => (string) max(1, $top)];
+    if ($skip > 0) {
+        $query['skip'] = (string) $skip;
+    }
     if ($filters !== []) {
         $query['filter'] = $filters;
     }
@@ -1106,7 +1220,7 @@ function mimir_tunnel_http(string $method, string $path, array $query, ?string $
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_TIMEOUT => 180,
+        CURLOPT_TIMEOUT => function_exists('mimir_deadline_curl_timeout') ? mimir_deadline_curl_timeout(180) : 180,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_USERAGENT => 'Mimir-TunnelClient/1.0',
     ];
