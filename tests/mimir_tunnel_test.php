@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+define('MIMIR_DEFAULT_ROUTE', ''); // automatische route testen
+
 require_once dirname(__DIR__) . '/web/mimir_store.php';
 
 function mimir_tn_fail(string $message): void
