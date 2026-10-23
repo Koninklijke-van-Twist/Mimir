@@ -18,8 +18,6 @@ require_once __DIR__ . '/mimir_tunnel_columns.php';
 require_once __DIR__ . '/mimir_tunnel_values.php';
 
 const MIMIR_TUNNEL_PAGE_TTL = 86400;
-/** Meer OR-waarden dan dit: de query direct via OData. */
-const MIMIR_TUNNEL_MAX_OR_VALUES = 5;
 /** Lege of afgekapte page 810-koppeling: kort cachen. */
 const MIMIR_TUNNEL_PAGE_TTL_INCOMPLETE = 300;
 /** Pagina-grootte richting de bridge (40 × 50 rijen = één volle bridge-transactie). */
@@ -1235,10 +1233,6 @@ function mimir_tunnel_odata_to_filters(string $odata, array $entry): ?array
                 return null;
             }
             $leaves[] = $leaf;
-        }
-        if (count($leaves) > MIMIR_TUNNEL_MAX_OR_VALUES) {
-            // BC filtert 'a|b|c|…' over de tunnel traag (20 waarden ~65 s vs ~2 s OData).
-            return null;
         }
         if (count($leaves) > 1) {
             $field = (string) $leaves[0]['field'];
