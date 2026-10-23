@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+define('MIMIR_DEFAULT_ROUTE', ''); // automatische route testen
+
 /**
  * DesignName-sleutels van de bridge (keyBy: designName) -> OData-velden via \$metadata.
  */

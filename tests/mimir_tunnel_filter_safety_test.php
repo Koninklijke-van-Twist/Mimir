@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+define('MIMIR_DEFAULT_ROUTE', ''); // automatische route testen
+
 // Tunnelfilters: alleen vertalen wat betrouwbaar is, anders OData; 0 rijen op een
 // gefilterde query wordt één keer via OData gecontroleerd.
 

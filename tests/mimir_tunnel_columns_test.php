@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+define('MIMIR_DEFAULT_ROUTE', ''); // automatische route testen
+
 /**
  * Taalonafhankelijke kolomkoppeling tunnel-captions -> OData-velden.
  */

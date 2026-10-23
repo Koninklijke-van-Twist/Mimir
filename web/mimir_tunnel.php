@@ -20,6 +20,8 @@ require_once __DIR__ . '/mimir_tunnel_values.php';
 const MIMIR_TUNNEL_PAGE_TTL = 86400;
 /** Meer OR-waarden dan dit: de query direct via OData. */
 const MIMIR_TUNNEL_MAX_OR_VALUES = 5;
+// Route zonder `route` in het verzoek: 'odata' (tijdelijk, tunnel 3-4x trager) of '' = automatisch (tunnel).
+defined('MIMIR_DEFAULT_ROUTE') || define('MIMIR_DEFAULT_ROUTE', 'odata');
 /** Lege of afgekapte page 810-koppeling: kort cachen. */
 const MIMIR_TUNNEL_PAGE_TTL_INCOMPLETE = 300;
 /** Pagina-grootte richting de bridge (40 × 50 rijen = één volle bridge-transactie). */
@@ -122,6 +124,7 @@ function mimir_tunnel_cache_key(string $environment): string
  */
 function mimir_tunnel_route_for(string $kind, ?string $prefer = null): string
 {
+    $prefer ??= (MIMIR_DEFAULT_ROUTE !== '' ? MIMIR_DEFAULT_ROUTE : null);
     if ($prefer === 'odata' || !mimir_tunnel_configured()) {
         return 'odata';
     }
