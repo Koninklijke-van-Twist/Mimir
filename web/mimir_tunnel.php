@@ -309,6 +309,8 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
                 throw new MimirTunnelFallback('filter niet naar de tunnel te vertalen (kolom onbekend na caption/DesignName-koppeling)');
             }
             $skip = $inspected['kind'] === 'card' ? 0 : max(0, (int) ($inspected['skip'] ?? 0));
+            // Profiel al bekend en velden onbetrouwbaar: direct OData, geen tunnelrondje vooraf.
+            mimir_tunnel_assert_reliable_fields($inspected, $page, $ctx);
             $pageTop = mimir_tunnel_page_top($inspected);
             $body = mimir_tunnel_get_page((int) $page['page_id'], (string) $ctx['company'], $filters, $pageTop, $ctx['key_id'] ?? null, $skip, MIMIR_TUNNEL_KEY_BY);
             mimir_tunnel_note_key_by($body);
