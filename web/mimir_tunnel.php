@@ -922,7 +922,7 @@ function mimir_tunnel_refresh_one(array $ctx): ?array
  */
 function mimir_tunnel_probe_captions(array $entry, array $ctx): array
 {
-    $body = mimir_tunnel_get_page((int) $entry['page_id'], (string) $ctx['company'], [], 1, $ctx['key_id'] ?? null);
+    $body = mimir_tunnel_get_page((int) $entry['page_id'], (string) $ctx['company'], [], 1, $ctx['key_id'] ?? null, 0, MIMIR_TUNNEL_KEY_BY);
     $entry = mimir_tunnel_remember_captions($entry, $body, $ctx);
     // Filterkolom onbekend: meestal captions in een andere taal. Koppeling opnieuw leren.
     $relearned = mimir_tunnel_relearn_columns($entry, $body, $ctx);
