@@ -324,6 +324,11 @@ function mimir_tunnel_read(array $inspected, array $ctx): array
             $learnCtx['_unfiltered_first_page'] = $inspected['kind'] !== 'card' && $filters === [] && $skip === 0;
             $page = mimir_tunnel_ensure_columns($page, $body, $learnCtx);
             mimir_tunnel_assert_reliable_fields($inspected, $page, $ctx);
+            if ($inspected['kind'] !== 'card' && is_array($body['fields'] ?? null) && empty($body['rows'])) {
+                // Kaartpagina (bijv. 88 Job Card): de webclient toont één record, geen lijst.
+                // Filters past de bridge dan alleen op dat ene record toe: 0 rijen zonder fout.
+                throw new MimirTunnelFallback('pagina ' . (int) $page['page_id'] . ' is een kaartpagina; de tunnel kan daar geen lijst uit lezen (webservice op een lijstpagina nodig)');
+            }
             $odata = mimir_tunnel_odata_shape($inspected, $body, $ctx['types'], mimir_tunnel_effective_columns($page, $body, $ctx['types']), mimir_tunnel_entry_profile($page));
             if ($inspected['kind'] !== 'card') {
                 mimir_tunnel_assert_filtered_rows($inspected, $body, $ctx);
@@ -1148,6 +1153,21 @@ function mimir_tunnel_caption_for(string $field, array $entry): ?string
         if (is_string($caption) && $caption !== '') {
             $seenSet[$caption] = true;
         }
+    }
+    // Sleutel die genormaliseerd gelijk is aan het OData-veld (DesignName "KVT_Contract_No",
+    // caption "No."): die wint. De geleerde waardekoppeling vult bij DesignName-sleutels
+    // alleen het restant en bevat zulke velden dan niet.
+    // Bij DesignName-sleutels koppelt de uitvoer ook eerst op naam (mimir_tunnel_effective_columns).
+    $designKeyed = ($entry['columns']['key_by'] ?? null) === 'designName';
+    $byName = [];
+    foreach (array_keys($seenSet) as $caption) {
+        if (preg_match('/#\d+$/', $caption) !== 1 && mimir_tunnel_design_norm($caption) === mimir_tunnel_design_norm($field)
+            && ($designKeyed || !mimir_tunnel_caption_mapped_elsewhere($caption, $field, $entry))) {
+            $byName[] = $caption;
+        }
+    }
+    if (count($byName) === 1) {
+        return $byName[0];
     }
     $fromMap = [];
     foreach (mimir_tunnel_columns_map($entry) as $caption => $mapped) {

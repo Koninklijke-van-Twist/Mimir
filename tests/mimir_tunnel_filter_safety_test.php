@@ -63,6 +63,11 @@ mimir_tfs_same(mimir_tunnel_caption_for('Name_2', $english), null, 'duplicate ca
 mimir_tfs_same(mimir_tunnel_caption_for('Description', $english), 'Description', 'guess that the bridge shows is fine');
 mimir_tfs_same(mimir_tunnel_caption_for('KVT_Sales_Person_Code', $english), null, 'unseen guess is unknown');
 mimir_tfs_same(mimir_tunnel_odata_to_filters("KVT_Sales_Person_Code eq 'NZ'", $english), null, 'unknown column -> OData');
+// --- DesignName-sleutels, KVT-velden alleen via $metadata gekoppeld (niet in de geleerde map).
+$design = ['columns' => ['map' => ['No.' => 'No', 'Description' => 'Contract_No'], 'seen' => ['No.', 'Description', 'KVT_Contract_No', 'KVT_Sales_Person_Code'], 'key_by' => 'designName']];
+mimir_tfs_same(mimir_tunnel_odata_to_filters("KVT_Contract_No eq 'CT26000230'", $design), ['KVT_Contract_No=CT26000230'], 'designName KVT column filters');
+mimir_tfs_same(mimir_tunnel_caption_for('KVT_Sales_Person_Code', $design), 'KVT_Sales_Person_Code', 'designName KVT salesperson');
+mimir_tfs_same(mimir_tunnel_caption_for('No', $design), 'No.', 'No still maps');
 $wrongGuess = ['columns' => ['map' => ['Name' => 'Search_Name'], 'seen' => ['Name']]];
 mimir_tfs_same(mimir_tunnel_caption_for('Name', $wrongGuess), null, 'guess that belongs to another field is refused');
 // Zonder geleerde koppeling: oude gedrag (gok).
