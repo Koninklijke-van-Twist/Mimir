@@ -349,6 +349,7 @@ function mimir_tunnel_ensure_columns(array $entry, array $body, array $ctx, bool
         'learned_at' => $now,
         'complete' => $error === null && $odataRows !== [] && $keyMapped,
         'method' => $result['method'],
+        'key_by' => $designKeyed ? 'designName' : 'caption',
         'output_version' => MIMIR_TUNNEL_OUTPUT_VERSION,
         'profile' => $error === null && $odataRows !== [] ? mimir_tunnel_build_profile($result['map'], $tunnelRows, $odataRows, $types, $keys) : null,
     ];
