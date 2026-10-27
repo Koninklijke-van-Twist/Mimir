@@ -3,10 +3,10 @@
 /**
  * Per tabel (OData-servicenaam) de bevestigde Normal-velden (geen FlowField).
  *
- * Een tabel die hier staat, of die *_Filter-velden heeft, geldt als tabel met FlowFields.
- * Delta en weekendverversing mogen daar alleen als elke gevraagde kolom (select,
- * filtervelden en sleutels) hieronder staat. Geen select, een kolom die er niet staat
- * of een tabel met een lege lijst -> volledige fetch.
+ * Delta en weekendverversing zijn strikt opt-in: alleen voor tabellen die hier staan,
+ * en alleen als elke gevraagde kolom (select, filtervelden en sleutels) hieronder staat.
+ * Een tabel die hier niet staat, geen select, een kolom die er niet staat of een lege
+ * lijst -> altijd volledig. (FlowFields zijn niet uit de metadata te halen.)
  *
  * Bron: Ariadne, veldklassen (fieldclass.json, BC-tabelmetadata, gecontroleerd voor KVT;
  * gelijk over bedrijven), 27-10-2026. Opgenomen: alleen class Normal met verified=true
