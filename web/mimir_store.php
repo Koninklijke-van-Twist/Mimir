@@ -769,19 +769,19 @@ function mimir_cache_upsert(PDO $pdo, string $environment, string $company, stri
  *
  * @param list<array{0: string, 1: array<string, mixed>}> $rows [row_key, payload]
  */
-function mimir_cache_upsert_many(PDO $pdo, string $environment, string $company, string $entity, array $rows, int $fetchedAt): void
+function mimir_cache_upsert_many(PDO $pdo, string $environment, string $company, string $entity, array $rows, int $fetchedAt, ?array $keepOld = null): void
 {
     if ($rows === []) {
         return;
     }
-    mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $rows, $fetchedAt): void {
+    mimir_db_retry(static function () use ($pdo, $environment, $company, $entity, $rows, $fetchedAt, $keepOld): void {
         $own = !$pdo->inTransaction();
         if ($own) {
             $pdo->beginTransaction();
         }
         try {
             foreach ($rows as [$rowKey, $payload]) {
-                mimir_cache_upsert_row($pdo, $environment, $company, $entity, (string) $rowKey, $payload, $fetchedAt);
+                mimir_cache_upsert_row($pdo, $environment, $company, $entity, (string) $rowKey, $payload, $fetchedAt, $keepOld);
             }
             if ($own) {
                 $pdo->commit();
@@ -796,9 +796,14 @@ function mimir_cache_upsert_many(PDO $pdo, string $environment, string $company,
 }
 
 /**
+ * $keepOld null: velden samenvoegen met de oude rij. Een lijst: de rij vervangen en
+ * van de oude rij alleen die velden houden (bevestigde Normal-velden), zodat er geen
+ * oude waarde met een nieuwe fetched_at blijft staan.
+ *
  * @param array<string, mixed> $payload
+ * @param list<string>|null $keepOld
  */
-function mimir_cache_upsert_row(PDO $pdo, string $environment, string $company, string $entity, string $rowKey, array $payload, int $fetchedAt): void
+function mimir_cache_upsert_row(PDO $pdo, string $environment, string $company, string $entity, string $rowKey, array $payload, int $fetchedAt, ?array $keepOld = null): void
 {
     $select = $pdo->prepare(
         'SELECT payload FROM cache_rows
@@ -815,7 +820,7 @@ function mimir_cache_upsert_row(PDO $pdo, string $environment, string $company, 
     if (is_string($existing) && $existing !== '') {
         $old = json_decode($existing, true);
         if (is_array($old)) {
-            $merged = mimir_cache_merge_payload($old, $payload);
+            $merged = mimir_cache_merge_payload($keepOld === null ? $old : array_intersect_key($old, array_flip($keepOld)), $payload);
         }
     }
     $json = json_encode($merged, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -835,6 +840,40 @@ function mimir_cache_upsert_row(PDO $pdo, string $environment, string $company, 
         ':payload' => $json,
         ':at' => $fetchedAt,
     ]);
+}
+
+/**
+ * Velden die bij vervangen van een rij uit de oude rij mogen blijven: de bevestigde
+ * Normal-velden uit web/config/delta_normal_fields.php (anders geen).
+ *
+ * @return list<string>
+ */
+function mimir_cache_kept_columns(string $entity): array
+{
+    return (array) mimir_delta_normal_fields($entity);
+}
+
+/**
+ * Rijen worden vervangen door $select (+ bewaarde velden). Dekking die meer kolommen
+ * belooft klopt dan niet meer: weg ermee, dan haalt die vraag weer live op.
+ *
+ * @param list<string> $select [] = alle kolommen
+ * @param list<string> $kept
+ */
+function mimir_coverage_drop_wider(PDO $pdo, string $environment, string $company, string $entity, array $select, array $kept): void
+{
+    if ($select === []) {
+        return;
+    }
+    $have = mimir_select_sig(array_merge($select, $kept));
+    $stmt = $pdo->prepare('SELECT filter_sig, select_sig FROM cache_coverage WHERE environment = :e AND company = :c AND entity = :n');
+    $stmt->execute([':e' => $environment, ':c' => $company, ':n' => $entity]);
+    $delete = $pdo->prepare('DELETE FROM cache_coverage WHERE environment = :e AND company = :c AND entity = :n AND filter_sig = :f AND select_sig = :s');
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        if (!mimir_select_sig_covers($have, (string) $row['select_sig'])) {
+            $delete->execute([':e' => $environment, ':c' => $company, ':n' => $entity, ':f' => $row['filter_sig'], ':s' => $row['select_sig']]);
+        }
+    }
 }
 
 function mimir_cache_delete(PDO $pdo, string $environment, string $company, string $entity, string $rowKey): void
@@ -2171,7 +2210,10 @@ function mimir_fetch_collection(
     // als geheel bewaard.
     $stored = [];
     $cacheBroken = false;
-    $onPage = static function (array $pageRows) use (&$stored, &$cacheBroken, $pdo, $environment, $company, $entity, $keys, $now): void {
+    // Opgehaalde rijen vervangen de oude volledig (alleen whitelist-velden blijven staan).
+    $keepOld = mimir_cache_kept_columns($entity);
+    $dropped = false;
+    $onPage = static function (array $pageRows) use (&$stored, &$cacheBroken, &$dropped, $pdo, $environment, $company, $entity, $keys, $select, $keepOld, $now): void {
         $batch = [];
         foreach ($pageRows as $payload) {
             if (!is_array($payload)) {
@@ -2198,7 +2240,11 @@ function mimir_fetch_collection(
         }
         // Eén transactie per BC-pagina (max. 2000 rijen) i.p.v. één per rij.
         try {
-            mimir_cache_upsert_many($pdo, $environment, $company, $entity, $batch, $now);
+            if (!$dropped) {
+                mimir_coverage_drop_wider($pdo, $environment, $company, $entity, $select, $keepOld);
+                $dropped = true;
+            }
+            mimir_cache_upsert_many($pdo, $environment, $company, $entity, $batch, $now, $keepOld);
         } catch (Throwable $error) {
             if (!mimir_is_storage_failure($error)) {
                 throw $error;

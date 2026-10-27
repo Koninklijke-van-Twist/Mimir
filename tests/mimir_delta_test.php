@@ -183,6 +183,19 @@ $fn = mimir_query_entity($fp, ['select' => []] + $fjob, $fetch, $now + 7200);
 dt_same($fn['meta']['delta_mode'], 'full (flowfields (geen select))', 'geen select -> volledig');
 $GLOBALS['mimir_delta_normal_fields'] = [];
 
+// Volledig ophalen vervangt de rij: geen oude veldwaarde met een nieuwe tijd.
+$wp = mimir_db(':memory:');
+mimir_cache_upsert($wp, 'env', 'KVT', 'AppItems', 'No="1"', ['No' => '1', 'Description' => 'oud', 'Inventory' => 5, 'Blocked' => false], $now - 100);
+mimir_coverage_put($wp, 'env', 'KVT', 'AppItems', '', '*', $now - 100, 1);
+mimir_cache_upsert_many($wp, 'env', 'KVT', 'AppItems', [['No="1"', ['No' => '1', 'Description' => 'nieuw']]], $now, []);
+dt_same(mimir_cache_all($wp, 'env', 'KVT', 'AppItems')[0]['payload'], ['No' => '1', 'Description' => 'nieuw'], 'rij volledig vervangen');
+$GLOBALS['mimir_delta_normal_fields'] = ['AppItems' => ['No', 'Description', 'Blocked']];
+mimir_cache_upsert_many($wp, 'env', 'KVT', 'AppItems', [['No="1"', ['No' => '1', 'Inventory' => 7]]], $now, mimir_cache_kept_columns('AppItems'));
+dt_same(mimir_cache_all($wp, 'env', 'KVT', 'AppItems')[0]['payload'], ['No' => '1', 'Description' => 'nieuw', 'Inventory' => 7], 'alleen whitelist-velden blijven staan');
+mimir_coverage_drop_wider($wp, 'env', 'KVT', 'AppItems', ['No'], ['Description']);
+dt_same((int) $wp->query('SELECT COUNT(*) FROM cache_coverage')->fetchColumn(), 0, 'bredere dekking vervalt');
+$GLOBALS['mimir_delta_normal_fields'] = [];
+
 dt_same(mimir_rolling_refresh($rp, ['keys' => ['A', 'B']] + $rjob, $fetch, 0, $wk, $wk), 'overgeslagen (sleutel)', 'samengestelde sleutel overslaan');
 
 echo "OK\n";

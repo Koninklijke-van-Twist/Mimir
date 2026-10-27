@@ -168,15 +168,18 @@ function mimir_delta_select_query(array $job): array
  */
 function mimir_delta_store(PDO $pdo, array $job, array $batch, int $now): void
 {
+    // Rij vervangen, net als bij volledig ophalen. Bij een FlowField-tabel ook als BC
+    // $select negeert alleen whitelist-velden en sleutels bewaren.
+    $kept = mimir_cache_kept_columns($job['entity']);
+    $select = [];
     if (mimir_delta_has_flowfields($job['types'])) {
-        // Ook als BC $select negeert: alleen whitelist-velden en sleutels bewaren.
-        $keep = array_flip(array_merge($job['keys'], (array) mimir_delta_normal_fields($job['entity'])));
+        $select = array_merge($job['keys'], $kept);
         foreach ($batch as $i => [$rowKey, $payload]) {
-            $batch[$i][1] = array_intersect_key($payload, $keep);
-            mimir_cache_delete($pdo, $job['environment'], $job['company'], $job['entity'], $rowKey);
+            $batch[$i][1] = array_intersect_key($payload, array_flip($select));
         }
     }
-    mimir_cache_upsert_many($pdo, $job['environment'], $job['company'], $job['entity'], $batch, $now);
+    mimir_coverage_drop_wider($pdo, $job['environment'], $job['company'], $job['entity'], $select, $kept);
+    mimir_cache_upsert_many($pdo, $job['environment'], $job['company'], $job['entity'], $batch, $now, $kept);
 }
 
 /** @param array<string, mixed> $job */

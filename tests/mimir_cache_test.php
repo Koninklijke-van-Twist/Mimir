@@ -358,7 +358,7 @@ mimir_query_entity($pdo, mimir_job([
     return ['value' => [['No' => 'A', 'Description' => 'Nieuw']]];
 }, $now + 1000);
 $afterNarrow = mimir_cache_all($pdo, 'kvtmdlive_aad', 'KVT', 'ItemList');
-mimir_cache_same($afterNarrow[0]['payload']['Name'] ?? null, 'Acme', 'refetch without Name keeps it');
+mimir_cache_same(array_key_exists('Name', $afterNarrow[0]['payload']), false, 'refetch without Name drops it (no stale value with fresh fetched_at)');
 mimir_cache_same($afterNarrow[0]['payload']['Description'] ?? null, 'Nieuw', 'refetch overwrites Description');
 
 fwrite(STDOUT, "ok\n");
