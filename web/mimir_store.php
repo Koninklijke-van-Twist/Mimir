@@ -1598,7 +1598,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         } elseif (($delta = mimir_delta_try($pdo, $deltaJob = [
             'environment' => $environment, 'company' => $company, 'entity' => $entity, 'prefix' => $prefix,
             'filter' => $filter, 'types' => $types, 'keys' => $keys, 'required' => $required,
-            'pushed' => $pushed, 'top' => $top, 'route' => $tunnelRoute,
+            'pushed' => $pushed, 'top' => $top, 'route' => $tunnelRoute, 'select' => $select,
         ], static function (string $url) use ($fetch, &$stayOnOdata): array {
             $stayOnOdata = true;
 

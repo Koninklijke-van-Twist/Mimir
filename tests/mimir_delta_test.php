@@ -26,7 +26,7 @@ dt_same(mimir_delta_filter(['field' => 'Last_Date_Modified', 'date_only' => true
 
 // Twijfelgevallen -> volledig.
 $base = [
-    'filter' => null, 'top' => 0, 'route' => null, 'keys' => ['No'],
+    'entity' => 'Elders', 'filter' => null, 'top' => 0, 'route' => null, 'keys' => ['No'],
     'types' => ['No' => 'Edm.String', 'Description' => 'Edm.String', 'Last_Date_Modified' => 'Edm.Date'],
 ];
 dt_same(mimir_delta_reason($base), null, 'basis mag delta');
@@ -36,6 +36,16 @@ dt_same(mimir_delta_reason(['top' => 100] + $base), 'top', 'top');
 dt_same(mimir_delta_reason(['route' => 'tunnel'] + $base), 'tunnel', 'tunnel');
 dt_same(mimir_delta_reason(['types' => $base['types'] + ['Date_Filter' => 'Edm.String']] + $base), 'flowfields', 'flowfields');
 dt_same(mimir_delta_reason(['filter' => "No eq '1' or Description eq 'x'"] + $base), 'filter niet lokaal te bewijzen', 'ruwe filterstring');
+
+// FlowField-tabel: alleen met whitelist en select binnen de whitelist.
+$GLOBALS['mimir_delta_normal_fields'] = ['AppItems' => ['No', 'Description', 'Blocked', 'Last_Date_Modified']];
+$ff = ['entity' => 'AppItems', 'types' => $base['types'] + ['Date_Filter' => 'Edm.String', 'Inventory' => 'Edm.Decimal']] + $base;
+dt_same(mimir_delta_reason(['select' => ['No', 'Description']] + $ff), null, 'whitelist-select -> delta');
+dt_same(mimir_delta_reason(['select' => ['No', 'Inventory']] + $ff), 'flowfields (kolom niet op whitelist)', 'niet-whitelist kolom -> volledig');
+dt_same(mimir_delta_reason(['select' => ['No'], 'filter' => ['field' => 'Inventory', 'op' => 'gt', 'value' => 0]] + $ff), 'flowfields (kolom niet op whitelist)', 'filterveld niet op whitelist');
+dt_same(mimir_delta_reason(['select' => []] + $ff), 'flowfields (geen select)', 'geen select -> volledig');
+dt_same(mimir_delta_reason(['select' => ['No'], 'entity' => 'Andere'] + $ff), 'flowfields', 'tabel zonder whitelist -> volledig');
+dt_same(mimir_delta_select_query($ff), ['$select' => 'No,Description,Last_Date_Modified'], 'delta haalt alleen whitelist-velden');
 
 // End-to-end: volledig, dan delta + merge op sleutel, dan dagelijkse volledige verversing.
 $now = 1_800_000_000;
@@ -156,6 +166,23 @@ for ($t = 1; $t < 10; $t++) {
 }
 dt_same(mimir_meta_get_raw($rp, 'delta:KVT|AppItems|abc')['full_at'], $wk, 'na laatste blok telt ronde als volledige fetch');
 dt_same(count(mimir_cache_all($rp, 'env', 'KVT', 'AppItems')), 1000, 'alle rijen ververst');
+// FlowField-tabel met whitelist: delta werkt end-to-end en de cache houdt geen oude FlowField-waarde.
+$fp = mimir_db(':memory:');
+$bc = ['1' => ['No' => '1', 'Description' => 'A', 'Blocked' => false, 'Last_Date_Modified' => '2026-01-01', 'Inventory' => 5, 'Date_Filter' => '']];
+$fjob = $job;
+$fjob['schema']['properties'] += ['Inventory' => 'Edm.Decimal', 'Date_Filter' => 'Edm.String'];
+mimir_cache_upsert($fp, 'env', 'KVT', 'AppItems', 'No="1"', $bc['1'], $now - 100);
+dt_same(mimir_query_entity($fp, $fjob, $fetch, $now)['meta']['delta_mode'], 'full', 'eerst volledig');
+$bc['1']['Description'] = 'B';
+$bc['1']['Last_Date_Modified'] = 'NIEUW';
+$fr = mimir_query_entity($fp, $fjob, $fetch, $now + 3600);
+dt_same($fr['meta']['delta_mode'], 'delta', 'FlowField-tabel met whitelist-select -> delta');
+dt_same($fr['value'][0]['Description'], 'B', 'gewijzigde waarde');
+dt_same(array_key_exists('Inventory', mimir_cache_all($fp, 'env', 'KVT', 'AppItems')[0]['payload']), false, 'oude FlowField-waarde niet meer in cache');
+$fn = mimir_query_entity($fp, ['select' => []] + $fjob, $fetch, $now + 7200);
+dt_same($fn['meta']['delta_mode'], 'full (flowfields (geen select))', 'geen select -> volledig');
+$GLOBALS['mimir_delta_normal_fields'] = [];
+
 dt_same(mimir_rolling_refresh($rp, ['keys' => ['A', 'B']] + $rjob, $fetch, 0, $wk, $wk), 'overgeslagen (sleutel)', 'samengestelde sleutel overslaan');
 
 echo "OK\n";

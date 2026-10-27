@@ -92,10 +92,19 @@ function mimir_delta_reason(array $job): ?string
     if ((int) $job['top'] !== 0) {
         return 'top';
     }
-    foreach (array_keys($types) as $name) {
-        // FlowFilter-velden betekenen FlowFields; die veranderen zonder wijzigingsdatum.
-        if (preg_match('/_Filter$/', (string) $name) === 1) {
+    if (mimir_delta_has_flowfields($types)) {
+        // FlowFields veranderen zonder wijzigingsdatum: alleen met een whitelist van
+        // bevestigde Normal-velden, en alleen als alle gevraagde kolommen erop staan.
+        $normal = mimir_delta_normal_fields($job['entity']);
+        if ($normal === null) {
             return 'flowfields';
+        }
+        if (($job['select'] ?? []) === []) {
+            return 'flowfields (geen select)';
+        }
+        $needed = array_merge($job['select'], mimir_filter_fields($job['filter']), $job['keys']);
+        if (array_diff($needed, $normal) !== []) {
+            return 'flowfields (kolom niet op whitelist)';
         }
     }
     if (mimir_filter_has_flowfilter($job['filter']) || !mimir_filter_coverage_servable($job['filter'])) {
@@ -106,6 +115,68 @@ function mimir_delta_reason(array $job): ?string
     }
 
     return null;
+}
+
+/** @param array<string, string> $types */
+function mimir_delta_has_flowfields(array $types): bool
+{
+    foreach (array_keys($types) as $name) {
+        if (preg_match('/_Filter$/', (string) $name) === 1) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Bevestigde Normal-velden van een tabel (web/config/delta_normal_fields.php), of null.
+ *
+ * @return list<string>|null
+ */
+function mimir_delta_normal_fields(string $entity): ?array
+{
+    $config = $GLOBALS['mimir_delta_normal_fields'] ??= (array) (require __DIR__ . '/config/delta_normal_fields.php');
+    $fields = $config[$entity] ?? null;
+
+    return is_array($fields) && $fields !== [] ? array_values(array_map('strval', $fields)) : null;
+}
+
+/**
+ * $select voor delta/weekendblokken: bij een FlowField-tabel alleen whitelist-velden
+ * die bestaan, anders [] (alle kolommen).
+ *
+ * @param array<string, mixed> $job
+ * @return array<string, string>
+ */
+function mimir_delta_select_query(array $job): array
+{
+    if (!mimir_delta_has_flowfields($job['types'])) {
+        return [];
+    }
+    $fields = array_values(array_intersect((array) mimir_delta_normal_fields($job['entity']), array_keys($job['types'])));
+
+    return ['$select' => implode(',', array_unique(array_merge($job['keys'], $fields)))];
+}
+
+/**
+ * Upsert van delta-/blokrijen. Bij een FlowField-tabel vervangt de rij de oude
+ * (geen merge), zodat er geen oude FlowField-waarden met een nieuwe tijd blijven staan.
+ *
+ * @param array<string, mixed> $job
+ * @param list<array{0: string, 1: array<string, mixed>}> $batch
+ */
+function mimir_delta_store(PDO $pdo, array $job, array $batch, int $now): void
+{
+    if (mimir_delta_has_flowfields($job['types'])) {
+        // Ook als BC $select negeert: alleen whitelist-velden en sleutels bewaren.
+        $keep = array_flip(array_merge($job['keys'], (array) mimir_delta_normal_fields($job['entity'])));
+        foreach ($batch as $i => [$rowKey, $payload]) {
+            $batch[$i][1] = array_intersect_key($payload, $keep);
+            mimir_cache_delete($pdo, $job['environment'], $job['company'], $job['entity'], $rowKey);
+        }
+    }
+    mimir_cache_upsert_many($pdo, $job['environment'], $job['company'], $job['entity'], $batch, $now);
 }
 
 /** @param array<string, mixed> $job */
@@ -175,7 +246,7 @@ function mimir_delta_try(PDO $pdo, array $job, callable $fetch, int $now): ?arra
         // binnen die sinds de vorige fetch NIET meer aan het filter voldoen.
         $url = mimir_collection_url($job['prefix'], $job['company'], $job['entity'], [
             '$filter' => mimir_delta_filter($change, (int) $state['last_at']),
-        ]);
+        ] + mimir_delta_select_query($job));
         $pages = mimir_follow_pages($url, $job['prefix'], $fetch);
         if ($pages['truncated']) {
             throw new RuntimeException('delta onvolledig');
@@ -191,7 +262,7 @@ function mimir_delta_try(PDO $pdo, array $job, callable $fetch, int $now): ?arra
             $batch[] = [mimir_row_key($clean, $job['keys']), $clean];
         }
         unset($pages);
-        mimir_cache_upsert_many($pdo, $job['environment'], $job['company'], $job['entity'], $batch, $now);
+        mimir_delta_store($pdo, $job, $batch, $now);
         unset($state['_fetched_at']);
         $state['last_at'] = $now;
         mimir_meta_put($pdo, $key, $state, $now);
@@ -380,7 +451,7 @@ function mimir_rolling_refresh(PDO $pdo, array $job, callable $fetch, int $slot,
         if ($upper !== null) {
             $parts[] = $key . " lt '" . str_replace("'", "''", (string) $upper) . "'";
         }
-        $query = $parts === [] ? [] : ['$filter' => implode(' and ', $parts)];
+        $query = ($parts === [] ? [] : ['$filter' => implode(' and ', $parts)]) + mimir_delta_select_query($job);
         $pages = mimir_follow_pages(
             mimir_collection_url($job['prefix'], $job['company'], $job['entity'], $query),
             $job['prefix'],
@@ -392,7 +463,7 @@ function mimir_rolling_refresh(PDO $pdo, array $job, callable $fetch, int $slot,
                     $clean = mimir_strip_odata_noise($row);
                     $batch[] = [mimir_row_key($clean, $job['keys']), $clean];
                 }
-                mimir_cache_upsert_many($pdo, $job['environment'], $job['company'], $job['entity'], $batch, $now);
+                mimir_delta_store($pdo, $job, $batch, $now);
             }
         );
         if ($pages['truncated']) {
