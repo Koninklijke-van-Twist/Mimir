@@ -1190,3 +1190,22 @@ function mimir_filter_range_before(
     ];
     return mimir_filter_range_nonempty($gap, $type) ? $gap : null;
 }
+
+/**
+ * BC FlowFilter-velden (Date_Filter, Global_Dimension_1_Filter, ...): geen rijfilter,
+ * ze veranderen alleen FlowField-waarden. OData-metadata markeert ze niet; BC geeft
+ * ze als lege Edm.String terug. Herkenning op de naamconventie *_Filter.
+ */
+function mimir_filter_has_flowfilter(mixed $filter): bool
+{
+    if (is_string($filter)) {
+        return preg_match('/\b[A-Za-z][A-Za-z0-9_]*_Filter\b/', $filter) === 1;
+    }
+    foreach (mimir_filter_fields($filter) as $field) {
+        if (preg_match('/_Filter$/', $field) === 1) {
+            return true;
+        }
+    }
+
+    return false;
+}

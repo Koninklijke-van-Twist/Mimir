@@ -1319,7 +1319,12 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $metaPdo = ($job['meta_pdo'] ?? null) instanceof PDO ? $job['meta_pdo'] : null;
     $tunnelRoute = isset($job['route']) && is_string($job['route']) && $job['route'] !== '' ? $job['route'] : null;
     unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page'], $GLOBALS['mimir_tunnel_columns_learned'], $GLOBALS['mimir_tunnel_key_by']);
-    $stayOnOdata = false;
+    $flowFilter = mimir_filter_has_flowfilter($filter);
+    if ($flowFilter && $tunnelRoute === 'tunnel') {
+        throw new MimirUserException('FlowFilter-velden (*_Filter) gaan niet via de tunnel; gebruik OData.');
+    }
+    // FlowFilter: altijd OData (tunnel kan het filter niet bewijzen).
+    $stayOnOdata = $flowFilter;
     $fetch = static function (string $url) use (
         $innerFetch,
         $environment,
@@ -1407,6 +1412,53 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     };
 
     try {
+    if ($flowFilter) {
+        // FlowFilter verandert FlowField-waarden per filter: geen rijcache/dekking
+        // (waarden per sleutel zouden elkaar overschrijven) en geen lokale hercontrole
+        // (het *_Filter-veld is in de rij leeg). Altijd live, BC filtert.
+        if ($mode !== 'bc' || $pushed === null) {
+            throw new MimirUserException('Een filter met FlowFilter-velden (*_Filter) moet volledig naar BC kunnen.');
+        }
+        $query = ['$filter' => $pushed];
+        if ($top > 0) {
+            $query['$top'] = $top;
+        }
+        if ($select !== []) {
+            $columns = array_values(array_unique(array_merge($select, $keys)));
+            sort($columns, SORT_STRING);
+            $query['$select'] = implode(',', $columns);
+        }
+        $pages = mimir_follow_pages(mimir_collection_url($prefix, $company, $entity, $query), $prefix, $fetch, $top);
+        $value = [];
+        foreach ($pages['rows'] as $payload) {
+            $value[] = mimir_project_row(mimir_strip_odata_noise($payload), $select);
+        }
+        if ($top > 0 && count($value) > $top) {
+            $value = array_slice($value, 0, $top);
+        }
+
+        return [
+            'value' => $value,
+            'meta' => [
+                'environment' => $environment,
+                'from_cache' => 0,
+                'from_live' => count($value),
+                'shared' => 0,
+                'bc_hit' => 1,
+                'max_age' => $maxAge,
+                'fetched_at_min' => $value === [] ? null : $now,
+                'fetched_at_max' => $value === [] ? null : $now,
+                'bc_filter' => $pushed,
+                'filter_mode' => 'bc',
+                'filter_note' => mimir_filter_note('bc'),
+                'flowfilter' => 1,
+                'route' => 'odata',
+                'queue_wait_ms' => $queueWaitMs,
+                'bc_slots_max' => mimir_bc_limit_max_concurrent(),
+                'bc_slots_used' => $slotHeld ? mimir_bc_slots_used($environment) : 0,
+            ],
+        ];
+    }
     $coverage = mimir_coverage_find(
         $pdo,
         $environment,
