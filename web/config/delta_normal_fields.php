@@ -3,15 +3,134 @@
 /**
  * Per tabel (OData-servicenaam) de bevestigde Normal-velden (geen FlowField).
  *
- * Alleen voor tabellen MET FlowFields (*_Filter-velden in de metadata): delta en
- * weekendverversing mogen daar alleen als elke gevraagde kolom (select, filter-
- * velden en sleutels) hier staat. Geen select (= alle kolommen), een kolom die
- * hier niet staat of een tabel die hier niet staat -> volledige fetch.
+ * Een tabel die hier staat, of die *_Filter-velden heeft, geldt als tabel met FlowFields.
+ * Delta en weekendverversing mogen daar alleen als elke gevraagde kolom (select,
+ * filtervelden en sleutels) hieronder staat. Geen select, een kolom die er niet staat
+ * of een tabel met een lege lijst -> volledige fetch.
  *
- * Alleen velden opnemen die in BC als FieldClass = Normal zijn bevestigd.
+ * Bron: Ariadne, veldklassen (fieldclass.json, BC-tabelmetadata, gecontroleerd voor KVT;
+ * gelijk over bedrijven), 27-10-2026. Opgenomen: alleen class Normal met verified=true
+ * EN waarvan de OData-naam in de live Mímir-metadata (kvtmdlive_aad) bestaat.
+ * Uitgesloten: FlowField, FlowFilter, Unknown, verified=false (o.a. AppItems
+ * LVS_Vendor_Name = FlowField).
+ *
+ * workflowItems/-Customers/-Vendors: de OData-namen (camelCase, API-stijl) wijken af van
+ * Ariadnes afgeleide namen en zijn niet bevestigd. Lege lijst = altijd volledig.
  */
 
 return [
-    // Voorbeeld, nog NIET bevestigd (lijst volgt van Ariadne):
-    // 'AppItems' => ['No', 'Description', 'Blocked', 'Last_Date_Modified'],
+    'AppItems' => [
+        'No',
+        'Description',
+        'Description_2',
+        'No_2',
+        'Type',
+        'Production_BOM_No',
+        'Routing_No',
+        'Base_Unit_of_Measure',
+        'Cost_is_Adjusted',
+        'Unit_Cost',
+        'Unit_Price',
+        'Vendor_No',
+        'LVS_Manufacturer_Item_No',
+        'LVS_Manufacturer_Model',
+        'LVS_Job_Item',
+        'LVS_Sales_Deposit_Group',
+        'LVS_Purch_Deposit_Group',
+        'LVS_Maintenance_Task_Item',
+        'LVS_Document_Status',
+        'KVT_Standard_Sales_Item',
+        'Safety_Stock_Quantity',
+        'Blocked',
+    ],
+    'AppProjecten' => [
+        'No',
+        'Description',
+        'Bill_to_Customer_No',
+        'Status',
+        'LVS_Document_Status',
+        'LVS_Doc_Status_Last_Date_Mod',
+        'Job_Posting_Group',
+        'LVS_Date_of_Arrival',
+        'LVS_Date_of_Departure',
+        'LVS_Port',
+        'LVS_Agent',
+        'LVS_Phone_No_on_Site',
+        'Search_Description',
+        'LVS_Created_By',
+        'KVT_Contract_No',
+        'KVT_Maintenance_Workorder_No',
+        'KVT_Task_Code',
+        'KVT_Remark_Finance',
+        'KVT_Order_Type',
+    ],
+    'Projecten' => [
+        'No',
+        'Description',
+        'Search_Description',
+        'External_Document_No',
+        'Your_Reference',
+        'Person_Responsible',
+        'KVT_Sales_Person_Code',
+        'Blocked',
+        'Last_Date_Modified',
+        'Project_Manager',
+        'NETVJS_Color',
+        'LVS_Document_Status',
+        'LVS_Doc_Status_Last_Date_Mod',
+        'LVS_Job_Baseline_Versn_Filter',
+        'KVT_EAC_Version_Filter',
+        'LVS_Product_Menu_No',
+        'LVS_Product_Menu_Version_No',
+        'LVS_Aut_Send_Job_Deliv_Reprt',
+        'LVS_Certificates_Required',
+        'LVS_Documents_Required',
+        'KVT_Contract_No',
+        'KVT_Maintenance_Workorder_No',
+        'KVT_Task_Code',
+        'KVT_Invoice_Process_Type',
+        'KVT_Reason_Code',
+        'KVT_Template_Job',
+        'KVT_Remark_Finance',
+        'KVT_Memo_Invoice_Text',
+        'KVT_Order_Type',
+        'LVS_Job_Line_Type',
+        'Status',
+        'Job_Posting_Group',
+        'Location_Code',
+        'Bin_Code',
+        'WIP_Method',
+        'WIP_Posting_Method',
+        'Allow_Schedule_Contract_Lines',
+        'Apply_Usage_Link',
+        'LVS_Job_Location',
+        'LVS_Default_Transfer_from',
+        'LVS_Job_Reporting_Group',
+        'Task_Billing_Method',
+        'LVS_Agent',
+        'LVS_Port',
+        'Payment_Terms_Code',
+        'Payment_Method_Code',
+        'Starting_Date',
+        'Ending_Date',
+        'LVS_Date_of_Arrival',
+        'LVS_Time_of_Arrival',
+        'LVS_Time_Docked_On_Slipway',
+        'LVS_Time_Undocked_Of_Slipway',
+        'LVS_Date_of_Departure',
+        'LVS_Time_of_Departure',
+        'Creation_Date',
+        'LVS_Created_By',
+        'Currency_Code',
+        'Invoice_Currency_Code',
+        'Price_Calculation_Method',
+        'Cost_Calculation_Method',
+        'Exch_Calculation_Cost',
+        'Exch_Calculation_Price',
+        'LVS_Unit_Customs_Value_Calcltn',
+        'WIP_Posting_Date',
+    ],
+    'workflowItems' => [],
+    'workflowCustomers' => [],
+    'workflowVendors' => [],
 ];

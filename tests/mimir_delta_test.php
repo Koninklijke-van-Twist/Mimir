@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 require_once dirname(__DIR__) . '/web/mimir_store.php';
+$GLOBALS['mimir_delta_normal_fields'] = []; // tests los van de echte config
 
 function dt_same(mixed $actual, mixed $expected, string $message): void
 {
@@ -45,7 +46,11 @@ dt_same(mimir_delta_reason(['select' => ['No', 'Inventory']] + $ff), 'flowfields
 dt_same(mimir_delta_reason(['select' => ['No'], 'filter' => ['field' => 'Inventory', 'op' => 'gt', 'value' => 0]] + $ff), 'flowfields (kolom niet op whitelist)', 'filterveld niet op whitelist');
 dt_same(mimir_delta_reason(['select' => []] + $ff), 'flowfields (geen select)', 'geen select -> volledig');
 dt_same(mimir_delta_reason(['select' => ['No'], 'entity' => 'Andere'] + $ff), 'flowfields', 'tabel zonder whitelist -> volledig');
+$GLOBALS['mimir_delta_normal_fields'] = ['AppItems' => ['No', 'Description', 'Blocked', 'Last_Date_Modified'], 'Leeg' => []];
+dt_same(mimir_delta_reason(['select' => ['No'], 'entity' => 'Leeg'] + $base), 'flowfields', 'in config met lege lijst -> volledig, ook zonder *_Filter');
+dt_same(mimir_delta_reason(['select' => ['No', 'Inventory'], 'entity' => 'AppItems'] + $base), 'flowfields (kolom niet op whitelist)', 'in config zonder *_Filter telt als FlowField-tabel');
 dt_same(mimir_delta_select_query($ff), ['$select' => 'No,Description,Last_Date_Modified'], 'delta haalt alleen whitelist-velden');
+$GLOBALS['mimir_delta_normal_fields'] = [];
 
 // End-to-end: volledig, dan delta + merge op sleutel, dan dagelijkse volledige verversing.
 $now = 1_800_000_000;
@@ -167,6 +172,7 @@ for ($t = 1; $t < 10; $t++) {
 dt_same(mimir_meta_get_raw($rp, 'delta:KVT|AppItems|abc')['full_at'], $wk, 'na laatste blok telt ronde als volledige fetch');
 dt_same(count(mimir_cache_all($rp, 'env', 'KVT', 'AppItems')), 1000, 'alle rijen ververst');
 // FlowField-tabel met whitelist: delta werkt end-to-end en de cache houdt geen oude FlowField-waarde.
+$GLOBALS['mimir_delta_normal_fields'] = ['AppItems' => ['No', 'Description', 'Blocked', 'Last_Date_Modified']];
 $fp = mimir_db(':memory:');
 $bc = ['1' => ['No' => '1', 'Description' => 'A', 'Blocked' => false, 'Last_Date_Modified' => '2026-01-01', 'Inventory' => 5, 'Date_Filter' => '']];
 $fjob = $job;

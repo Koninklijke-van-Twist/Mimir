@@ -92,11 +92,11 @@ function mimir_delta_reason(array $job): ?string
     if ((int) $job['top'] !== 0) {
         return 'top';
     }
-    if (mimir_delta_has_flowfields($types)) {
+    if (mimir_delta_has_flowfields($types, (string) ($job['entity'] ?? ''))) {
         // FlowFields veranderen zonder wijzigingsdatum: alleen met een whitelist van
         // bevestigde Normal-velden, en alleen als alle gevraagde kolommen erop staan.
         $normal = mimir_delta_normal_fields($job['entity']);
-        if ($normal === null) {
+        if ($normal === null || $normal === []) {
             return 'flowfields';
         }
         if (($job['select'] ?? []) === []) {
@@ -118,8 +118,12 @@ function mimir_delta_reason(array $job): ?string
 }
 
 /** @param array<string, string> $types */
-function mimir_delta_has_flowfields(array $types): bool
+function mimir_delta_has_flowfields(array $types, string $entity = ''): bool
 {
+    // In de config genoemd = bekend met FlowFields (ook zonder *_Filter-velden).
+    if ($entity !== '' && mimir_delta_normal_fields($entity) !== null) {
+        return true;
+    }
     foreach (array_keys($types) as $name) {
         if (preg_match('/_Filter$/', (string) $name) === 1) {
             return true;
@@ -139,7 +143,7 @@ function mimir_delta_normal_fields(string $entity): ?array
     $config = $GLOBALS['mimir_delta_normal_fields'] ??= (array) (require __DIR__ . '/config/delta_normal_fields.php');
     $fields = $config[$entity] ?? null;
 
-    return is_array($fields) && $fields !== [] ? array_values(array_map('strval', $fields)) : null;
+    return is_array($fields) ? array_values(array_map('strval', $fields)) : null;
 }
 
 /**
@@ -151,7 +155,7 @@ function mimir_delta_normal_fields(string $entity): ?array
  */
 function mimir_delta_select_query(array $job): array
 {
-    if (!mimir_delta_has_flowfields($job['types'])) {
+    if (!mimir_delta_has_flowfields($job['types'], $job['entity'])) {
         return [];
     }
     $fields = array_values(array_intersect((array) mimir_delta_normal_fields($job['entity']), array_keys($job['types'])));
@@ -172,7 +176,7 @@ function mimir_delta_store(PDO $pdo, array $job, array $batch, int $now): void
     // $select negeert alleen whitelist-velden en sleutels bewaren.
     $kept = mimir_cache_kept_columns($job['entity']);
     $select = [];
-    if (mimir_delta_has_flowfields($job['types'])) {
+    if (mimir_delta_has_flowfields($job['types'], $job['entity'])) {
         $select = array_merge($job['keys'], $kept);
         foreach ($batch as $i => [$rowKey, $payload]) {
             $batch[$i][1] = array_intersect_key($payload, array_flip($select));
