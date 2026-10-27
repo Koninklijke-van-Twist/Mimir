@@ -365,6 +365,7 @@ php tests/mimir_auth_env_test.php
 php tests/mimir_sqlite_test.php
 php tests/mimir_reliability_test.php
 php tests/mimir_metadata_test.php
+php tests/mimir_delta_test.php
 php tests/mimir_write_test.php
 php tests/mimir_write_resilience_test.php
 php tests/mimir_migrate_test.php

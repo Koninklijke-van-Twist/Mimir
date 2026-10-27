@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/mimir_reliability.php';
 require_once __DIR__ . '/mimir_filter.php';
+require_once __DIR__ . '/mimir_delta.php';
 require_once __DIR__ . '/odata.php';
 require_once __DIR__ . '/mimir_heatmap.php';
 require_once __DIR__ . '/mimir_bc_limit.php';
@@ -1474,6 +1475,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $fromCache = 0;
     $fromLive = 0;
     $kept = [];
+    $deltaMode = null;
     $usedCoverage = false;
     $gapFilled = false;
     $gapSharedKeyId = null;
@@ -1593,7 +1595,24 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                 $kept = array_slice($kept, 0, $top);
             }
             $fromLive = count($kept);
+        } elseif (($delta = mimir_delta_try($pdo, $deltaJob = [
+            'environment' => $environment, 'company' => $company, 'entity' => $entity, 'prefix' => $prefix,
+            'filter' => $filter, 'types' => $types, 'keys' => $keys, 'required' => $required,
+            'pushed' => $pushed, 'top' => $top, 'route' => $tunnelRoute,
+        ], static function (string $url) use ($fetch, &$stayOnOdata): array {
+            $stayOnOdata = true;
+
+            return $fetch($url);
+        }, $now)) !== null) {
+            $kept = $delta['rows'];
+            $fromLive = $delta['from_live'];
+            $fromCache = count($kept) - $fromLive;
+            $deltaMode = 'delta';
         } else {
+            if ($fetchSelect !== [] && mimir_delta_reason($deltaJob) === null) {
+                // Filtervelden mee in de cache, zodat een latere delta het filter lokaal kan herhalen.
+                $fetchSelect = array_values(array_unique(array_merge($fetchSelect, $required)));
+            }
             $live = mimir_fetch_collection(
                 $pdo,
                 $environment,
@@ -1614,6 +1633,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
             );
             $mode = $live['mode'];
             $pushed = $live['pushed'];
+            $deltaMode = mimir_delta_record_full($pdo, $deltaJob, $live, $fetchSelect, $now);
             foreach ($live['rows'] as $row) {
                 if (!mimir_filter_match($row['payload'], $filter, $types)) {
                     continue;
@@ -1673,6 +1693,9 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         'filter_mode' => $mode,
         'filter_note' => mimir_filter_note($mode),
     ];
+    if ($deltaMode !== null) {
+        $meta['delta_mode'] = $deltaMode;
+    }
     if ($gapFilled) {
         $meta['gap_fill'] = 1;
     }
