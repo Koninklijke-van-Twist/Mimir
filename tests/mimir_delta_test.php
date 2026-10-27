@@ -49,6 +49,22 @@ $calls = [];
 $fetch = static function (string $url) use (&$calls, &$bc): array {
     $decoded = urldecode($url);
     $calls[] = $decoded;
+    if (str_contains($decoded, '$count=true')) {
+        if ($GLOBALS['dt_count_unknown'] ?? false) {
+            return ['value' => []];
+        }
+        $n = 0;
+        foreach ($bc as $r) {
+            $n += str_contains($decoded, 'Blocked eq false') ? (int) !$r['Blocked'] : 1;
+        }
+        return ['@odata.count' => $n, 'value' => []];
+    }
+    if (str_contains($decoded, '$select=No') && !str_contains($decoded, '$filter')) {
+        return ['value' => array_map(static fn ($r) => ['No' => $r['No']], array_values($bc))];
+    }
+    if (preg_match("/No ge '(\\d+)'/", $decoded, $m) === 1) {
+        return ['value' => array_values(array_filter($bc, static fn ($r) => $r['No'] >= $m[1]))];
+    }
     if (str_contains($decoded, 'Last_Date_Modified ge')) {
         return ['value' => array_values(array_filter($bc, static fn ($r) => $r['Last_Date_Modified'] === 'NIEUW'))];
     }
@@ -69,7 +85,8 @@ $bc['2']['Blocked'] = true;              // valt nu buiten het filter
 $bc['2']['Last_Date_Modified'] = 'NIEUW';
 $b = mimir_query_entity($pdo, $job, $fetch, $now + 3600);
 dt_same($b['meta']['delta_mode'], 'delta', 'tweede keer delta');
-dt_same(str_contains(end($calls), 'Blocked'), false, 'delta-filter alleen op wijzigingsveld');
+$deltaCalls = array_values(array_filter($calls, static fn ($u) => str_contains($u, 'Last_Date_Modified ge')));
+dt_same(str_contains(end($deltaCalls), 'Blocked'), false, 'delta-filter alleen op wijzigingsveld');
 $desc = array_column($b['value'], 'Description', 'No');
 ksort($desc);
 dt_same($desc, ['1' => 'Nieuw', '3' => 'Drie'], 'merge op sleutel + filter lokaal opnieuw');
@@ -84,11 +101,29 @@ $failing = static function (string $url) use ($fetch): array {
 $c = mimir_query_entity($pdo, $job, $failing, $now + 7200);
 dt_same($c['meta']['delta_mode'], 'full', 'fout in delta -> volledig');
 
-// Verwijderd in BC: pas zichtbaar na de dagelijkse volledige verversing.
+// Verwijderd in BC: count-controle ziet het verschil, sleutelcontrole wist de rij (geen volledige fetch).
 unset($bc['3']);
-$d = mimir_query_entity($pdo, $job, $fetch, $now + 7200 + MIMIR_DELTA_FULL_REFRESH);
-dt_same($d['meta']['delta_mode'], 'full', 'periodiek volledig');
-dt_same(array_column($d['value'], 'No'), ['1'], 'verwijderde rij weg na volledige fetch');
+$d = mimir_query_entity($pdo, $job, $fetch, $now + 9000);
+dt_same($d['meta']['delta_mode'], 'delta', 'verwijdering via sleutelcontrole, nog steeds delta');
+dt_same(array_column($d['value'], 'No'), ['1'], 'verwijderde rij weg');
+dt_same(count(array_filter($calls, static fn ($u) => str_contains($u, '$select=No') && !str_contains($u, '$filter'))), 1, 'sleutels één keer opgehaald');
+
+// Count onbekend -> sleutelcontrole; klopt het daarna, dan delta.
+$GLOBALS['dt_count_unknown'] = true;
+$bc['4'] = ['No' => '4', 'Description' => 'Vier', 'Blocked' => false, 'Last_Date_Modified' => 'NIEUW'];
+$g = mimir_query_entity($pdo, $job, $fetch, $now + 9500);
+dt_same($g['meta']['delta_mode'], 'full', 'count onbekend blijft onbewezen -> volledig');
+$GLOBALS['dt_count_unknown'] = false;
+
+// Gesorteerd op sleutel.
+$bc['0'] = ['No' => '0', 'Description' => 'Nul', 'Blocked' => false, 'Last_Date_Modified' => 'NIEUW'];
+$h = mimir_query_entity($pdo, $job, $fetch, $now + 9800);
+dt_same($h['meta']['delta_mode'], 'delta', 'delta na nieuwe rij');
+dt_same(array_column($h['value'], 'No'), ['0', '1', '4'], 'gesorteerd op sleutel');
+
+// Vangnet: na MIMIR_DELTA_FULL_REFRESH toch volledig.
+$i = mimir_query_entity($pdo, $job, $fetch, $now + 9800 + MIMIR_DELTA_FULL_REFRESH);
+dt_same($i['meta']['delta_mode'], 'full', 'vangnet volledig');
 
 // Na invalidatie (write) geen delta op lege cache.
 mimir_cache_invalidate_rows($pdo, 'env', 'KVT', 'AppItems');
@@ -98,5 +133,29 @@ dt_same($e['meta']['delta_mode'], 'full', 'na invalidatie volledig');
 // top > 0 -> nooit delta.
 $f = mimir_query_entity($pdo, ['top' => 10] + $job, $fetch, $now + 9000 + MIMIR_DELTA_FULL_REFRESH);
 dt_same(str_starts_with((string) ($f['meta']['delta_mode'] ?? 'full (top)'), 'full'), true, 'top -> volledig');
+
+// Weekendverversing in blokken.
+$rp = mimir_db(':memory:');
+$big = [];
+for ($n = 100; $n < 1100; $n++) {
+    $big[(string) $n] = ['No' => (string) $n, 'Description' => 'x', 'Blocked' => false, 'Last_Date_Modified' => '2026-01-01'];
+}
+$bc = $big;
+$calls = [];
+$rjob = ['environment' => 'env', 'company' => 'KVT', 'entity' => 'AppItems', 'prefix' => 'https://bc.test/ODataV4/', 'keys' => ['No'], 'types' => $job['schema']['properties']];
+mimir_meta_put($rp, 'delta:KVT|AppItems|abc', ['full_at' => 1, 'last_at' => 1, 'filter_sig' => '', 'select_sig' => '*'], $now);
+mimir_cache_upsert($rp, 'env', 'KVT', 'AppItems', 'No="weg"', ['No' => 'weg'], 1);
+$wk = $now;
+dt_same(mimir_rolling_refresh($rp, $rjob, $fetch, 0, $wk, $wk), 'blok 0 van 47', 'slot 0');
+dt_same(mimir_cache_all($rp, 'env', 'KVT', 'AppItems') !== [] && !in_array('weg', array_column(array_column(mimir_cache_all($rp, 'env', 'KVT', 'AppItems'), 'payload'), 'No'), true), true, 'verdwenen sleutel gewist');
+dt_same(str_contains(end($calls), "No lt '"), true, 'blok 0 alleen bovengrens');
+dt_same(mimir_rolling_refresh($rp, $rjob, $fetch, 0, $wk, $wk + 60), 'blok 0 van 47', 'zelfde slot nog eens: niets');
+dt_same(mimir_rolling_refresh($rp, $rjob, $fetch, 10, $wk, $wk + 36000), 'blok 6 van 47', 'inhalen max 6 per run');
+for ($t = 1; $t < 10; $t++) {
+    mimir_rolling_refresh($rp, $rjob, $fetch, 47, $wk, $wk + 40000 + $t);
+}
+dt_same(mimir_meta_get_raw($rp, 'delta:KVT|AppItems|abc')['full_at'], $wk, 'na laatste blok telt ronde als volledige fetch');
+dt_same(count(mimir_cache_all($rp, 'env', 'KVT', 'AppItems')), 1000, 'alle rijen ververst');
+dt_same(mimir_rolling_refresh($rp, ['keys' => ['A', 'B']] + $rjob, $fetch, 0, $wk, $wk), 'overgeslagen (sleutel)', 'samengestelde sleutel overslaan');
 
 echo "OK\n";
