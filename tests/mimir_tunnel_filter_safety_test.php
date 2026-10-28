@@ -39,6 +39,8 @@ mimir_tfs_same(mimir_tunnel_odata_to_filters("Contract_No gt ''", $plain), null,
 mimir_tfs_same(mimir_tunnel_odata_to_filters("Contract_No eq ''", $plain), null, "eq '' is not a tunnel filter");
 mimir_tfs_same(mimir_tunnel_odata_to_filters("Contract_No eq 'x'", $plain), ['Contract No.=x'], 'eq x still works');
 mimir_tfs_same(mimir_tunnel_odata_to_filters("Contract_No eq 'A*'", $plain), null, 'wildcard inside a value is not passed on');
+$manyOr = implode(' or ', array_map(static fn (int $i): string => "Contract_No eq 'C" . $i . "'", range(1, 20)));
+mimir_tfs_same(mimir_tunnel_odata_to_filters($manyOr, $plain), ['Contract No.=' . implode('|', array_map(static fn (int $i): string => 'C' . $i, range(1, 20)))], 'many OR values still go via the tunnel (no forced OData)');
 mimir_tfs_same(mimir_tunnel_odata_to_filters("Contract_No eq 'A..B'", $plain), null, 'range inside a value is not passed on');
 mimir_tfs_same(mimir_tunnel_filters_for(['kind' => 'list', 'filter' => "Contract_No ne ''", 'predicate' => null, 'top' => 5], []), null, 'syntax check without entry');
 
