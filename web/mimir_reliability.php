@@ -1497,13 +1497,19 @@ function mimir_metadata_snapshot_read(string $environment, int $ttl): ?array
  */
 function mimir_csrf_token(): string
 {
+    // Kort heropenen om het token te bewaren en daarna direct sluiten, zodat de
+    // rest van de pagina het sessielock niet vasthoudt.
+    $opened = false;
     if (session_status() !== PHP_SESSION_ACTIVE && !headers_sent() && PHP_SAPI !== 'cli') {
-        session_start();
+        $opened = session_start();
     }
     $token = $_SESSION['mimir_csrf'] ?? '';
     if (!is_string($token) || strlen($token) < 32) {
         $token = bin2hex(random_bytes(32));
         $_SESSION['mimir_csrf'] = $token;
+    }
+    if ($opened) {
+        session_write_close();
     }
 
     return $token;
