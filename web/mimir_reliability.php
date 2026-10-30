@@ -1653,7 +1653,8 @@ function mimir_event_display_time(string $ts): string
  *
  * @return array{rows: list<array<string, mixed>>, total: int, page: int, pages: int}
  */
-function mimir_event_log_day(string $day, int $page = 1, int $perPage = 500): array
+/** @param list<string>|null $statuses null = alle statussen */
+function mimir_event_log_day(string $day, int $page = 1, int $perPage = 500, ?array $statuses = null): array
 {
     $lines = [];
     $file = mimir_event_log_path($day);
@@ -1673,13 +1674,61 @@ function mimir_event_log_day(string $day, int $page = 1, int $perPage = 500): ar
         }
     }
     $lines = array_merge($legacy, $lines);
-    $total = count($lines);
+    // Server-side statusfilter: tellen per status over de hele dag, daarna pas pagineren.
+    $rows = array_reverse(mimir_event_rows($lines));
+    $counts = array_fill_keys(MIMIR_EVENT_STATUS_KEYS, 0);
+    $kept = [];
+    foreach ($rows as $row) {
+        $key = mimir_event_status_key(mimir_event_status($row));
+        $counts[$key] = ($counts[$key] ?? 0) + 1;
+        if ($statuses === null || in_array($key, $statuses, true)) {
+            $kept[] = $row;
+        }
+    }
+    $total = count($kept);
     $perPage = max(1, $perPage);
     $pages = max(1, (int) ceil($total / $perPage));
     $page = min(max(1, $page), $pages);
-    $slice = array_slice(array_reverse($lines), ($page - 1) * $perPage, $perPage);
 
-    return ['rows' => mimir_event_rows($slice), 'total' => $total, 'page' => $page, 'pages' => $pages];
+    return ['rows' => array_slice($kept, ($page - 1) * $perPage, $perPage), 'total' => $total, 'all' => count($rows), 'counts' => $counts, 'page' => $page, 'pages' => $pages];
+}
+
+const MIMIR_EVENT_STATUS_KEYS = ['check-green', 'crate-green', 'question-red', 'cross-red', 'cross-orange', 'recycle-green', 'recycle-orange', 'recycle-red', 'info-blue'];
+
+/** @param array{icon: string, color: string} $status */
+function mimir_event_status_key(array $status): string
+{
+    return $status['icon'] . '-' . $status['color'];
+}
+
+/**
+ * Leest ?events_status=a,b; ontbreekt de parameter, dan null (alles aan). Onbekende waarden vallen weg.
+ *
+ * @return list<string>|null
+ */
+function mimir_event_status_filter(?string $raw): ?array
+{
+    if ($raw === null) {
+        return null;
+    }
+
+    return array_values(array_intersect(MIMIR_EVENT_STATUS_KEYS, explode(',', $raw)));
+}
+
+/** Tooltiptekst per statusfilter. */
+function mimir_event_status_label(string $key): string
+{
+    return [
+        'check-green' => 'Geslaagd',
+        'crate-green' => 'Volledig uit cache',
+        'question-red' => 'Bestaat niet (tabel/webservice/kolom)',
+        'cross-red' => 'Mislukt',
+        'cross-orange' => 'Mislukt, retry/fallback volgt of volgde',
+        'recycle-green' => 'Retry geslaagd',
+        'recycle-orange' => 'Retry mislukt, er komt nog een retry',
+        'recycle-red' => 'Retry mislukt, gestopt',
+        'info-blue' => 'Statusbericht',
+    ][$key] ?? $key;
 }
 
 /** Goedkope logregel voor een verzoek dat volledig uit cache kwam; faalt nooit. */

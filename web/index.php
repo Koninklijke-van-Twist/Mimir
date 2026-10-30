@@ -16,7 +16,9 @@ $mimirEventDay = (string) ($_GET['events_day'] ?? '');
 if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $mimirEventDay) !== 1) {
     $mimirEventDay = mimir_event_today();
 }
-$mimirEventPage = mimir_event_log_day($mimirEventDay, (int) ($_GET['events_page'] ?? 1));
+$mimirEventStatuses = mimir_event_status_filter(isset($_GET['events_status']) ? (string) $_GET['events_status'] : null);
+$mimirEventPage = mimir_event_log_day($mimirEventDay, (int) ($_GET['events_page'] ?? 1), 500, $mimirEventStatuses);
+$mimirEventQs = $mimirEventStatuses === null ? '' : '&amp;events_status=' . mimir_event_escape(implode(',', $mimirEventStatuses));
 $mimirEvents = $mimirEventPage['rows']; // al nieuwste eerst; mimir_event_log_recent blijft voor tests
 $mimirEventDate = new DateTimeImmutable($mimirEventDay, new DateTimeZone('Europe/Amsterdam'));
 $mimirEventPrev = $mimirEventDate->modify('-1 day')->format('Y-m-d');
@@ -183,12 +185,19 @@ function mimir_h(string $value): string
                 <p class="row-actions"><button type="button" id="tunnel-cache-clear">Tunnel-koppelcache legen</button></p>
                 <p id="tunnel-cache-status" class="status" role="status"></p>
                 <form class="row-actions event-day-nav" method="get" action="#reliability">
-                    <a href="?events_day=<?= mimir_event_escape($mimirEventPrev) ?>#reliability">&larr; Vorige dag</a>
+                    <a href="?events_day=<?= mimir_event_escape($mimirEventPrev) ?><?= $mimirEventQs ?>#reliability">&larr; Vorige dag</a>
                     <input type="date" name="events_day" value="<?= mimir_event_escape($mimirEventDay) ?>" max="<?= mimir_event_escape(mimir_event_today()) ?>" onchange="this.form.submit()">
-                    <?php if (!$mimirEventIsToday): ?><a href="?events_day=<?= mimir_event_escape($mimirEventNext) ?>#reliability">Volgende dag &rarr;</a><?php endif; ?>
-                    <span><?= mimir_event_escape($mimirEventDate->format('j M Y')) ?>: <?= (int) $mimirEventPage['total'] ?> regels<?php if ($mimirEventPage['pages'] > 1): ?>, pagina <?= (int) $mimirEventPage['page'] ?>/<?= (int) $mimirEventPage['pages'] ?><?php endif; ?></span>
-                    <?php if ($mimirEventPage['page'] > 1): ?><a href="?events_day=<?= mimir_event_escape($mimirEventDay) ?>&amp;events_page=<?= (int) $mimirEventPage['page'] - 1 ?>#reliability">Nieuwer</a><?php endif; ?>
-                    <?php if ($mimirEventPage['page'] < $mimirEventPage['pages']): ?><a href="?events_day=<?= mimir_event_escape($mimirEventDay) ?>&amp;events_page=<?= (int) $mimirEventPage['page'] + 1 ?>#reliability">Ouder</a><?php endif; ?>
+                    <?php if ($mimirEventStatuses !== null): ?><input type="hidden" name="events_status" value="<?= mimir_event_escape(implode(',', $mimirEventStatuses)) ?>"><?php endif; ?>
+                    <?php if (!$mimirEventIsToday): ?><a href="?events_day=<?= mimir_event_escape($mimirEventNext) ?><?= $mimirEventQs ?>#reliability">Volgende dag &rarr;</a><?php endif; ?>
+                    <span><?= mimir_event_escape($mimirEventDate->format('j M Y')) ?>: <?= (int) $mimirEventPage['total'] ?><?php if ($mimirEventStatuses !== null): ?> van <?= (int) $mimirEventPage['all'] ?><?php endif; ?> regels<?php if ($mimirEventPage['pages'] > 1): ?>, pagina <?= (int) $mimirEventPage['page'] ?>/<?= (int) $mimirEventPage['pages'] ?><?php endif; ?></span>
+                    <?php if ($mimirEventPage['page'] > 1): ?><a href="?events_day=<?= mimir_event_escape($mimirEventDay) ?>&amp;events_page=<?= (int) $mimirEventPage['page'] - 1 ?><?= $mimirEventQs ?>#reliability">Nieuwer</a><?php endif; ?>
+                    <?php if ($mimirEventPage['page'] < $mimirEventPage['pages']): ?><a href="?events_day=<?= mimir_event_escape($mimirEventDay) ?>&amp;events_page=<?= (int) $mimirEventPage['page'] + 1 ?><?= $mimirEventQs ?>#reliability">Ouder</a><?php endif; ?>
+                    <span class="event-filters" role="group" aria-label="Statusfilter (klik: aan/uit, dubbelklik: alleen deze)">
+                        <?php foreach (MIMIR_EVENT_STATUS_KEYS as $mimirKey): ?>
+                            <?php [$mimirIcon, $mimirColor] = explode('-', $mimirKey); $mimirOn = $mimirEventStatuses === null || in_array($mimirKey, $mimirEventStatuses, true); $mimirTip = mimir_event_status_label($mimirKey) . ' (' . (int) ($mimirEventPage['counts'][$mimirKey] ?? 0) . ')'; ?>
+                            <button type="button" class="event-filter" data-status="<?= mimir_event_escape($mimirKey) ?>" aria-pressed="<?= $mimirOn ? 'true' : 'false' ?>" title="<?= mimir_event_escape($mimirTip) ?>"><?= mimir_event_icon_svg(['icon' => $mimirIcon, 'color' => $mimirColor, 'title' => $mimirTip]) ?></button>
+                        <?php endforeach; ?>
+                    </span>
                 </form>
             </div>
             <div class="table-wrap">

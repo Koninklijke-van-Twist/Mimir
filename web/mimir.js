@@ -909,3 +909,36 @@
 
     if (location.hash === '#metadata') showTab('metadata', false);
 })();
+
+// Statusfilter gebeurtenissen: klik = aan/uit, dubbelklik = alleen deze. Server-side via ?events_status.
+(function () {
+    var buttons = Array.prototype.slice.call(document.querySelectorAll('.event-filter'));
+    if (buttons.length === 0) return;
+    var timer = null;
+    function go(active) {
+        var url = new URL(location.href);
+        url.searchParams.delete('events_page');
+        if (active.length === buttons.length) url.searchParams.delete('events_status');
+        else url.searchParams.set('events_status', active.join(','));
+        url.hash = 'reliability';
+        location.href = url.toString();
+    }
+    function current() {
+        return buttons.filter(function (b) { return b.getAttribute('aria-pressed') === 'true'; }).map(function (b) { return b.dataset.status; });
+    }
+    buttons.forEach(function (button) {
+        button.addEventListener('click', function (event) {
+            if (event.detail > 1) return; // tweede klik van een dubbelklik
+            clearTimeout(timer);
+            var delay = event.detail === 0 ? 0 : 250; // toetsenbord: direct
+            timer = setTimeout(function () {
+                button.setAttribute('aria-pressed', button.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+                go(current());
+            }, delay);
+        });
+        button.addEventListener('dblclick', function () {
+            clearTimeout(timer);
+            go([button.dataset.status]);
+        });
+    });
+})();

@@ -304,3 +304,7 @@ mark { background: #ffe08a; color: inherit; border-radius: 3px; padding: 0 1px; 
 #events td.event-time { white-space: nowrap; min-width: 9.5rem; }
 #events th.event-status, #events td.event-status { padding-left: .75rem; overflow: visible; }
 #reliability .table-wrap { overflow-x: auto; overflow-y: visible; padding-left: 2px; }
+.event-filters { display: inline-flex; gap: .25rem; flex-wrap: wrap; margin-left: auto; }
+.event-filter { border: 0; background: none; padding: 2px; cursor: pointer; line-height: 0; border-radius: 50%; }
+.event-filter[aria-pressed="false"] .event-icon { filter: grayscale(1); opacity: .35; }
+.event-filter:focus-visible { outline: 2px solid var(--kvt-blue, #0099cc); outline-offset: 1px; }
