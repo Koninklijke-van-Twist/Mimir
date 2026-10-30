@@ -295,3 +295,6 @@ mark { background: #ffe08a; color: inherit; border-radius: 3px; padding: 0 1px; 
     #keys td[data-col="write"]::before { content: "Schrijfacties"; }
     #keys td[data-col="created"]::before { content: "Aangemaakt"; }
 }
+
+.event-status { width: 1.5rem; padding-right: 0; text-align: center; }
+.event-icon { display: block; vertical-align: middle; }
