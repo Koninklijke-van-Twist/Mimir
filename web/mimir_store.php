@@ -947,12 +947,25 @@ function mimir_cache_all(PDO $pdo, string $environment, string $company, string 
  *
  * @return Generator<int, array{row_key: string, payload: array<string, mixed>, fetched_at: int}>
  */
-function mimir_cache_each(PDO $pdo, string $environment, string $company, string $entity): Generator
+function mimir_cache_each(PDO $pdo, string $environment, string $company, string $entity, int $minFetchedAt = 0, array $jsonEq = []): Generator
 {
-    $stmt = $pdo->prepare(
-        'SELECT row_key, payload, fetched_at FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity'
-    );
-    $stmt->execute([':environment' => $environment, ':company' => $company, ':entity' => $entity]);
+    // Optionele voorfilters in SQL (fetched_at via index, tekst-eq via json_extract):
+    // scheelt json_decode van rijen die toch afvallen. Rijen blijven daarna in PHP gecontroleerd.
+    $sql = 'SELECT row_key, payload, fetched_at FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity';
+    $params = [':environment' => $environment, ':company' => $company, ':entity' => $entity];
+    if ($minFetchedAt > 0) {
+        $sql .= ' AND fetched_at >= :min_at';
+        $params[':min_at'] = $minFetchedAt;
+    }
+    $i = 0;
+    foreach ($jsonEq as $field => $value) {
+        $sql .= " AND json_extract(payload, :p$i) = :v$i";
+        $params[":p$i"] = '$.' . $field;
+        $params[":v$i"] = $value;
+        $i++;
+    }
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $payload = json_decode((string) $row['payload'], true);
         yield [
@@ -1090,6 +1103,32 @@ function mimir_select_sig_covers(string $stored, string $needed): bool
     $have = $stored === '' ? [] : explode(',', $stored);
     $need = $needed === '' ? [] : explode(',', $needed);
     return array_diff($need, $have) === [];
+}
+
+/**
+ * Kolommen van één opgeslagen rij (LIMIT 1). mimir_run gebruikt alleen of er al
+ * kolommen op file staan; een volledige scan + json_decode per cache-hit is daarvoor
+ * onnodig duur (AppItemCard: ~2 s per verzoek).
+ *
+ * @return list<string>
+ */
+function mimir_on_file_columns_any(PDO $pdo, string $environment, string $company, string $entity): array
+{
+    $stmt = $pdo->prepare(
+        'SELECT payload FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity LIMIT 1'
+    );
+    $stmt->execute([':environment' => $environment, ':company' => $company, ':entity' => $entity]);
+    $raw = $stmt->fetchColumn();
+    $stmt->closeCursor();
+    $payload = is_string($raw) ? json_decode($raw, true) : null;
+    $cols = [];
+    foreach (is_array($payload) ? array_keys($payload) : [] as $key) {
+        if (is_string($key) && $key !== '' && !str_starts_with($key, '@')) {
+            $cols[] = $key;
+        }
+    }
+    sort($cols, SORT_STRING);
+    return $cols;
 }
 
 /**
@@ -1329,7 +1368,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $batchCount = $filterBatches === null ? 1 : count($filterBatches);
     $selectSig = mimir_select_sig($select);
     $required = array_values(array_unique(array_merge($select, mimir_filter_fields($filter))));
-    $onFile = mimir_on_file_columns($pdo, $environment, $company, $entity);
+    $onFile = mimir_on_file_columns_any($pdo, $environment, $company, $entity);
     $emptyFilterFetch = ($pushed === null);
     // Full-entity warms omit $select toward BC; filtered cold may still pass select.
     // Age-refresh non-shrink is preserved by omitting (or by mimir_select_for_bc_refresh when used).
@@ -1346,6 +1385,11 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     if ($simpleEq !== null && $fetchSelect !== []) {
         $fetchSelect[] = $simpleEq['field'];
         $fetchSelect = array_values(array_unique($fetchSelect));
+    }
+    // Idem voor velden uit een eenvoudige and-keten (lokaal te bewijzen vanuit coverage).
+    $andLeaves = is_string($filter) && $simpleEq === null ? (mimir_filter_parse_simple_and($filter) ?? []) : [];
+    if ($andLeaves !== [] && $fetchSelect !== []) {
+        $fetchSelect = array_values(array_unique(array_merge($fetchSelect, array_column($andLeaves, 'field'))));
     }
     $fetchSelectSig = mimir_select_sig($fetchSelect);
     $keyId = array_key_exists('key_id', $job) && $job['key_id'] !== null && $job['key_id'] !== ''
@@ -1527,7 +1571,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
 
     // Ongeparseerde $filter-strings niet uit de gedeelde rijcache serveren:
     // mimir_filter_match kan die niet bewijzen, en latere upserts lekken dan mee.
-    if ($coverage !== null && mimir_filter_coverage_servable($filter)) {
+    if ($coverage !== null && mimir_filter_coverage_servable($filter, $types)) {
         $served = mimir_serve_from_coverage(
             $pdo,
             $environment,
@@ -2058,7 +2102,22 @@ function mimir_serve_from_coverage(
 ): array {
     $window = [];
     $needsRefresh = 0;
-    foreach (mimir_cache_each($pdo, $environment, $company, $entity) as $stored) {
+    $jsonEq = [];
+    $simple = null;
+    $leaves = is_string($filter)
+        ? (($simple = mimir_filter_parse_simple_eq($filter)) !== null ? [$simple] : (mimir_filter_parse_simple_and($filter) ?? []))
+        : [];
+    foreach ($leaves as $leaf) {
+        if ($leaf['op'] === 'eq' && $leaf['type'] === 'Edm.String' && preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $leaf['field']) === 1
+            && preg_match('/int|decimal|double|single|float|byte|boolean/i', (string) ($types[$leaf['field']] ?? '')) !== 1) {
+            $jsonEq[$leaf['field']] = (string) $leaf['value'];
+        }
+    }
+    // Filtervelden moeten op de rij staan, anders zou een ontbrekend veld als null vergeleken worden.
+    if (count($leaves) > 1 || ($leaves !== [] && $simple === null)) {
+        $required = array_values(array_unique(array_merge($required, array_column($leaves, 'field'))));
+    }
+    foreach (mimir_cache_each($pdo, $environment, $company, $entity, max(0, $coverageAt - 2), $jsonEq) as $stored) {
         if ($stored['fetched_at'] + 2 < $coverageAt) {
             continue;
         }

@@ -335,13 +335,71 @@ function mimir_filter_parse_simple_eq_leaf(string $text): ?array
  * Coverage-serve is alleen veilig als we het filter lokaal kunnen toepassen.
  * Een ongeparseerde $filter-string moet live naar BC (die heeft al gefilterd).
  */
-function mimir_filter_coverage_servable(mixed $filter): bool
+/**
+ * Eenvoudige and-keten zonder haakjes/or: Field eq|ne 'tekst', Field eq|ne true|false,
+ * Field eq|ne|ge|le|gt|lt JJJJ-MM-DD. Anders null (BC moet filteren).
+ *
+ * @return list<array{field: string, op: string, value: bool|string, type: string}>|null
+ */
+function mimir_filter_parse_simple_and(string $filter): ?array
+{
+    $parts = preg_split("/('(?:[^']|'')*')/", trim($filter), -1, PREG_SPLIT_DELIM_CAPTURE);
+    $clauses = [''];
+    foreach ($parts === false ? [] : $parts as $i => $part) {
+        if ($i % 2 === 1) {
+            $clauses[count($clauses) - 1] .= $part;
+            continue;
+        }
+        if (preg_match('/[()]|\bor\b|\bnot\b/i', $part) === 1) {
+            return null;
+        }
+        $pieces = preg_split('/\s+and\s+/i', $part);
+        $clauses[count($clauses) - 1] .= array_shift($pieces);
+        foreach ($pieces as $piece) {
+            $clauses[] = $piece;
+        }
+    }
+    $leaves = [];
+    foreach ($clauses as $clause) {
+        $clause = trim($clause);
+        $field = '([A-Za-z_][A-Za-z0-9_]*)';
+        if (preg_match("/^$field\s+(eq|ne)\s+'((?:[^']|'')*)'$/i", $clause, $m) === 1) {
+            $leaves[] = ['field' => $m[1], 'op' => strtolower($m[2]), 'value' => str_replace("''", "'", $m[3]), 'type' => 'Edm.String'];
+        } elseif (preg_match("/^$field\s+(eq|ne)\s+(true|false)$/i", $clause, $m) === 1) {
+            $leaves[] = ['field' => $m[1], 'op' => strtolower($m[2]), 'value' => strtolower($m[3]) === 'true', 'type' => 'Edm.Boolean'];
+        } elseif (preg_match("/^$field\s+(eq|ne|ge|le|gt|lt)\s+(\d{4}-\d{2}-\d{2})$/i", $clause, $m) === 1) {
+            $leaves[] = ['field' => $m[1], 'op' => strtolower($m[2]), 'value' => $m[3], 'type' => 'Edm.Date'];
+        } else {
+            return null;
+        }
+    }
+
+    return $leaves === [] ? null : $leaves;
+}
+
+/**
+ * @param array<string, string> $types
+ */
+function mimir_filter_coverage_servable(mixed $filter, array $types = []): bool
 {
     if (!is_string($filter)) {
         return true;
     }
+    if (mimir_filter_parse_simple_eq($filter) !== null) {
+        return true;
+    }
+    $leaves = mimir_filter_parse_simple_and($filter);
+    if ($leaves === null) {
+        return false;
+    }
+    foreach ($leaves as $leaf) {
+        // Datumvergelijking alleen lokaal bij een echt Edm.Date-veld (tekstvergelijking JJJJ-MM-DD).
+        if ($leaf['type'] === 'Edm.Date' && ($types[$leaf['field']] ?? '') !== 'Edm.Date') {
+            return false;
+        }
+    }
 
-    return mimir_filter_parse_simple_eq($filter) !== null;
+    return true;
 }
 
 /**
@@ -356,7 +414,18 @@ function mimir_filter_match(array $row, mixed $filter, array $types = []): bool
     if (is_string($filter)) {
         $parsed = mimir_filter_parse_simple_eq($filter);
         if ($parsed === null) {
-            // Complexe string: BC heeft gefilterd. Niet gebruiken op een gedeelde cache.
+            $leaves = mimir_filter_parse_simple_and($filter);
+            if ($leaves === null) {
+                // Complexe string: BC heeft gefilterd. Niet gebruiken op een gedeelde cache.
+                return true;
+            }
+            foreach ($leaves as $leaf) {
+                $type = $leaf['type'] === 'Edm.String' ? (string) ($types[$leaf['field']] ?? 'Edm.String') : $leaf['type'];
+                $actual = array_key_exists($leaf['field'], $row) ? $row[$leaf['field']] : null;
+                if (!mimir_filter_compare($actual, $leaf['op'], $leaf['value'], $type)) {
+                    return false;
+                }
+            }
             return true;
         }
         $type = (string) ($types[$parsed['field']] ?? $parsed['type']);
