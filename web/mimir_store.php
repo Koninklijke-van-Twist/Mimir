@@ -2339,7 +2339,10 @@ function mimir_fetch_collection(
     try {
         $pages = $attempt($pushed);
     } catch (Throwable $error) {
-        if ($pushed !== null && mimir_exception_status($error) === 501) {
+        // Een complexe $filter-string kan Mímir lokaal niet herhalen: ongefilterd
+        // ophalen zou de hele tabel ongefilterd teruggeven. Dan de 501 doorgeven.
+        $localOk = !is_string($filter) || mimir_filter_parse_simple_eq($filter) !== null || mimir_filter_parse_simple_and($filter) !== null;
+        if ($pushed !== null && $localOk && mimir_exception_status($error) === 501) {
             $pushed = null;
             $mode = 'local';
             $pages = $attempt(null);

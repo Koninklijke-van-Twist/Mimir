@@ -423,3 +423,18 @@ mimir_rel_same($only['rows'][0]['message'], 'HTTP 500 f0', 'filtered page 2 hold
 mimir_rel_same(mimir_event_log_day($fday, 1, 500, [])['total'], 0, 'all filters off shows nothing');
 mimir_rel_same(mimir_event_log_day($fday, 1, 500, ['cross-red'])['counts']['crate-green'], 5, 'counts ignore the filter');
 @unlink(mimir_event_log_path($fday));
+
+// 501 (filter niet ondersteund) is geen tijdelijke fout; na de deadline geen retry.
+mimir_rel_same(mimir_bc_is_transient(new RuntimeException('HTTP 501 from OData: BadRequest_MethodNotImplemented')), false, '501 is not transient');
+mimir_rel_same(mimir_bc_is_transient(new RuntimeException('HTTP 503 from OData: busy')), true, '503 stays transient');
+$GLOBALS['mimir_deadline_at'] = microtime(true) - 1;
+$deadlineCalls = 0;
+try {
+    mimir_bc_retry(static function () use (&$deadlineCalls): never {
+        $deadlineCalls++;
+        throw new RuntimeException('cURL error: Operation timed out after 1002 milliseconds with 0 bytes received');
+    });
+} catch (RuntimeException $ignored) {
+}
+unset($GLOBALS['mimir_deadline_at']);
+mimir_rel_same($deadlineCalls, 1, 'no retry after the request deadline');
