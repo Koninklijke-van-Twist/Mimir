@@ -21,6 +21,7 @@ const MIMIR_TUNNEL_PAGE_TTL = 86400;
 /** Meer OR-waarden dan dit: de query direct via OData. */
 const MIMIR_TUNNEL_MAX_OR_VALUES = 5;
 // Route zonder `route` in het verzoek: 'odata' (tijdelijk, tunnel 3-4x trager) of '' = automatisch (tunnel).
+defined('MIMIR_TUNNEL_FAST_TIMEOUT_SECONDS') || define('MIMIR_TUNNEL_FAST_TIMEOUT_SECONDS', 15);
 defined('MIMIR_DEFAULT_ROUTE') || define('MIMIR_DEFAULT_ROUTE', 'odata');
 /** Lege of afgekapte page 810-koppeling: kort cachen. */
 const MIMIR_TUNNEL_PAGE_TTL_INCOMPLETE = 300;
@@ -1659,12 +1660,17 @@ function mimir_tunnel_http(string $method, string $path, array $query, ?string $
     if ($ch === false) {
         return ['status' => 0, 'json' => null, 'body' => 'cURL kon niet worden gestart'];
     }
+    // Kleine lookup (fast lane): 15 s, anders 180 s.
+    $tunnelTimeout = (int) ($GLOBALS['mimir_tunnel_timeout_seconds'] ?? 0);
+    if ($tunnelTimeout < 1) {
+        $tunnelTimeout = 180;
+    }
     $options = [
         CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_TIMEOUT => function_exists('mimir_deadline_curl_timeout') ? mimir_deadline_curl_timeout(180) : 180,
+        CURLOPT_TIMEOUT => function_exists('mimir_deadline_curl_timeout') ? mimir_deadline_curl_timeout($tunnelTimeout) : $tunnelTimeout,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_USERAGENT => 'Mimir-TunnelClient/1.0',
     ];

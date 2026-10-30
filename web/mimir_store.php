@@ -1359,6 +1359,11 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $metaPdo = ($job['meta_pdo'] ?? null) instanceof PDO ? $job['meta_pdo'] : null;
     $tunnelRoute = isset($job['route']) && is_string($job['route']) && $job['route'] !== '' ? $job['route'] : null;
     unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page'], $GLOBALS['mimir_tunnel_columns_learned'], $GLOBALS['mimir_tunnel_key_by']);
+    // Fast lane: kleine lookup (één eq op een sleutelveld, of top <= 50) mag een
+    // extra BC-slot gebruiken en krijgt een korte tunnel-timeout.
+    $fastLane = ($simpleEq !== null && in_array($simpleEq['field'], $keys, true))
+        || ($top > 0 && $top <= (defined('MIMIR_BC_FAST_LANE_MAX_TOP') ? MIMIR_BC_FAST_LANE_MAX_TOP : 50));
+    $GLOBALS['mimir_tunnel_timeout_seconds'] = $fastLane ? (defined('MIMIR_TUNNEL_FAST_TIMEOUT_SECONDS') ? MIMIR_TUNNEL_FAST_TIMEOUT_SECONDS : 15) : null;
     $flowFilter = mimir_filter_has_flowfilter($filter);
     if ($flowFilter && $tunnelRoute === 'tunnel') {
         throw new MimirUserException('FlowFilter-velden (*_Filter) gaan niet via de tunnel; gebruik OData.');
@@ -1376,6 +1381,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
         $keyId,
         $now,
         $tunnelRoute,
+        $fastLane,
         &$slotHeld,
         &$queueWaitMs,
         &$stayOnOdata
@@ -1399,13 +1405,13 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                     'route' => $tunnelRoute,
                     // Kleine OData-steekproef ($top=N, zelfde pagina) om tunnel-captions
                     // taalonafhankelijk aan OData-velden te koppelen.
-                    'odata_sample' => static function (int $top) use ($innerFetch, $url, $entity, $environment, &$slotHeld, &$queueWaitMs): array {
+                    'odata_sample' => static function (int $top) use ($innerFetch, $url, $entity, $environment, $fastLane, &$slotHeld, &$queueWaitMs): array {
                         $sampleUrl = mimir_tunnel_sample_url($url, $entity, $top);
                         if ($sampleUrl === null) {
                             return [];
                         }
                         if (!$slotHeld) {
-                            $queueWaitMs = mimir_bc_slot_acquire($environment);
+                            $queueWaitMs = mimir_bc_slot_acquire($environment, $fastLane);
                             $slotHeld = true;
                         }
                         $payload = $innerFetch($sampleUrl);
@@ -1441,7 +1447,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
             }
         }
         if (!$slotHeld) {
-            $queueWaitMs = mimir_bc_slot_acquire($environment);
+            $queueWaitMs = mimir_bc_slot_acquire($environment, $fastLane);
             $slotHeld = true;
         }
         if (mimir_tunnel_configured()) {

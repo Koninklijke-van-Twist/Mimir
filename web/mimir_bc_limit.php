@@ -34,6 +34,10 @@ require_once __DIR__ . '/mimir_reliability.php';
 const MIMIR_BC_MAX_CONCURRENT = 3;
 const MIMIR_BC_QUEUE_WAIT_SECONDS = 120;
 const MIMIR_BC_LIMIT_POLL_US = 50000;
+/** Korte slotwacht voor interactieve webverzoeken (API query zonder background). */
+const MIMIR_BC_INTERACTIVE_QUEUE_WAIT_SECONDS = 10;
+/** Kleine lookups (top <= dit, of één eq op een sleutel) mogen een extra fast-lane-slot. */
+const MIMIR_BC_FAST_LANE_MAX_TOP = 50;
 
 /**
  * Override voor tests: map voor de slotbestanden, of null voor de default.
@@ -69,6 +73,11 @@ function mimir_bc_limit_queue_wait_seconds(): int
 {
     if (isset($GLOBALS['mimir_bc_queue_wait_seconds'])) {
         return max(0, (int) $GLOBALS['mimir_bc_queue_wait_seconds']);
+    }
+    // Interactief webverzoek: kort wachten en snel 503, zodat de client kan terugvallen.
+    // CLI, hourly, nightly en background-verzoeken houden de lange wacht.
+    if (PHP_SAPI !== 'cli' && !empty($GLOBALS['mimir_bc_interactive'])) {
+        return MIMIR_BC_INTERACTIVE_QUEUE_WAIT_SECONDS;
     }
 
     return MIMIR_BC_QUEUE_WAIT_SECONDS;
@@ -368,7 +377,7 @@ function mimir_bc_limit_file_locked(string $path): bool
  *
  * @return int milliseconden gewacht vóór het slot (0 bij directe toekenning of nest)
  */
-function mimir_bc_slot_acquire(string $environment): int
+function mimir_bc_slot_acquire(string $environment, bool $fastLane = false): int
 {
     $environment = trim($environment);
     if ($environment === '') {
@@ -393,6 +402,14 @@ function mimir_bc_slot_acquire(string $environment): int
         return mimir_bc_limit_bypass_live($environment);
     }
     $effectiveMax = $candidates['fallback'] ? 1 : $max;
+    if ($fastLane && !$candidates['fallback']) {
+        // Eén extra slot alleen voor kleine lookups: die wachten niet achter grote fetches.
+        $fast = mimir_bc_limit_open_lock_file(mimir_bc_limit_env_dir($environment) . '/slot-fast');
+        if ($fast !== null) {
+            $candidates['handles'][] = $fast;
+            $effectiveMax++;
+        }
+    }
     $winner = mimir_bc_limit_wait_lock(
         $candidates['handles'],
         $deadline,
