@@ -733,7 +733,8 @@ function mimir_bc_is_transient(Throwable $error): bool
     $message = $error->getMessage();
     if (preg_match('/HTTP (\d{3})/', $message, $match) === 1) {
         $code = (int) $match[1];
-        if ($code === 429 || ($code >= 500 && $code <= 599)) {
+        // 501 = filter niet ondersteund: opnieuw proberen helpt niet.
+        if ($code === 429 || ($code >= 500 && $code <= 599 && $code !== 501)) {
             return true;
         }
     }
@@ -803,7 +804,9 @@ function mimir_bc_retry(callable $fn, int $attempts = MIMIR_BC_RETRY_ATTEMPTS): 
             return $result;
         } catch (Throwable $error) {
             $remaining = $budget - $spent;
-            $retryNext = mimir_bc_is_transient($error) && $attempt < $attempts && $remaining > 0;
+            // Na de verzoek-deadline krijgt cURL nog maar 1 s; opnieuw proberen is zinloos.
+            $retryNext = mimir_bc_is_transient($error) && $attempt < $attempts && $remaining > 0
+                && !(function_exists('mimir_deadline_passed') && mimir_deadline_passed());
             if ($retried || $retryNext) {
                 mimir_event_log('bc', mimir_event_redact($error->getMessage()), '', '', 'attempt-failed', ['attempt' => $attempt, 'retry_next' => $retryNext]);
             }

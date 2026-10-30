@@ -147,7 +147,7 @@ function odata_perform(string $url, array $auth, string $accept, array $extraHea
             if (isset($responseHeaders['retry-after'])) {
                 $retryAfter = mimir_retry_after_seconds((string) $responseHeaders['retry-after']);
             }
-            if ($code === 429 || ($code >= 500 && $code <= 599)) {
+            if ($code === 429 || ($code >= 500 && $code <= 599 && $code !== 501)) {
                 throw new MimirBcTransientException($message, $retryAfter, $code);
             }
             throw new RuntimeException($message);
