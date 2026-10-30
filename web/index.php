@@ -12,7 +12,16 @@ require_once __DIR__ . '/mimir_reliability.php';
 
 $email = (string) ($_SESSION['user']['email'] ?? '');
 $mimirCircuit = mimir_circuit_public_state();
-$mimirEvents = mimir_event_log_recent(40);
+$mimirEventDay = (string) ($_GET['events_day'] ?? '');
+if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $mimirEventDay) !== 1) {
+    $mimirEventDay = mimir_event_today();
+}
+$mimirEventPage = mimir_event_log_day($mimirEventDay, (int) ($_GET['events_page'] ?? 1));
+$mimirEvents = $mimirEventPage['rows']; // al nieuwste eerst; mimir_event_log_recent blijft voor tests
+$mimirEventDate = new DateTimeImmutable($mimirEventDay, new DateTimeZone('Europe/Amsterdam'));
+$mimirEventPrev = $mimirEventDate->modify('-1 day')->format('Y-m-d');
+$mimirEventNext = $mimirEventDate->modify('+1 day')->format('Y-m-d');
+$mimirEventIsToday = $mimirEventDay >= mimir_event_today();
 $mimirCsrf = mimir_csrf_token();
 function mimir_h(string $value): string
 {
@@ -173,6 +182,14 @@ function mimir_h(string $value): string
                 <p>Circuit <strong><?= mimir_event_escape($mimirCircuit['label']) ?></strong><?php if ($mimirCircuit['since'] !== ''): ?> sinds <?= mimir_event_escape($mimirCircuit['since']) ?><?php endif; ?>. Tijden in Europe/Amsterdam. Het log staat buiten de SQLite-database.</p>
                 <p class="row-actions"><button type="button" id="tunnel-cache-clear">Tunnel-koppelcache legen</button></p>
                 <p id="tunnel-cache-status" class="status" role="status"></p>
+                <form class="row-actions event-day-nav" method="get" action="#reliability">
+                    <a href="?events_day=<?= mimir_event_escape($mimirEventPrev) ?>#reliability">&larr; Vorige dag</a>
+                    <input type="date" name="events_day" value="<?= mimir_event_escape($mimirEventDay) ?>" max="<?= mimir_event_escape(mimir_event_today()) ?>" onchange="this.form.submit()">
+                    <?php if (!$mimirEventIsToday): ?><a href="?events_day=<?= mimir_event_escape($mimirEventNext) ?>#reliability">Volgende dag &rarr;</a><?php endif; ?>
+                    <span><?= mimir_event_escape($mimirEventDate->format('j M Y')) ?>: <?= (int) $mimirEventPage['total'] ?> regels<?php if ($mimirEventPage['pages'] > 1): ?>, pagina <?= (int) $mimirEventPage['page'] ?>/<?= (int) $mimirEventPage['pages'] ?><?php endif; ?></span>
+                    <?php if ($mimirEventPage['page'] > 1): ?><a href="?events_day=<?= mimir_event_escape($mimirEventDay) ?>&amp;events_page=<?= (int) $mimirEventPage['page'] - 1 ?>#reliability">Nieuwer</a><?php endif; ?>
+                    <?php if ($mimirEventPage['page'] < $mimirEventPage['pages']): ?><a href="?events_day=<?= mimir_event_escape($mimirEventDay) ?>&amp;events_page=<?= (int) $mimirEventPage['page'] + 1 ?>#reliability">Ouder</a><?php endif; ?>
+                </form>
             </div>
             <div class="table-wrap">
                 <table id="events">
@@ -190,9 +207,9 @@ function mimir_h(string $value): string
                     </thead>
                     <tbody>
                         <?php if ($mimirEvents === []): ?>
-                            <tr><td colspan="8" class="empty">Nog geen gebeurtenissen.</td></tr>
+                            <tr><td colspan="8" class="empty">Geen gebeurtenissen op deze dag.</td></tr>
                         <?php else: ?>
-                            <?php foreach (array_reverse($mimirEvents) as $event): ?>
+                            <?php foreach ($mimirEvents as $event): ?>
                                 <tr>
                                     <?php $mimirStatus = mimir_event_status($event); ?>
                                     <td class="event-status" title="<?= mimir_event_escape($mimirStatus['title']) ?>"><?= mimir_event_icon_svg($mimirStatus) ?></td>

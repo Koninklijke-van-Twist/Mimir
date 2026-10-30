@@ -21,8 +21,6 @@ const MIMIR_BC_RETRY_ATTEMPTS = 3;
 const MIMIR_BC_RETRY_BUDGET_US = 8000000;
 const MIMIR_BC_RETRY_BASE_US = 200000;
 const MIMIR_CIRCUIT_PROBE_SECONDS = 5;
-const MIMIR_EVENT_LOG_MAX_BYTES = 262144;
-const MIMIR_EVENT_LOG_KEEP = 3;
 const MIMIR_BC_TIMEOUT_NO_RETRY_SECONDS = 45.0;
 const MIMIR_METADATA_SNAPSHOT_TTL = 86400;
 
@@ -113,9 +111,50 @@ function mimir_event_redact(string $message): string
     return $message;
 }
 
-function mimir_event_log_path(): string
+/** Eén bestand per dag (Europe/Amsterdam); de bestandsnaam is de index op tijd. */
+function mimir_event_log_path(?string $day = null): string
+{
+    if ($day === null || preg_match('/^\d{4}-\d{2}-\d{2}$/', $day) !== 1) {
+        $day = mimir_event_today();
+    }
+
+    return mimir_runtime_dir() . '/mimir-events-' . $day . '.jsonl';
+}
+
+function mimir_event_today(?int $unix = null): string
+{
+    return (new DateTimeImmutable('@' . ($unix ?? time())))->setTimezone(new DateTimeZone('Europe/Amsterdam'))->format('Y-m-d');
+}
+
+/** Oud logbestand van voor de dagbestanden (mimir-events.jsonl + .1..3). */
+function mimir_event_legacy_path(): string
 {
     return mimir_runtime_dir() . '/mimir-events.jsonl';
+}
+
+/**
+ * Retentie: vandaag + 7 vorige dagen blijven, ouder gaat weg. Eén glob, geen leesacties.
+ * Aangeroepen vanuit nightly.php en hourly.php, niet per verzoek.
+ */
+function mimir_event_log_prune(?int $now = null): int
+{
+    $cutoff = (new DateTimeImmutable(mimir_event_today($now), new DateTimeZone('Europe/Amsterdam')))->modify('-7 days')->format('Y-m-d');
+    $removed = 0;
+    foreach (glob(mimir_runtime_dir() . '/mimir-events-*.jsonl') ?: [] as $file) {
+        if (preg_match('/mimir-events-(\d{4}-\d{2}-\d{2})\.jsonl$/', $file, $m) === 1 && $m[1] < $cutoff && @unlink($file)) {
+            $removed++;
+        }
+    }
+    $legacy = mimir_event_legacy_path();
+    $cutoffTs = strtotime($cutoff . ' 00:00:00 Europe/Amsterdam');
+    foreach (array_merge([$legacy], glob($legacy . '.*') ?: []) as $file) {
+        $mtime = is_file($file) ? @filemtime($file) : false;
+        if (is_int($mtime) && $mtime < $cutoffTs && @unlink($file)) {
+            $removed++;
+        }
+    }
+
+    return $removed;
 }
 
 function mimir_caller_reset(): void
@@ -298,21 +337,6 @@ function mimir_event_log(string $category, string $message, string $environment 
         if (!@flock($handle, LOCK_EX)) {
             return;
         }
-        clearstatcache(true, $path);
-        $size = @filesize($path);
-        if (is_int($size) && $size >= MIMIR_EVENT_LOG_MAX_BYTES) {
-            @flock($handle, LOCK_UN);
-            @fclose($handle);
-            $handle = null;
-            mimir_event_log_rotate($path);
-            $handle = @fopen($path, 'ab');
-            if ($handle === false) {
-                return;
-            }
-            if (!@flock($handle, LOCK_EX)) {
-                return;
-            }
-        }
         @fwrite($handle, $line . "\n");
         @fflush($handle);
     } finally {
@@ -326,25 +350,6 @@ function mimir_event_log(string $category, string $message, string $environment 
     }
 }
 
-function mimir_event_log_rotate(string $path): void
-{
-    $keep = MIMIR_EVENT_LOG_KEEP;
-    $oldest = $path . '.' . $keep;
-    if (is_file($oldest)) {
-        @unlink($oldest);
-    }
-    for ($index = $keep - 1; $index >= 1; $index--) {
-        $from = $path . '.' . $index;
-        $to = $path . '.' . ($index + 1);
-        if (is_file($from)) {
-            @rename($from, $to);
-        }
-    }
-    if (is_file($path)) {
-        @rename($path, $path . '.1');
-    }
-}
-
 /**
  * @return list<array{ts: string, category: string, message: string, environment: string, entity: string, action: string, caller: string}>
  */
@@ -353,12 +358,23 @@ function mimir_event_log_recent(int $limit = 40): array
     if ($limit < 1) {
         return [];
     }
-    $path = mimir_event_log_path();
-    $lines = mimir_event_log_tail($path, $limit);
-    if (count($lines) < $limit && is_file($path . '.1')) {
-        $older = mimir_event_log_tail($path . '.1', $limit - count($lines));
-        $lines = array_merge($older, $lines);
+    $lines = mimir_event_log_tail(mimir_event_log_path(), $limit);
+    $sources = [mimir_event_log_path(mimir_event_today(time() - 86400)), mimir_event_legacy_path(), mimir_event_legacy_path() . '.1'];
+    foreach ($sources as $source) {
+        if (count($lines) >= $limit) {
+            break;
+        }
+        $lines = array_merge(mimir_event_log_tail($source, $limit - count($lines)), $lines);
     }
+    return mimir_event_rows($lines);
+}
+
+/**
+ * @param list<string> $lines
+ * @return list<array<string, mixed>>
+ */
+function mimir_event_rows(array $lines): array
+{
     $rows = [];
     foreach ($lines as $line) {
         $decoded = json_decode($line, true);
@@ -1630,4 +1646,47 @@ function mimir_event_display_time(string $ts): string
     }
 
     return $moment->setTimezone(new DateTimeZone('Europe/Amsterdam'))->format('j M Y, H:i');
+}
+
+/**
+ * Gebeurtenissen van één dag, nieuwste eerst, gepagineerd.
+ *
+ * @return array{rows: list<array<string, mixed>>, total: int, page: int, pages: int}
+ */
+function mimir_event_log_day(string $day, int $page = 1, int $perPage = 500): array
+{
+    $lines = [];
+    $file = mimir_event_log_path($day);
+    if (is_file($file)) {
+        $lines = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+    }
+    // Oude regels uit het logbestand van voor de dagbestanden, op datum gefilterd.
+    $legacy = [];
+    foreach ([mimir_event_legacy_path() . '.3', mimir_event_legacy_path() . '.2', mimir_event_legacy_path() . '.1', mimir_event_legacy_path()] as $old) {
+        if (!is_file($old)) {
+            continue;
+        }
+        foreach (@file($old, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+            if (preg_match('/"ts":"([^"]+)"/', $line, $m) === 1 && mimir_event_today((int) strtotime($m[1])) === $day) {
+                $legacy[] = $line;
+            }
+        }
+    }
+    $lines = array_merge($legacy, $lines);
+    $total = count($lines);
+    $perPage = max(1, $perPage);
+    $pages = max(1, (int) ceil($total / $perPage));
+    $page = min(max(1, $page), $pages);
+    $slice = array_slice(array_reverse($lines), ($page - 1) * $perPage, $perPage);
+
+    return ['rows' => mimir_event_rows($slice), 'total' => $total, 'page' => $page, 'pages' => $pages];
+}
+
+/** Goedkope logregel voor een verzoek dat volledig uit cache kwam; faalt nooit. */
+function mimir_event_log_cache_hit(string $environment, string $entity): void
+{
+    try {
+        mimir_event_log('request', 'Volledig uit cache beantwoord.', $environment, $entity, 'cache-hit', ['cache' => 'full']);
+    } catch (Throwable) {
+    }
 }

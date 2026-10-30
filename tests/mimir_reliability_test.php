@@ -382,3 +382,22 @@ mimir_rel_same($st(['action' => 'attempt-failed', 'attempt' => 2, 'retry_next' =
 mimir_rel_same($st(['action' => 'attempt-failed', 'attempt' => 3, 'retry_next' => false]), 'recycle/red', 'last retry failed');
 mimir_rel_same($st(['action' => 'recovered']), 'info/blue', 'status message is blue info');
 mimir_rel_same(mimir_event_display_time('2026-04-28T13:34:00+00:00'), '28 Apr 2026, 15:34', 'display time');
+
+// Dagbestanden, paginering, cache-hit en retentie
+$today = mimir_event_today();
+mimir_caller_bind_named('ui', 'tim@kvt.nl');
+mimir_event_log_cache_hit('kvtmdlive_aad', 'ItemList');
+$dayPage = mimir_event_log_day($today, 1, 2);
+mimir_rel_same($dayPage['rows'][0]['cache'] ?? '', 'full', 'cache hit is newest on today page');
+mimir_rel_same($dayPage['rows'][0]['caller'] ?? '', 'ui owner=tim@kvt.nl', 'cache hit names the caller');
+mimir_rel_same(count($dayPage['rows']), 2, 'page size is honoured');
+mimir_rel_same($dayPage['pages'] >= 2, true, 'day has more pages');
+$oldDay = (new DateTimeImmutable($today))->modify('-8 days')->format('Y-m-d');
+$keepDay = (new DateTimeImmutable($today))->modify('-7 days')->format('Y-m-d');
+file_put_contents(mimir_event_log_path($oldDay), "{}\n");
+file_put_contents(mimir_event_log_path($keepDay), "{}\n");
+mimir_event_log_prune();
+mimir_rel_same(is_file(mimir_event_log_path($oldDay)), false, 'events of 8 days ago are removed');
+mimir_rel_same(is_file(mimir_event_log_path($keepDay)), true, 'events of 7 days ago stay');
+mimir_rel_same(is_file(mimir_event_log_path($today)), true, 'today stays');
+mimir_caller_reset();

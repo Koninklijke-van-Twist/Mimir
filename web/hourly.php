@@ -26,6 +26,7 @@ require_once __DIR__ . '/mimir_service.php';
 
 mimir_caller_reset();
 mimir_caller_bind_named('hourly', '');
+mimir_event_log_prune();
 
 $now = time();
 $local = new DateTimeImmutable('@' . $now);

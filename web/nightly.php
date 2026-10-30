@@ -35,6 +35,7 @@ if (PHP_SAPI !== 'cli' && session_status() === PHP_SESSION_ACTIVE) {
 }
 mimir_caller_reset();
 mimir_caller_bind_named('nightly', $nightlyOwner);
+mimir_event_log_prune();
 
 $startedAt = hrtime(true);
 $now = time();
