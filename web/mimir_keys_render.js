@@ -28,7 +28,9 @@
             : '<span class="key-badge">alleen lezen</span>';
         const toggle = '<label class="field-check key-write-toggle"><input type="checkbox" data-can-write="' + esc(row.id) + '"'
             + (canWrite ? ' checked' : '') + (row.revoked_at ? ' disabled' : '') + '> <span>Mag schrijven</span></label>';
-        const label = '<div class="key-label"><span class="key-name">' + esc(row.label) + '</span> ' + badge + '</div>' + toggle;
+        const eventsToggle = '<label class="field-check key-write-toggle"><input type="checkbox" data-can-read-events="' + esc(row.id) + '"'
+            + (row.can_read_events === true ? ' checked' : '') + (row.revoked_at ? ' disabled' : '') + '> <span>Mag eventlog lezen</span></label>';
+        const label = '<div class="key-label"><span class="key-name">' + esc(row.label) + '</span> ' + badge + '</div>' + toggle + eventsToggle;
         const caption = '<p class="heatmap-caption">ma–zo</p>';
         const readCell = ctx.renderHeatmap(row.days || [], heatmap) + caption;
         const writeCell = canWrite

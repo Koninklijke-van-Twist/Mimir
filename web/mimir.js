@@ -613,6 +613,28 @@
     });
 
     keysBody.addEventListener('change', async function (event) {
+        const box = event.target.closest('[data-can-read-events]');
+        if (!box) return;
+        const wanted = box.checked;
+        box.disabled = true;
+        try {
+            await api('ui_api.php?action=keys_set_events', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Mimir-CSRF': csrfToken },
+                body: JSON.stringify({ id: Number(box.dataset.canReadEvents), can_read_events: wanted }),
+            });
+            keyStatus.textContent = wanted ? 'Eventlog lezen (api/events.php) staat aan voor deze sleutel.' : 'Eventlog lezen staat uit voor deze sleutel.';
+            keyStatus.classList.remove('error');
+            await loadKeys();
+        } catch (error) {
+            box.checked = !wanted;
+            box.disabled = false;
+            keyStatus.textContent = error.message;
+            keyStatus.classList.add('error');
+        }
+    });
+
+    keysBody.addEventListener('change', async function (event) {
         const box = event.target.closest('[data-can-write]');
         if (!box) return;
         const wanted = box.checked;
