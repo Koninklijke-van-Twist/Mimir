@@ -1003,6 +1003,16 @@ function mimir_ui_cached_payload(PDO $pdo, string $action, string $email, int $n
 
         return ['ok' => true, 'id' => (int) $body['id'], 'can_write' => $body['can_write']];
     }
+    if ($action === 'keys_set_events') {
+        if (!is_array($body) || !is_bool($body['can_read_events'] ?? null)) {
+            throw new MimirUserException('can_read_events (true/false) is verplicht.');
+        }
+        if (!mimir_key_set_events($pdo, (int) ($body['id'] ?? 0), $email, $body['can_read_events'])) {
+            throw new MimirUserException('Sleutel niet gevonden.', 404);
+        }
+
+        return ['ok' => true, 'id' => (int) $body['id'], 'can_read_events' => $body['can_read_events']];
+    }
     if ($action === 'tunnel_cache_clear') {
         return ['ok' => true, 'cleared' => mimir_tunnel_clear_page_cache($pdo)];
     }

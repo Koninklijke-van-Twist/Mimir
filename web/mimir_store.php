@@ -281,6 +281,11 @@ function mimir_migrate_schema(PDO $pdo): void
     if ($keyColumns !== [] && !in_array('can_write', $keyColumns, true)) {
         $pdo->exec('ALTER TABLE api_keys ADD COLUMN can_write INTEGER NOT NULL DEFAULT 0');
     }
+    // Leesrecht op het gebeurtenislog (api/events.php); standaard uit.
+    $keyColumns = mimir_sqlite_columns($pdo, 'api_keys');
+    if ($keyColumns !== [] && !in_array('can_read_events', $keyColumns, true)) {
+        $pdo->exec('ALTER TABLE api_keys ADD COLUMN can_read_events INTEGER NOT NULL DEFAULT 0');
+    }
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS api_usage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -460,13 +465,33 @@ function mimir_key_set_write(PDO $pdo, int $id, string $ownerEmail, bool $canWri
     return $found;
 }
 
+/** Leesrecht op het gebeurtenislog aan/uit; alleen de eigenaar, alleen een actieve sleutel. */
+function mimir_key_set_events(PDO $pdo, int $id, string $ownerEmail, bool $canRead): bool
+{
+    $owner = strtolower(trim($ownerEmail));
+    $stmt = $pdo->prepare('UPDATE api_keys SET can_read_events = :v WHERE id = :id AND owner_email = :owner AND revoked_at IS NULL');
+    $stmt->execute([':v' => $canRead ? 1 : 0, ':id' => $id, ':owner' => $owner]);
+    $exists = $pdo->prepare('SELECT COUNT(*) FROM api_keys WHERE id = :id AND owner_email = :owner AND revoked_at IS NULL');
+    $exists->execute([':id' => $id, ':owner' => $owner]);
+
+    return (int) $exists->fetchColumn() > 0;
+}
+
+function mimir_key_can_read_events(PDO $pdo, int $id): bool
+{
+    $stmt = $pdo->prepare('SELECT can_read_events FROM api_keys WHERE id = :id AND revoked_at IS NULL');
+    $stmt->execute([':id' => $id]);
+
+    return (int) $stmt->fetchColumn() === 1;
+}
+
 /**
  * @return list<array{id: int, label: string, key: string, created_at: int, revoked_at: ?int, can_write: bool, avg_per_day: float, shared_pct: ?int, days: list<array{date: string, count: int, future: bool}>, write_days: list<array{date: string, count: int, future: bool}>, write_note: ?string}>
  */
 function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
 {
     $stmt = $pdo->prepare(
-        'SELECT id, label, key_plain, created_at, revoked_at, can_write FROM api_keys WHERE owner_email = :owner ORDER BY id DESC'
+        'SELECT id, label, key_plain, created_at, revoked_at, can_write, can_read_events FROM api_keys WHERE owner_email = :owner ORDER BY id DESC'
     );
     $stmt->execute([':owner' => strtolower(trim($ownerEmail))]);
     $rows = [];
@@ -482,6 +507,7 @@ function mimir_key_list(PDO $pdo, string $ownerEmail, int $now): array
             'avg_per_day' => mimir_key_avg_per_day($pdo, $id, $now),
             'shared_pct' => mimir_key_shared_pct($pdo, $id, $now),
             'can_write' => $canWrite,
+            'can_read_events' => (int) ($row['can_read_events'] ?? 0) === 1,
             'days' => mimir_key_usage_days($pdo, $id, $now, MIMIR_USAGE_KIND_READ),
             'write_days' => $canWrite ? mimir_key_usage_days($pdo, $id, $now, MIMIR_USAGE_KIND_WRITE) : [],
             'write_note' => $canWrite ? null : MIMIR_HEATMAP_WRITE_DISABLED_TEXT,

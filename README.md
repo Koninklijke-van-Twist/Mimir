@@ -216,6 +216,7 @@ Authenticatie voor de data-API: `Authorization: Bearer <sleutel>` of `X-API-Key:
 | GET | `/mimir/api/companies.php` | bedrijven uit de nightly-cache (`name` + `environment`). Geen live discovery per call |
 | POST | `/mimir/api/query.php` | één tabel, of meerdere via `queries` |
 | GET | `/mimir/api/write_log.php` | schrijflog van de eigen sleutel (`limit`, `since`, `before_id`, `table`, `company`) |
+| GET | `/mimir/api/events.php` | gebeurtenislog van een dag, alleen sleutels met **Mag eventlog lezen** (`date`, `status`, `caller`, `category`, `limit`, `offset`, `summary=1`) |
 | POST / PATCH / DELETE | `/mimir/api/write.php` | schrijven naar BC (insert / update / delete). Alleen sleutels met schrijfrecht, zie [Schrijven naar BC](#schrijven-naar-bc) |
 | GET | `/mimir/api/metadata.php` | webservice-metadata: alle tabellen met sleutels en velden. Optioneel `environment`, `q` (zoekfilter op tabel- en veldnamen), `table` (één tabel), `page`/`per_page` (max 50). Ook met de ingelogde sessie, zonder sleutel. Belt BC niet |
 
@@ -380,3 +381,15 @@ php tests/mimir_tunnel_values_test.php
 ```
 
 De tests hebben de PHP-extensie `pdo_sqlite` nodig (Debian: `php-sqlite3`). `mimir_write_test.php` gebruikt een gemockte HTTP-client en belt Business Central nooit.
+
+## Gebeurtenislog via API
+
+`GET /mimir/api/events.php` met een sleutel waarbij op de sleutelpagina **Mag eventlog lezen** aanstaat (kolom `can_read_events`, standaard uit; anders 403 `events_not_allowed`).
+
+- `date` YYYY-MM-DD (Europe/Amsterdam, standaard vandaag); `status` kommalijst met de codes van de filtericoontjes (`check-green`, `crate-green`, `question-red`, `cross-red`, `cross-orange`, `recycle-green`, `recycle-orange`, `recycle-red`, `info-blue`); `caller` (label), `category`, `limit` (standaard 500, max 5000), `offset`.
+- Antwoord: `{ date, counts (per status, hele dag), all, matched, rows: [ { time, category, environment, entity, action, caller: {label, owner}, message, status } ] }`. Nooit prefix of hash van een sleutel.
+- `summary=1`: fouten (zonder `status` alle rode/oranje statussen) gegroepeerd op caller, entity, action en genormaliseerd bericht, met `count`, `first`, `last`, `statuses` en een `example`.
+
+```bash
+curl -H "Authorization: Bearer $MIMIR_API_KEY" "https://sleutels.kvt.nl/mimir/api/events.php?summary=1"
+```
