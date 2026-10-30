@@ -105,7 +105,8 @@ function mimir_delta_reason(array $job): ?string
     if (array_diff($needed, $normal) !== []) {
         return 'kolom niet op whitelist';
     }
-    if (mimir_filter_has_flowfilter($job['filter']) || !mimir_filter_coverage_servable($job['filter'])) {
+    if (mimir_filter_has_flowfilter($job['filter']) || !mimir_filter_coverage_servable($job['filter'])
+        || (is_string($job['filter']) && mimir_filter_parse_simple_eq($job['filter']) === null)) {
         return 'filter niet lokaal te bewijzen';
     }
     if (mimir_delta_change_field($types) === null) {
