@@ -404,3 +404,22 @@ mimir_caller_reset();
 mimir_rel_same(mimir_event_caller_display('key_id=31 label="Sancus" owner=tfalken@kvt.nl prefix=ebe85e37 hash=e4257ec3decd'), "Sancus\ntfalken@kvt.nl", 'caller display shows label and owner only');
 mimir_rel_same(mimir_event_caller_display('nightly'), 'nightly', 'nightly stays');
 mimir_rel_same(mimir_event_caller_display('ui owner=tim@kvt.nl'), "ui\ntim@kvt.nl", 'ui caller');
+
+// Server-side statusfilter
+mimir_rel_same(mimir_event_status_filter(null), null, 'no filter param means all');
+mimir_rel_same(mimir_event_status_filter('cross-red,bogus,crate-green'), ['crate-green', 'cross-red'], 'filter keeps known keys only');
+mimir_rel_same(mimir_event_status_filter(''), [], 'empty filter means none');
+$fday = '2026-01-15';
+@unlink(mimir_event_log_path($fday));
+$lines = [];
+for ($i = 0; $i < 5; $i++) { $lines[] = json_encode(['ts' => '2026-01-15T10:0' . $i . ':00+01:00', 'action' => 'cache-hit', 'cache' => 'full', 'message' => 'c' . $i]); }
+for ($i = 0; $i < 3; $i++) { $lines[] = json_encode(['ts' => '2026-01-15T11:0' . $i . ':00+01:00', 'action' => 'bc-failed', 'message' => 'HTTP 500 f' . $i]); }
+file_put_contents(mimir_event_log_path($fday), implode("\n", $lines) . "\n");
+$all = mimir_event_log_day($fday, 1, 2);
+mimir_rel_same([$all['total'], $all['pages'], $all['counts']['crate-green'], $all['counts']['cross-red']], [8, 4, 5, 3], 'unfiltered counts and pages');
+$only = mimir_event_log_day($fday, 2, 2, ['cross-red']);
+mimir_rel_same([$only['total'], $only['all'], $only['pages'], $only['page'], count($only['rows'])], [3, 8, 2, 2, 1], 'filtered total and pagination');
+mimir_rel_same($only['rows'][0]['message'], 'HTTP 500 f0', 'filtered page 2 holds the oldest failure');
+mimir_rel_same(mimir_event_log_day($fday, 1, 500, [])['total'], 0, 'all filters off shows nothing');
+mimir_rel_same(mimir_event_log_day($fday, 1, 500, ['cross-red'])['counts']['crate-green'], 5, 'counts ignore the filter');
+@unlink(mimir_event_log_path($fday));
