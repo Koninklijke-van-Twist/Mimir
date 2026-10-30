@@ -147,7 +147,7 @@ function mimir_sqlite_columns(PDO $pdo, string $table): array
  * Schemaversie in PRAGMA user_version. Verhoog bij elke schemawijziging.
  * Een database op deze versie slaat de DDL helemaal over: geen locks per request.
  */
-const MIMIR_SCHEMA_VERSION = 4;
+const MIMIR_SCHEMA_VERSION = 5;
 /**
  * Vanaf deze versie levert de tunnel OData-formaat (Y-m-d, HH:MM:SS, ISO-UTC).
  * Oudere cache bevat mogelijk tunnelrijen met '20-7-2026' en lege tijden; rijen
