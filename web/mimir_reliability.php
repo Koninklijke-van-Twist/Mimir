@@ -1690,3 +1690,23 @@ function mimir_event_log_cache_hit(string $environment, string $entity): void
     } catch (Throwable) {
     }
 }
+
+/** Aanroeper voor weergave: alleen label en owner (of bijv. "nightly"), zonder prefix/hash. */
+function mimir_event_caller_display(string $caller): string
+{
+    if (!str_contains($caller, 'key_id=') && !str_contains($caller, 'owner=')) {
+        return $caller;
+    }
+    $parts = [];
+    if (preg_match('/^(\w[\w-]*)(?:\s|$)/', $caller, $m) === 1 && !str_contains($m[1], '=') && $m[1] !== 'key_id') {
+        $parts[] = $m[1];
+    }
+    if (preg_match('/label="([^"]*)"/', $caller, $m) === 1 && $m[1] !== '') {
+        $parts[] = $m[1];
+    }
+    if (preg_match('/owner=(\S+)/', $caller, $m) === 1) {
+        $parts[] = $m[1];
+    }
+
+    return implode("\n", $parts);
+}

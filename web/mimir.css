@@ -301,3 +301,6 @@ mark { background: #ffe08a; color: inherit; border-radius: 3px; padding: 0 1px; 
 .event-day-nav { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
 .event-day-nav input[type="date"] { width: auto; }
 .event-day-nav { display: flex !important; }
+#events td.event-time { white-space: nowrap; min-width: 9.5rem; }
+#events th.event-status, #events td.event-status { padding-left: .75rem; overflow: visible; }
+#reliability .table-wrap { overflow-x: auto; overflow-y: visible; padding-left: 2px; }

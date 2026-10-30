@@ -213,12 +213,12 @@ function mimir_h(string $value): string
                                 <tr>
                                     <?php $mimirStatus = mimir_event_status($event); ?>
                                     <td class="event-status" title="<?= mimir_event_escape($mimirStatus['title']) ?>"><?= mimir_event_icon_svg($mimirStatus) ?></td>
-                                    <td title="<?= mimir_event_escape((string) $event['ts']) ?>"><?= mimir_event_escape(mimir_event_display_time((string) $event['ts'])) ?></td>
+                                    <td class="event-time" title="<?= mimir_event_escape((string) $event['ts']) ?>"><?= mimir_event_escape(mimir_event_display_time((string) $event['ts'])) ?></td>
                                     <td><?= mimir_event_escape((string) $event['category']) ?></td>
                                     <td><?= mimir_event_escape((string) $event['environment']) ?></td>
                                     <td><?= mimir_event_escape((string) $event['entity']) ?></td>
                                     <td><?= mimir_event_escape((string) $event['action']) ?></td>
-                                    <td><?= mimir_event_escape((string) ($event['caller'] ?? '')) ?></td>
+                                    <td class="event-caller"><?= nl2br(mimir_event_escape(mimir_event_caller_display((string) ($event['caller'] ?? ''))), false) ?></td>
                                     <td><?= mimir_event_escape((string) $event['message']) ?></td>
                                 </tr>
                             <?php endforeach; ?>
