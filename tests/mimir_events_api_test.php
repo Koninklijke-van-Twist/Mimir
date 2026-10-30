@@ -58,4 +58,11 @@ ev_same($ok['status'], 200, 'met recht 200');
 ev_same(mimir_events_api_handle('GET', $key['key'], ['date' => '30-10-2026'], $pdo)['status'], 400, 'foute datum');
 ev_same(mimir_events_api_handle('POST', $key['key'], [], $pdo)['status'], 405, 'alleen GET');
 
+// Bestaande database op versie 4 zonder kolom krijgt can_read_events bij openen.
+$old = new PDO('sqlite:' . $tmp . '/old.sqlite');
+$old->exec('CREATE TABLE api_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_email TEXT NOT NULL, label TEXT NOT NULL, key_plain TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, revoked_at INTEGER, can_write INTEGER NOT NULL DEFAULT 0)');
+$old->exec('PRAGMA user_version = 4');
+mimir_migrate($old);
+ev_same(in_array('can_read_events', mimir_sqlite_columns($old, 'api_keys'), true), true, 'v4 -> kolom toegevoegd');
+
 echo "mimir_events_api_test OK\n";
