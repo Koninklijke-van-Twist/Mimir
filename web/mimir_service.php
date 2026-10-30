@@ -895,8 +895,9 @@ function mimir_metadata_api_main(): void
 
 function mimir_session_email(): string
 {
+    // Alleen lezen: het sessielock mag niet openblijven tijdens trage BC-calls.
     if (session_status() !== PHP_SESSION_ACTIVE) {
-        session_start();
+        session_start(['read_and_close' => true]);
     }
     $email = strtolower(trim((string) ($_SESSION['user']['email'] ?? '')));
     if ($email === '' || filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
