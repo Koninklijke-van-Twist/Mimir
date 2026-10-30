@@ -401,3 +401,6 @@ mimir_rel_same(is_file(mimir_event_log_path($oldDay)), false, 'events of 8 days 
 mimir_rel_same(is_file(mimir_event_log_path($keepDay)), true, 'events of 7 days ago stay');
 mimir_rel_same(is_file(mimir_event_log_path($today)), true, 'today stays');
 mimir_caller_reset();
+mimir_rel_same(mimir_event_caller_display('key_id=31 label="Sancus" owner=tfalken@kvt.nl prefix=ebe85e37 hash=e4257ec3decd'), "Sancus\ntfalken@kvt.nl", 'caller display shows label and owner only');
+mimir_rel_same(mimir_event_caller_display('nightly'), 'nightly', 'nightly stays');
+mimir_rel_same(mimir_event_caller_display('ui owner=tim@kvt.nl'), "ui\ntim@kvt.nl", 'ui caller');
