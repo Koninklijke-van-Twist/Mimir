@@ -752,8 +752,8 @@ function mimir_api_main(?string $forcedRoute = null): void
         } catch (MimirUserException $error) {
             mimir_json(['error' => $error->getMessage()], $error->status);
         }
-        // Interactief tenzij de client "background": true meestuurt (warm-up, nachtjob).
-        $GLOBALS['mimir_bc_interactive'] = empty($body['background']);
+        // Alleen "interactive": true (webpagina/AJAX) krijgt de korte slotwacht.
+        $GLOBALS['mimir_bc_interactive'] = is_array($body) && ($body['interactive'] ?? false) === true;
     }
 
     try {

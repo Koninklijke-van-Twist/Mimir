@@ -34,7 +34,7 @@ require_once __DIR__ . '/mimir_reliability.php';
 const MIMIR_BC_MAX_CONCURRENT = 3;
 const MIMIR_BC_QUEUE_WAIT_SECONDS = 120;
 const MIMIR_BC_LIMIT_POLL_US = 50000;
-/** Korte slotwacht voor interactieve webverzoeken (API query zonder background). */
+/** Korte slotwacht voor interactieve webverzoeken (API query met "interactive": true). */
 const MIMIR_BC_INTERACTIVE_QUEUE_WAIT_SECONDS = 10;
 /** Kleine lookups (top <= dit, of één eq op een sleutel) mogen een extra fast-lane-slot. */
 const MIMIR_BC_FAST_LANE_MAX_TOP = 50;
@@ -75,7 +75,7 @@ function mimir_bc_limit_queue_wait_seconds(): int
         return max(0, (int) $GLOBALS['mimir_bc_queue_wait_seconds']);
     }
     // Interactief webverzoek: kort wachten en snel 503, zodat de client kan terugvallen.
-    // CLI, hourly, nightly en background-verzoeken houden de lange wacht.
+    // Standaard (CLI, hourly, nightly, alle andere verzoeken) blijft de lange wacht.
     if (PHP_SAPI !== 'cli' && !empty($GLOBALS['mimir_bc_interactive'])) {
         return MIMIR_BC_INTERACTIVE_QUEUE_WAIT_SECONDS;
     }
