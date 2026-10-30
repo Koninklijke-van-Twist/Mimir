@@ -21,8 +21,6 @@ const MIMIR_BC_RETRY_ATTEMPTS = 3;
 const MIMIR_BC_RETRY_BUDGET_US = 8000000;
 const MIMIR_BC_RETRY_BASE_US = 200000;
 const MIMIR_CIRCUIT_PROBE_SECONDS = 5;
-const MIMIR_EVENT_LOG_MAX_BYTES = 262144;
-const MIMIR_EVENT_LOG_KEEP = 3;
 const MIMIR_BC_TIMEOUT_NO_RETRY_SECONDS = 45.0;
 const MIMIR_METADATA_SNAPSHOT_TTL = 86400;
 
@@ -113,9 +111,50 @@ function mimir_event_redact(string $message): string
     return $message;
 }
 
-function mimir_event_log_path(): string
+/** Eén bestand per dag (Europe/Amsterdam); de bestandsnaam is de index op tijd. */
+function mimir_event_log_path(?string $day = null): string
+{
+    if ($day === null || preg_match('/^\d{4}-\d{2}-\d{2}$/', $day) !== 1) {
+        $day = mimir_event_today();
+    }
+
+    return mimir_runtime_dir() . '/mimir-events-' . $day . '.jsonl';
+}
+
+function mimir_event_today(?int $unix = null): string
+{
+    return (new DateTimeImmutable('@' . ($unix ?? time())))->setTimezone(new DateTimeZone('Europe/Amsterdam'))->format('Y-m-d');
+}
+
+/** Oud logbestand van voor de dagbestanden (mimir-events.jsonl + .1..3). */
+function mimir_event_legacy_path(): string
 {
     return mimir_runtime_dir() . '/mimir-events.jsonl';
+}
+
+/**
+ * Retentie: vandaag + 7 vorige dagen blijven, ouder gaat weg. Eén glob, geen leesacties.
+ * Aangeroepen vanuit nightly.php en hourly.php, niet per verzoek.
+ */
+function mimir_event_log_prune(?int $now = null): int
+{
+    $cutoff = (new DateTimeImmutable(mimir_event_today($now), new DateTimeZone('Europe/Amsterdam')))->modify('-7 days')->format('Y-m-d');
+    $removed = 0;
+    foreach (glob(mimir_runtime_dir() . '/mimir-events-*.jsonl') ?: [] as $file) {
+        if (preg_match('/mimir-events-(\d{4}-\d{2}-\d{2})\.jsonl$/', $file, $m) === 1 && $m[1] < $cutoff && @unlink($file)) {
+            $removed++;
+        }
+    }
+    $legacy = mimir_event_legacy_path();
+    $cutoffTs = strtotime($cutoff . ' 00:00:00 Europe/Amsterdam');
+    foreach (array_merge([$legacy], glob($legacy . '.*') ?: []) as $file) {
+        $mtime = is_file($file) ? @filemtime($file) : false;
+        if (is_int($mtime) && $mtime < $cutoffTs && @unlink($file)) {
+            $removed++;
+        }
+    }
+
+    return $removed;
 }
 
 function mimir_caller_reset(): void
@@ -248,7 +287,10 @@ function mimir_caller_log_value(): string
     return implode(' ', $parts);
 }
 
-function mimir_event_log(string $category, string $message, string $environment = '', string $entity = '', string $action = ''): void
+/**
+ * @param array{attempt?: int, retry_next?: bool, cache?: string} $extra
+ */
+function mimir_event_log(string $category, string $message, string $environment = '', string $entity = '', string $action = '', array $extra = []): void
 {
     $dir = mimir_runtime_dir();
     if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
@@ -264,11 +306,24 @@ function mimir_event_log(string $category, string $message, string $environment 
         'entity' => mimir_event_redact($entity),
         'action' => mimir_event_redact($action),
     ];
-    if (mimir_event_logs_caller($action)) {
-        $caller = mimir_event_redact(mimir_caller_log_value());
-        if ($caller !== '') {
-            $entry['caller'] = $caller;
-        }
+    // Aanroeper bij elke regel die tijdens een verzoek/run ontstaat, niet alleen bij fouten.
+    $caller = mimir_event_redact(mimir_caller_log_value());
+    if ($caller !== '') {
+        $entry['caller'] = $caller;
+    }
+    if (isset($extra['attempt'])) {
+        $entry['attempt'] = (int) $extra['attempt'];
+    } elseif (mimir_event_logs_caller($action) && (int) ($GLOBALS['mimir_retry_gave_up'] ?? 0) > 1) {
+        // Fout na eerdere pogingen: er zijn al retries geweest.
+        $entry['attempt'] = (int) $GLOBALS['mimir_retry_gave_up'];
+        $entry['retry_next'] = false;
+        unset($GLOBALS['mimir_retry_gave_up']);
+    }
+    if (isset($extra['retry_next'])) {
+        $entry['retry_next'] = (bool) $extra['retry_next'];
+    }
+    if (isset($extra['cache']) && $extra['cache'] !== '') {
+        $entry['cache'] = (string) $extra['cache'];
     }
     $line = json_encode($entry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     if ($line === false) {
@@ -281,21 +336,6 @@ function mimir_event_log(string $category, string $message, string $environment 
     try {
         if (!@flock($handle, LOCK_EX)) {
             return;
-        }
-        clearstatcache(true, $path);
-        $size = @filesize($path);
-        if (is_int($size) && $size >= MIMIR_EVENT_LOG_MAX_BYTES) {
-            @flock($handle, LOCK_UN);
-            @fclose($handle);
-            $handle = null;
-            mimir_event_log_rotate($path);
-            $handle = @fopen($path, 'ab');
-            if ($handle === false) {
-                return;
-            }
-            if (!@flock($handle, LOCK_EX)) {
-                return;
-            }
         }
         @fwrite($handle, $line . "\n");
         @fflush($handle);
@@ -310,25 +350,6 @@ function mimir_event_log(string $category, string $message, string $environment 
     }
 }
 
-function mimir_event_log_rotate(string $path): void
-{
-    $keep = MIMIR_EVENT_LOG_KEEP;
-    $oldest = $path . '.' . $keep;
-    if (is_file($oldest)) {
-        @unlink($oldest);
-    }
-    for ($index = $keep - 1; $index >= 1; $index--) {
-        $from = $path . '.' . $index;
-        $to = $path . '.' . ($index + 1);
-        if (is_file($from)) {
-            @rename($from, $to);
-        }
-    }
-    if (is_file($path)) {
-        @rename($path, $path . '.1');
-    }
-}
-
 /**
  * @return list<array{ts: string, category: string, message: string, environment: string, entity: string, action: string, caller: string}>
  */
@@ -337,12 +358,23 @@ function mimir_event_log_recent(int $limit = 40): array
     if ($limit < 1) {
         return [];
     }
-    $path = mimir_event_log_path();
-    $lines = mimir_event_log_tail($path, $limit);
-    if (count($lines) < $limit && is_file($path . '.1')) {
-        $older = mimir_event_log_tail($path . '.1', $limit - count($lines));
-        $lines = array_merge($older, $lines);
+    $lines = mimir_event_log_tail(mimir_event_log_path(), $limit);
+    $sources = [mimir_event_log_path(mimir_event_today(time() - 86400)), mimir_event_legacy_path(), mimir_event_legacy_path() . '.1'];
+    foreach ($sources as $source) {
+        if (count($lines) >= $limit) {
+            break;
+        }
+        $lines = array_merge(mimir_event_log_tail($source, $limit - count($lines)), $lines);
     }
+    return mimir_event_rows($lines);
+}
+
+/**
+ * @param list<string> $lines
+ * @return list<array<string, mixed>>
+ */
+function mimir_event_rows(array $lines): array
+{
     $rows = [];
     foreach ($lines as $line) {
         $decoded = json_decode($line, true);
@@ -357,6 +389,10 @@ function mimir_event_log_recent(int $limit = 40): array
             'entity' => (string) ($decoded['entity'] ?? ''),
             'action' => (string) ($decoded['action'] ?? ''),
             'caller' => (string) ($decoded['caller'] ?? ''),
+            // Oude regels zonder deze velden: attempt 0, retry_next null, cache ''.
+            'attempt' => (int) ($decoded['attempt'] ?? 0),
+            'retry_next' => isset($decoded['retry_next']) ? (bool) $decoded['retry_next'] : null,
+            'cache' => (string) ($decoded['cache'] ?? ''),
         ];
     }
 
@@ -672,7 +708,7 @@ function mimir_db_retry(callable $fn, int $attempts = MIMIR_SQLITE_RETRY_ATTEMPT
             $result = $fn();
             mimir_db_relax_tracked();
             if ($retried) {
-                mimir_event_log('sqlite', 'Tijdelijke SQLite-fout hersteld na opnieuw proberen.', '', '', 'retried');
+                mimir_event_log('sqlite', 'Tijdelijke SQLite-fout hersteld na opnieuw proberen.', '', '', 'retried', ['attempt' => $attempt]);
             }
 
             return $result;
@@ -761,16 +797,20 @@ function mimir_bc_retry(callable $fn, int $attempts = MIMIR_BC_RETRY_ATTEMPTS): 
         try {
             $result = $fn();
             if ($retried) {
-                mimir_event_log('bc', 'Tijdelijke Business Central-fout hersteld na opnieuw proberen.', '', '', 'retried');
+                mimir_event_log('bc', 'Tijdelijke Business Central-fout hersteld na opnieuw proberen.', '', '', 'retried', ['attempt' => $attempt]);
             }
 
             return $result;
         } catch (Throwable $error) {
-            if (!mimir_bc_is_transient($error) || $attempt >= $attempts) {
-                throw $error;
-            }
             $remaining = $budget - $spent;
-            if ($remaining <= 0) {
+            $retryNext = mimir_bc_is_transient($error) && $attempt < $attempts && $remaining > 0;
+            if ($retried || $retryNext) {
+                mimir_event_log('bc', mimir_event_redact($error->getMessage()), '', '', 'attempt-failed', ['attempt' => $attempt, 'retry_next' => $retryNext]);
+            }
+            if (!$retryNext) {
+                if ($retried) {
+                    $GLOBALS['mimir_retry_gave_up'] = $attempt;
+                }
                 throw $error;
             }
             $sleepUs = 0;
@@ -1523,4 +1563,130 @@ function mimir_csrf_valid(string $presented): bool
     }
 
     return hash_equals($expected, $presented);
+}
+
+/**
+ * Statusicoon voor een gebeurtenis in de tabel.
+ *
+ * @param array<string, mixed> $event
+ * @return array{icon: string, color: string, title: string}
+ */
+function mimir_event_status(array $event): array
+{
+    $action = (string) ($event['action'] ?? '');
+    $message = (string) ($event['message'] ?? '');
+    $attempt = (int) ($event['attempt'] ?? 0);
+    $retryNext = $event['retry_next'] ?? null;
+    if (($event['cache'] ?? '') === 'full') {
+        return ['icon' => 'crate', 'color' => 'green', 'title' => 'Geslaagd, volledig uit cache beantwoord'];
+    }
+    if (in_array($action, ['recovered', 'self-repair', 'tunnel-columns', 'truncated', 'rolling'], true)) {
+        return ['icon' => 'info', 'color' => 'blue', 'title' => 'Statusbericht, geen gevolg van een verzoek'];
+    }
+    if ($action === 'retried') {
+        return ['icon' => 'recycle', 'color' => 'green', 'title' => 'Retry geslaagd' . ($attempt > 0 ? ' (poging ' . $attempt . ')' : '')];
+    }
+    if ($action === 'attempt-failed') {
+        if ($retryNext === true) {
+            return ['icon' => 'recycle', 'color' => 'orange', 'title' => 'Poging ' . $attempt . ' mislukt, er volgt nog een retry'];
+        }
+        if ($attempt > 1) {
+            return ['icon' => 'recycle', 'color' => 'red', 'title' => 'Retry (poging ' . $attempt . ') mislukt, Mímir stopt'];
+        }
+    }
+    $failed = in_array($action, ['attempt-failed', 'bc-failed', 'failed', 'bypassed-to-BC', 'delta-fallback', 'fallback-one-slot', 'tunnel-fallback', 'stale-webservice'], true)
+        || ($event['category'] ?? '') === 'error';
+    if (!$failed) {
+        return ['icon' => 'check', 'color' => 'green', 'title' => 'Geslaagd'];
+    }
+    if (mimir_event_is_not_found($message)) {
+        return ['icon' => 'question', 'color' => 'red', 'title' => 'Gevraagde tabel, webservice of kolom bestaat niet'];
+    }
+    $fallback = in_array($action, ['bypassed-to-BC', 'delta-fallback', 'fallback-one-slot', 'tunnel-fallback'], true);
+    if ($fallback || $retryNext === true || $attempt > 1) {
+        return ['icon' => 'cross', 'color' => 'orange', 'title' => 'Mislukt, er volgt of volgde een nieuwe poging'];
+    }
+
+    return ['icon' => 'cross', 'color' => 'red', 'title' => 'Mislukt'];
+}
+
+function mimir_event_is_not_found(string $message): bool
+{
+    return preg_match('/HTTP 404|RecordNotFound|BadRequest_NotFound|does not exist|bestaat niet|niet gevonden|Onbekende (tabel|kolom|webservice)|not found for the type|Could not find a property/i', $message) === 1;
+}
+
+function mimir_event_icon_svg(array $status): string
+{
+    $fill = ['green' => '#2e9e4f', 'orange' => '#e08a00', 'red' => '#d33a2c', 'blue' => '#2f6fd6'][$status['color']] ?? '#888';
+    $title = mimir_event_escape($status['title']);
+    if ($status['icon'] === 'crate') {
+        // Krat uit Elpis (web/box.svg), in groen.
+        return '<svg class="event-icon" width="16" height="16" viewBox="225 118.87 130 148.62" role="img" aria-label="' . $title . '"><title>' . $title . '</title>'
+            . '<path style="fill:#7fd08f" d="m 293.91667,257.58479 0.58333,-62.68797 17,-9.80097 24.9234,-13.9719 L 347.1402,165 347.5,227.2369 Z M 237,158.01963 254.37491,147.70233 308,178.50142 290.09096,188.79664 Z m 42,-23.80039 10.97788,-7.31813 53.0211,31.05961 -10.99051,6.70243 z"/>'
+            . '<path style="fill:#2e9e4f" d="M 225.69479,230.4916 225,157.80242 l 64.99724,-38.93138 64.98213,38.23912 -0.74468,73.4329 -63.40437,36.94681 z M 347.5,227.2369 347.1402,165 l -10.7168,6.12395 -0.22871,29.92087 -11.65797,-2.78288 -13.26779,15.93027 0.23107,-29.09636 -17,9.80097 -0.5833,62.68797 z M 308,178.50142 254.37491,147.70233 237,158.01963 l 53.09096,30.77701 z m 34.99898,-20.5407 -53.0211,-31.05961 -10.97788,7.31813 53.00847,30.44391 z"/></svg>';
+    }
+    $glyph = match ($status['icon']) {
+        'check' => '<path d="M4.5 8.3l2.3 2.3 4.7-5" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
+        'cross' => '<path d="M5.2 5.2l5.6 5.6M10.8 5.2l-5.6 5.6" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>',
+        'info' => '<circle cx="8" cy="4.6" r="1.1" fill="#fff"/><path d="M8 7v4.8" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>',
+        'question' => '<path d="M6 6.2a2 2 0 1 1 2.8 1.8c-.6.3-.8.7-.8 1.3v.4" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/><circle cx="8" cy="11.8" r="1" fill="#fff"/>',
+        default => '<path d="M11.6 6.4A4 4 0 0 0 4.6 6M4.4 9.6A4 4 0 0 0 11.4 10" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/><path d="M4.1 3.6v2.8h2.8M11.9 12.4V9.6H9.1" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>',
+    };
+
+    return '<svg class="event-icon" width="16" height="16" viewBox="0 0 16 16" role="img" aria-label="' . $title . '"><title>' . $title . '</title><circle cx="8" cy="8" r="8" fill="' . $fill . '"/>' . $glyph . '</svg>';
+}
+
+/** "28 Apr 2026, 15:34" in Europe/Amsterdam; onleesbare waarde blijft ongewijzigd. */
+function mimir_event_display_time(string $ts): string
+{
+    try {
+        $moment = new DateTimeImmutable($ts);
+    } catch (Throwable) {
+        return $ts;
+    }
+
+    return $moment->setTimezone(new DateTimeZone('Europe/Amsterdam'))->format('j M Y, H:i');
+}
+
+/**
+ * Gebeurtenissen van één dag, nieuwste eerst, gepagineerd.
+ *
+ * @return array{rows: list<array<string, mixed>>, total: int, page: int, pages: int}
+ */
+function mimir_event_log_day(string $day, int $page = 1, int $perPage = 500): array
+{
+    $lines = [];
+    $file = mimir_event_log_path($day);
+    if (is_file($file)) {
+        $lines = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+    }
+    // Oude regels uit het logbestand van voor de dagbestanden, op datum gefilterd.
+    $legacy = [];
+    foreach ([mimir_event_legacy_path() . '.3', mimir_event_legacy_path() . '.2', mimir_event_legacy_path() . '.1', mimir_event_legacy_path()] as $old) {
+        if (!is_file($old)) {
+            continue;
+        }
+        foreach (@file($old, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+            if (preg_match('/"ts":"([^"]+)"/', $line, $m) === 1 && mimir_event_today((int) strtotime($m[1])) === $day) {
+                $legacy[] = $line;
+            }
+        }
+    }
+    $lines = array_merge($legacy, $lines);
+    $total = count($lines);
+    $perPage = max(1, $perPage);
+    $pages = max(1, (int) ceil($total / $perPage));
+    $page = min(max(1, $page), $pages);
+    $slice = array_slice(array_reverse($lines), ($page - 1) * $perPage, $perPage);
+
+    return ['rows' => mimir_event_rows($slice), 'total' => $total, 'page' => $page, 'pages' => $pages];
+}
+
+/** Goedkope logregel voor een verzoek dat volledig uit cache kwam; faalt nooit. */
+function mimir_event_log_cache_hit(string $environment, string $entity): void
+{
+    try {
+        mimir_event_log('request', 'Volledig uit cache beantwoord.', $environment, $entity, 'cache-hit', ['cache' => 'full']);
+    } catch (Throwable) {
+    }
 }

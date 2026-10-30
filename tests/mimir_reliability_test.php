@@ -214,7 +214,7 @@ foreach (mimir_event_log_recent(20) as $row) {
 $expectedCaller = 'key_id=12 label="Consus" owner=tim@kvt.nl prefix=' . substr($callerKey, 6, 8) . ' hash=' . $callerHash;
 mimir_rel_same($failedCaller, $expectedCaller, 'bc-failed names the API key without the secret');
 mimir_rel_same($bypassCaller, $expectedCaller, 'bypassed-to-BC names the same caller');
-mimir_rel_same($retryCaller, '', 'retried does not add a caller field');
+mimir_rel_same($retryCaller, $expectedCaller, 'retried also names the caller');
 mimir_caller_bind_named('ui', 'tim@kvt.nl');
 mimir_event_log('request', 'slot files unusable', 'kvtmdlive_aad', '', 'fallback-one-slot');
 mimir_caller_bind_named('nightly', '');
@@ -369,3 +369,35 @@ try {
 }
 
 fwrite(STDOUT, "ok\n");
+
+// Statusicoon en tijdnotatie
+$st = static fn (array $e): string => mimir_event_status($e)['icon'] . '/' . mimir_event_status($e)['color'];
+mimir_rel_same($st(['action' => 'delta']), 'check/green', 'normal event is a green check');
+mimir_rel_same($st(['action' => 'delta', 'cache' => 'full']), 'crate/green', 'full cache hit is a green crate');
+mimir_rel_same($st(['action' => 'bc-failed', 'message' => 'HTTP 500']), 'cross/red', 'failure is a red cross');
+mimir_rel_same($st(['action' => 'bc-failed', 'message' => 'HTTP 500', 'attempt' => 3]), 'cross/orange', 'failure after retries is orange');
+mimir_rel_same($st(['action' => 'bc-failed', 'message' => 'HTTP 404 Not Found']), 'question/red', 'not found is a red question mark');
+mimir_rel_same($st(['action' => 'retried', 'attempt' => 2]), 'recycle/green', 'successful retry');
+mimir_rel_same($st(['action' => 'attempt-failed', 'attempt' => 2, 'retry_next' => true]), 'recycle/orange', 'retry failed, more coming');
+mimir_rel_same($st(['action' => 'attempt-failed', 'attempt' => 3, 'retry_next' => false]), 'recycle/red', 'last retry failed');
+mimir_rel_same($st(['action' => 'recovered']), 'info/blue', 'status message is blue info');
+mimir_rel_same(mimir_event_display_time('2026-04-28T13:34:00+00:00'), '28 Apr 2026, 15:34', 'display time');
+
+// Dagbestanden, paginering, cache-hit en retentie
+$today = mimir_event_today();
+mimir_caller_bind_named('ui', 'tim@kvt.nl');
+mimir_event_log_cache_hit('kvtmdlive_aad', 'ItemList');
+$dayPage = mimir_event_log_day($today, 1, 2);
+mimir_rel_same($dayPage['rows'][0]['cache'] ?? '', 'full', 'cache hit is newest on today page');
+mimir_rel_same($dayPage['rows'][0]['caller'] ?? '', 'ui owner=tim@kvt.nl', 'cache hit names the caller');
+mimir_rel_same(count($dayPage['rows']), 2, 'page size is honoured');
+mimir_rel_same($dayPage['pages'] >= 2, true, 'day has more pages');
+$oldDay = (new DateTimeImmutable($today))->modify('-8 days')->format('Y-m-d');
+$keepDay = (new DateTimeImmutable($today))->modify('-7 days')->format('Y-m-d');
+file_put_contents(mimir_event_log_path($oldDay), "{}\n");
+file_put_contents(mimir_event_log_path($keepDay), "{}\n");
+mimir_event_log_prune();
+mimir_rel_same(is_file(mimir_event_log_path($oldDay)), false, 'events of 8 days ago are removed');
+mimir_rel_same(is_file(mimir_event_log_path($keepDay)), true, 'events of 7 days ago stay');
+mimir_rel_same(is_file(mimir_event_log_path($today)), true, 'today stays');
+mimir_caller_reset();

@@ -569,6 +569,12 @@ function mimir_api_cached_payload(PDO $pdo, array $record, array $parsed, int $n
         $flags['from_cache'],
         $flags['from_live']
     );
+    if ($flags['from_cache'] > 0 && $flags['from_live'] === 0 && $flags['bc_hit'] === 0) {
+        mimir_event_log_cache_hit(
+            (string) ($result['environment'] ?? $body['company'] ?? ''),
+            (string) ($body['table'] ?? (is_array($body['queries'] ?? null) ? 'batch' : ''))
+        );
+    }
 
     return $result;
 }
