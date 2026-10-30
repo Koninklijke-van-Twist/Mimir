@@ -1093,6 +1093,32 @@ function mimir_select_sig_covers(string $stored, string $needed): bool
 }
 
 /**
+ * Kolommen van één opgeslagen rij (LIMIT 1). mimir_run gebruikt alleen of er al
+ * kolommen op file staan; een volledige scan + json_decode per cache-hit is daarvoor
+ * onnodig duur (AppItemCard: ~2 s per verzoek).
+ *
+ * @return list<string>
+ */
+function mimir_on_file_columns_any(PDO $pdo, string $environment, string $company, string $entity): array
+{
+    $stmt = $pdo->prepare(
+        'SELECT payload FROM cache_rows WHERE environment = :environment AND company = :company AND entity = :entity LIMIT 1'
+    );
+    $stmt->execute([':environment' => $environment, ':company' => $company, ':entity' => $entity]);
+    $raw = $stmt->fetchColumn();
+    $stmt->closeCursor();
+    $payload = is_string($raw) ? json_decode($raw, true) : null;
+    $cols = [];
+    foreach (is_array($payload) ? array_keys($payload) : [] as $key) {
+        if (is_string($key) && $key !== '' && !str_starts_with($key, '@')) {
+            $cols[] = $key;
+        }
+    }
+    sort($cols, SORT_STRING);
+    return $cols;
+}
+
+/**
  * Business-column names currently stored for an entity (union across cached rows).
  *
  * @return list<string>
@@ -1329,7 +1355,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $batchCount = $filterBatches === null ? 1 : count($filterBatches);
     $selectSig = mimir_select_sig($select);
     $required = array_values(array_unique(array_merge($select, mimir_filter_fields($filter))));
-    $onFile = mimir_on_file_columns($pdo, $environment, $company, $entity);
+    $onFile = mimir_on_file_columns_any($pdo, $environment, $company, $entity);
     $emptyFilterFetch = ($pushed === null);
     // Full-entity warms omit $select toward BC; filtered cold may still pass select.
     // Age-refresh non-shrink is preserved by omitting (or by mimir_select_for_bc_refresh when used).
