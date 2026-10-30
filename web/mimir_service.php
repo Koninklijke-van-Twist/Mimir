@@ -752,6 +752,8 @@ function mimir_api_main(?string $forcedRoute = null): void
         } catch (MimirUserException $error) {
             mimir_json(['error' => $error->getMessage()], $error->status);
         }
+        // Alleen "interactive": true (webpagina/AJAX) krijgt de korte slotwacht.
+        $GLOBALS['mimir_bc_interactive'] = is_array($body) && ($body['interactive'] ?? false) === true;
     }
 
     try {
