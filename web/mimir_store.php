@@ -16,6 +16,8 @@ const MIMIR_DEFAULT_MAX_AGE = 3600;
 const MIMIR_MAX_MAX_AGE = 31536000;
 const MIMIR_DEFAULT_TOP = 100;
 const MIMIR_MAX_TOP = 10000;
+// Volledige BC-sets (prijslijst, AppItems) plus één cachepagina passen niet in 512M.
+const MIMIR_MEMORY_LIMIT = '2048M';
 const MIMIR_METADATA_TTL = 3600;
 const MIMIR_COMPANY_TTL = 86400;
 const MIMIR_USAGE_KIND_READ = 'read';
@@ -1328,6 +1330,7 @@ function mimir_project_row(array $row, array $select): array
  */
 function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): array
 {
+    @ini_set('memory_limit', MIMIR_MEMORY_LIMIT);
     $environment = trim((string) ($job['environment'] ?? ''));
     $company = trim((string) ($job['company'] ?? ''));
     $entity = trim((string) ($job['entity'] ?? ''));
@@ -1338,6 +1341,7 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     if ($company === '') {
         throw new MimirUserException('company is verplicht.');
     }
+    $GLOBALS['mimir_request_entity'] = $entity;
     if (!mimir_entity_name_ok($entity)) {
         throw new MimirUserException('Tabelnaam is ongeldig.');
     }
@@ -1421,6 +1425,8 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $keyId = array_key_exists('key_id', $job) && $job['key_id'] !== null && $job['key_id'] !== ''
         ? (int) $job['key_id']
         : null;
+    // Antwoord bewaart alleen select/filter/sleutel. De brede BC-rij leeft één pagina. null = hele rij (lege select).
+    $retainKeys = mimir_fetch_retain_keys($select, $filter, $keys);
     $allowBroad = mimir_filter_allows_local($filter);
 
     $slotHeld = false;
@@ -1679,7 +1685,8 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                     $now,
                     false,
                     $keyId,
-                    $top
+                    $top,
+                    $retainKeys
                 );
                 if ($live['mode'] === 'local') {
                     $mode = 'local';
@@ -1744,17 +1751,26 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
                 $now,
                 true,
                 $keyId,
-                $top
+                $top,
+                $retainKeys
             );
             $mode = $live['mode'];
             $pushed = $live['pushed'];
-            $deltaMode = mimir_delta_record_full($pdo, $deltaJob, $live, $fetchSelect, $now);
-            foreach ($live['rows'] as $row) {
+            $rows = $live['rows'];
+            // Niet de hele set meegeven: record_full leest alleen truncated/pushed,
+            // en een schrijfactie zou de rijlijst anders kopiëren.
+            $deltaMode = mimir_delta_record_full($pdo, $deltaJob, [
+                'truncated' => !empty($live['truncated']),
+                'pushed' => $live['pushed'],
+            ], $fetchSelect, $now);
+            unset($live);
+            foreach ($rows as $row) {
                 if (!mimir_filter_match($row['payload'], $filter, $types)) {
                     continue;
                 }
                 $kept[] = $row;
             }
+            unset($rows);
             if ($top > 0 && count($kept) > $top) {
                 $kept = array_slice($kept, 0, $top);
             }
@@ -1765,12 +1781,14 @@ function mimir_query_entity(PDO $pdo, array $job, callable $fetch, int $now): ar
     $value = [];
     $min = null;
     $max = null;
-    foreach ($kept as $row) {
+    foreach ($kept as $i => $row) {
         $value[] = mimir_project_row($row['payload'], $select);
         $at = (int) $row['fetched_at'];
         $min = $min === null ? $at : min($min, $at);
         $max = $max === null ? $at : max($max, $at);
+        unset($kept[$i]);
     }
+    unset($kept);
 
     $bcHit = 0;
     $shared = 0;
@@ -2051,7 +2069,8 @@ function mimir_try_range_gap_fill(
             $now,
             true,
             $keyId,
-            0
+            0,
+            mimir_fetch_retain_keys($select, $filter, $keys)
         );
         $liveMode = $live['mode'];
         $lastPushed = $live['pushed'];
@@ -2264,9 +2283,42 @@ function mimir_refresh_whole_row(
 }
 
 /**
+ * Kolommen die het antwoord en de lokale hercontrole nog nodig hebben.
+ * null = de hele rij (lege select levert alle kolommen terug).
+ *
+ * @param list<string> $select
+ * @param list<string> $keys
+ * @return list<string>|null
+ */
+function mimir_fetch_retain_keys(array $select, mixed $filter, array $keys): ?array
+{
+    if ($select === []) {
+        return null;
+    }
+    $fields = array_merge($select, $keys);
+    if (is_string($filter)) {
+        $parsed = mimir_filter_parse_simple_eq($filter);
+        if ($parsed !== null) {
+            $fields[] = $parsed['field'];
+        } else {
+            foreach (mimir_filter_parse_simple_and($filter) ?? [] as $leaf) {
+                $fields[] = $leaf['field'];
+            }
+        }
+    } else {
+        foreach (mimir_filter_fields($filter) as $field) {
+            $fields[] = $field;
+        }
+    }
+
+    return array_values(array_unique($fields));
+}
+
+/**
  * @param list<string> $keys
  * @param list<string> $select
  * @param array<string, string> $types
+ * @param list<string>|null $retainKeys null = volledige payload in het resultaat
  * @param callable(string): array $fetch
  * @return array{rows: list<array{payload: array<string, mixed>, fetched_at: int}>, mode: string, pushed: ?string, truncated: bool}
  */
@@ -2286,8 +2338,10 @@ function mimir_fetch_collection(
     int $now,
     bool $writeCoverage = true,
     ?int $keyId = null,
-    int $clientTop = 0
+    int $clientTop = 0,
+    ?array $retainKeys = null
 ): array {
+    @ini_set('memory_limit', MIMIR_MEMORY_LIMIT);
     // $top alleen bij een eindig plafond van de aanroeper. top=0 (Mercurius: ongelimiteerd)
     // krijgt geen $top: BC laat nextLink dan vaak weg, waardoor de set op één pagina blijft
     // steken (productie: ledger op exact 2000). Pagina-grootte zit in Prefer: odata.maxpagesize
@@ -2298,13 +2352,15 @@ function mimir_fetch_collection(
         $clientTop = 0;
     }
     // Pagina's direct per pagina in de store schrijven; de ruwe BC-respons wordt niet
-    // als geheel bewaard.
+    // als geheel bewaard. $stored houdt daarna alleen de kolommen die het antwoord
+    // nog nodig heeft, niet elke brede BC-kolom van de hele set.
     $stored = [];
     $cacheBroken = false;
     // Opgehaalde rijen vervangen de oude volledig (alleen whitelist-velden blijven staan).
     $keepOld = mimir_cache_kept_columns($entity);
     $dropped = false;
-    $onPage = static function (array $pageRows) use (&$stored, &$cacheBroken, &$dropped, $pdo, $environment, $company, $entity, $keys, $select, $keepOld, $now): void {
+    $retainFlip = $retainKeys === null ? null : array_flip($retainKeys);
+    $onPage = static function (array &$pageRows) use (&$stored, &$cacheBroken, &$dropped, $pdo, $environment, $company, $entity, $keys, $select, $keepOld, $now, $retainFlip): void {
         $batch = [];
         foreach ($pageRows as $payload) {
             if (!is_array($payload)) {
@@ -2324,8 +2380,13 @@ function mimir_fetch_collection(
                 }
             }
             $batch[] = [mimir_row_key($clean, $keys), $clean];
-            $stored[] = ['payload' => $clean, 'fetched_at' => $now];
+            $stored[] = [
+                'payload' => $retainFlip === null ? $clean : array_intersect_key($clean, $retainFlip),
+                'fetched_at' => $now,
+            ];
         }
+        unset($payload);
+        $pageRows = [];
         if ($cacheBroken || $batch === []) {
             return;
         }
@@ -2343,6 +2404,7 @@ function mimir_fetch_collection(
             $cacheBroken = true;
             mimir_cache_storage_failure($pdo, $error, $environment, $entity);
         }
+        unset($batch);
     };
     $attempt = static function (?string $filterString) use ($prefix, $company, $entity, $select, $keys, $fetch, $clientTop, $onPage, &$stored): array {
         $stored = [];

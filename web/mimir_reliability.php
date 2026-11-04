@@ -92,7 +92,8 @@ function mimir_event_escape(string $value): string
 function mimir_event_redact(string $message): string
 {
     $message = str_replace(["\r", "\n"], ' ', $message);
-    $redacted = preg_replace('/mimir_[A-Za-z0-9]+/', 'mimir_[redacted]', $message);
+    // Sleutels (mimir_…) wel, bestandsnamen (mimir_store.php) niet: anders is een fatal niet te herleiden.
+    $redacted = preg_replace('/mimir_(?![A-Za-z0-9]+\.php\b)[A-Za-z0-9]+/', 'mimir_[redacted]', $message);
     if (is_string($redacted)) {
         $message = $redacted;
     }
