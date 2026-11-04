@@ -713,21 +713,56 @@ function mimir_api_register_fatal_handler(): void
         }
         if (function_exists('mimir_event_log')) {
             try {
-                mimir_event_log('error', 'Fatale fout in API: ' . $message);
+                mimir_log_fatal_error($error);
             } catch (Throwable) {
             }
         }
     });
 }
 
+/**
+ * Fatal in het gebeurtenislog, met route, entity en bestand:regel.
+ * De HTTP-body blijft alleen de fouttekst (geen pad naar de client).
+ *
+ * @param array{message?: string, file?: string, line?: int} $error
+ */
+function mimir_log_fatal_error(array $error): void
+{
+    $message = (string) ($error['message'] ?? '');
+    if (strlen($message) > 400) {
+        $message = substr($message, 0, 400) . '…';
+    }
+    $entity = trim((string) ($GLOBALS['mimir_request_entity'] ?? ''));
+    $route = trim((string) ($GLOBALS['mimir_bc_route'] ?? ''));
+    if ($route === '') {
+        $route = trim((string) ($GLOBALS['mimir_request_route'] ?? ''));
+    }
+    $file = (string) ($error['file'] ?? '');
+    $line = (int) ($error['line'] ?? 0);
+    $at = $file !== '' ? $file . ':' . $line : '';
+    $context = 'route=' . ($route !== '' ? $route : '-')
+        . ' entity=' . ($entity !== '' ? $entity : '-')
+        . ($at !== '' ? ' ' . $at : '');
+    mimir_event_log(
+        'error',
+        'Fatale fout in API: ' . $context . ': ' . $message,
+        '',
+        $entity,
+        $route !== '' ? $route : 'fatal'
+    );
+}
+
 function mimir_api_main(?string $forcedRoute = null): void
 {
     @set_time_limit(300);
-    @ini_set('memory_limit', '512M');
+    @ini_set('memory_limit', MIMIR_MEMORY_LIMIT);
     mimir_deadline_start();
     @ini_set('display_errors', '0');
     mimir_api_register_fatal_handler();
     $GLOBALS['mimir_stamp_bc_live'] = false;
+    $GLOBALS['mimir_request_route'] = '';
+    $GLOBALS['mimir_request_entity'] = '';
+    unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page']);
     $apiKey = mimir_request_api_key();
     if ($apiKey === '') {
         mimir_json(['error' => 'API-sleutel ontbreekt. Gebruik Authorization: Bearer of de header X-API-Key.'], 401);
@@ -738,6 +773,7 @@ function mimir_api_main(?string $forcedRoute = null): void
     mimir_load_auth(true);
 
     $route = $forcedRoute ?? mimir_route_from_request();
+    $GLOBALS['mimir_request_route'] = $route;
     $parsed = mimir_parse_route($route);
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     if ($parsed['action'] === 'unknown') {
@@ -792,6 +828,7 @@ function mimir_api_main(?string $forcedRoute = null): void
     if ($entity === '' && isset($parsed['table'])) {
         $entity = (string) $parsed['table'];
     }
+    $GLOBALS['mimir_request_entity'] = $entity;
     $now = time();
 
     try {
@@ -1098,11 +1135,14 @@ function mimir_ui_live_payload(string $action, int $now, ?array $body): array
 function mimir_ui_main(): void
 {
     @set_time_limit(300);
-    @ini_set('memory_limit', '512M');
+    @ini_set('memory_limit', MIMIR_MEMORY_LIMIT);
     mimir_deadline_start();
     @ini_set('display_errors', '0');
     mimir_api_register_fatal_handler();
     $GLOBALS['mimir_stamp_bc_live'] = false;
+    $GLOBALS['mimir_request_route'] = '';
+    $GLOBALS['mimir_request_entity'] = '';
+    unset($GLOBALS['mimir_bc_route'], $GLOBALS['mimir_bc_route_page']);
     $action = trim((string) ($_GET['action'] ?? ''));
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     $now = time();
@@ -1167,6 +1207,8 @@ function mimir_ui_main(): void
         if ($entity === '' && is_array($body)) {
             $entity = trim((string) ($body['table'] ?? $body['entity'] ?? ''));
         }
+        $GLOBALS['mimir_request_route'] = $action;
+        $GLOBALS['mimir_request_entity'] = $entity;
         $payload = mimir_with_cache_or_live(
             static function () use ($pdo, $action, $email, $now, $body): array {
                 if (!$pdo instanceof PDO) {

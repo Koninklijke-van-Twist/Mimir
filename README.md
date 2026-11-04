@@ -359,6 +359,7 @@ Zonder Business Central:
 ```sh
 php tests/mimir_filter_test.php
 php tests/mimir_cache_test.php
+php tests/mimir_memory_test.php
 php tests/mimir_bc_reduce_test.php
 php tests/mimir_bc_limit_test.php
 php tests/mimir_keys_test.php
