@@ -71,11 +71,17 @@ function mimir_events_query(array $get): array
     $offset = max(0, (int) ($get['offset'] ?? 0));
     $summary = in_array((string) ($get['summary'] ?? ''), ['1', 'true'], true);
 
+    // Groepen van fouten; zonder statusfilter alle niet-groene/niet-info statussen.
+    $errorKeys = ['question-red', 'cross-red', 'cross-orange', 'recycle-orange', 'recycle-red'];
     $day_data = mimir_event_log_day($day, 1, PHP_INT_MAX, null);
     $rows = [];
     foreach ($day_data['rows'] as $row) {
         $status = mimir_event_status_key(mimir_event_status($row));
         if ($statuses !== null && !in_array($status, $statuses, true)) {
+            continue;
+        }
+        // Samenvatting zonder statusfilter: alleen foutregels bewaren (anders geheugenuitputting op drukke dagen).
+        if ($summary && $statuses === null && !in_array($status, $errorKeys, true)) {
             continue;
         }
         if ($category !== '' && $row['category'] !== $category) {
@@ -100,13 +106,8 @@ function mimir_events_query(array $get): array
     if (!$summary) {
         return $base + ['offset' => $offset, 'limit' => $limit, 'rows' => array_slice($rows, $offset, $limit)];
     }
-    // Groepen van fouten; zonder statusfilter alle niet-groene/niet-info statussen.
-    $errorKeys = ['question-red', 'cross-red', 'cross-orange', 'recycle-orange', 'recycle-red'];
     $groups = [];
     foreach ($rows as $row) {
-        if ($statuses === null && !in_array($row['status'], $errorKeys, true)) {
-            continue;
-        }
         $norm = mimir_events_normalize_message($row['message']);
         $id = implode("\x1f", [$row['caller']['label'], $row['caller']['owner'], $row['entity'], $row['action'], $norm]);
         if (!isset($groups[$id])) {
