@@ -226,6 +226,20 @@ mimir_write_same(mimir_key_lookup($pdo, $reader['key'])['can_write'], true, 'val
 mimir_write_same(mimir_key_mirror_lookup($reader['key'])['can_write'], true, 'mirror follows the toggle');
 mimir_ui_cached_payload($pdo, 'keys_set_write', 'tim@kvt.nl', $now, ['id' => $reader['id'], 'can_write' => false]);
 mimir_write_same(mimir_key_lookup($pdo, $reader['key'])['can_write'], false, 'toggle back off');
+// keys_set_events: route bekend als POST, CSRF verplicht, toggle wordt opgeslagen
+mimir_write_same(mimir_ui_key_actions()['keys_set_events'] ?? null, 'POST', 'keys_set_events is a POST route');
+$_SERVER['HTTP_X_MIMIR_CSRF'] = '';
+try {
+    mimir_ui_cached_payload($pdo, 'keys_set_events', 'tim@kvt.nl', $now, ['id' => $reader['id'], 'can_read_events' => true]);
+    mimir_write_fail('keys_set_events without CSRF should fail');
+} catch (MimirUserException $error) {
+    mimir_write_same($error->status, 403, 'keys_set_events missing CSRF is 403');
+}
+$_SERVER['HTTP_X_MIMIR_CSRF'] = $token;
+mimir_ui_cached_payload($pdo, 'keys_set_events', 'tim@kvt.nl', $now, ['id' => $reader['id'], 'can_read_events' => true]);
+mimir_write_same(mimir_key_can_read_events($pdo, (int) $reader['id']), true, 'events toggle on');
+mimir_ui_cached_payload($pdo, 'keys_set_events', 'tim@kvt.nl', $now, ['id' => $reader['id'], 'can_read_events' => false]);
+mimir_write_same(mimir_key_can_read_events($pdo, (int) $reader['id']), false, 'events toggle off');
 $created = mimir_ui_cached_payload($pdo, 'keys_create', 'tim@kvt.nl', $now, ['label' => 'Via UI']);
 mimir_write_same($created['can_write'], false, 'UI create without checkbox is read-only');
 $_SERVER['HTTP_X_MIMIR_CSRF'] = '';
