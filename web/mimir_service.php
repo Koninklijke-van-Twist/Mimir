@@ -918,11 +918,19 @@ function mimir_request_csrf_token(): string
 }
 
 /**
+ * Sleutelacties van ui_api.php met de verwachte HTTP-methode.
+ */
+function mimir_ui_key_actions(): array
+{
+    return ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST', 'keys_set_write' => 'POST', 'keys_set_events' => 'POST', 'keys_write_log' => 'GET', 'tunnel_cache_clear' => 'POST'];
+}
+
+/**
  * Sleutelbeheer dat iets verandert vraagt een geldig CSRF-token.
  */
 function mimir_ui_require_csrf(string $action): void
 {
-    if (!in_array($action, ['keys_create', 'keys_revoke', 'keys_set_write', 'tunnel_cache_clear'], true)) {
+    if (!in_array($action, ['keys_create', 'keys_revoke', 'keys_set_write', 'keys_set_events', 'tunnel_cache_clear'], true)) {
         return;
     }
     if (!mimir_csrf_valid(mimir_request_csrf_token())) {
@@ -1098,7 +1106,7 @@ function mimir_ui_main(): void
     $action = trim((string) ($_GET['action'] ?? ''));
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     $now = time();
-    $keyActions = ['keys' => 'GET', 'keys_create' => 'POST', 'keys_revoke' => 'POST', 'keys_set_write' => 'POST', 'keys_write_log' => 'GET', 'tunnel_cache_clear' => 'POST'];
+    $keyActions = mimir_ui_key_actions();
     $dataActions = ['companies' => 'GET', 'tables' => 'GET', 'schema' => 'GET', 'query' => 'POST'];
     $metadataActions = ['metadata' => 'GET', 'metadata_refresh' => 'POST'];
 
